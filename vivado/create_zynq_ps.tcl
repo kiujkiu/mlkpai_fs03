@@ -50,10 +50,12 @@ set_property -dict [list \
 
 validate_bd_design
 save_bd_design
+# 生成 BD 全部产物 (含 .hwh 硬件交接, write_hw_platform 必需)
+generate_target all [get_files system.bd]
 make_wrapper -files [get_files system.bd] -top
 add_files -norecurse $BUILD/$PROJ.gen/sources_1/bd/system/hdl/system_wrapper.v
 set_property top system_wrapper [current_fileset]
 
-# 生成 XSA (给 PetaLinux / 内核 DT / 后续 POV PL)
-# write_hw_platform -fixed -force $DIR/mlkpai_fs03.xsa
-puts "=== PS7 base 工程建好. 取消注释 write_hw_platform 那行可出 XSA ==="
+# 生成 XSA (给 PetaLinux / 内核 DT / 后续 POV PL). -fixed = PS-only 无 PL bitstream
+write_hw_platform -fixed -force $DIR/mlkpai_fs03.xsa
+puts "=== XSA 已生成: $DIR/mlkpai_fs03.xsa ==="
