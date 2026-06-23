@@ -5,3 +5,4 @@ build/
 .Xil/
 vivado*.str
 *.xsa
+test/ps7_init.tcl
