@@ -1,0 +1,7 @@
+# Vivado build 产物
+build/
+*.jou
+*.log
+.Xil/
+vivado*.str
+*.xsa
