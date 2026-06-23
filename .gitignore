@@ -6,3 +6,4 @@ build/
 vivado*.str
 *.xsa
 test/ps7_init.tcl
+test/ddr_progress.txt
