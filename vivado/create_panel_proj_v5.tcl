@@ -41,7 +41,7 @@ if {![file exists $DIR/vivado/hdl/icnd2049_panel_pov.v]} {
     puts "FATAL: vivado/hdl/icnd2049_panel_pov.v 不存在 (主线还没写完?)"
     exit 1
 }
-add_files -norecurse $DIR/vivado/hdl/icnd2049_panel_pov.v
+add_files -norecurse $DIR/vivado/hdl/icnd2049_panel_pov.v $DIR/vivado/hdl/ddr_slice_fetch.v
 add_files -fileset constrs_1 -norecurse $DIR/vivado/panel_pins.xdc
 add_files -fileset constrs_1 -norecurse $DIR/vivado/panel_pins_v5.xdc
 

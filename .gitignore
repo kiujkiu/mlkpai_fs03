@@ -8,3 +8,5 @@ sim/*.wdb
 sim/*.jou
 cam/frame_*.jpg
 cam/test*.jpg
+*.jou
+*.xsa
