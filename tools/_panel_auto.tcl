@@ -7,7 +7,12 @@ set BIT  build_panel/mlkpai_panel.runs/impl_1/system_wrapper.bit
 proc log {m} { puts "\[auto\] $m" }
 
 connect
-targets -set -filter {name =~ "*Cortex-A9*#0*"}
+catch { jtag targets -set -filter {name =~ "*MLK*"}; jtag frequency 5000000 }
+# 等目标枚举 (新 hw_server 有竞态)
+for {set w 0} {$w < 20} {incr w} {
+    if {![catch { targets -set -filter {name =~ "*Cortex-A9*#0*"} }]} { break }
+    after 500
+}
 catch { stop }
 catch { targets -set -filter {name =~ "*Cortex-A9*#1*"}; stop }
 targets -set -filter {jtag_cable_name =~ "*2515BCEF4DEA*" && name =~ "*xc7z020*"}

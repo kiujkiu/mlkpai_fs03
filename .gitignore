@@ -1,9 +1,10 @@
-# Vivado build 产物
+build_panel/
 build/
-*.jou
 *.log
-.Xil/
-vivado*.str
-*.xsa
-test/ps7_init.tcl
-test/ddr_progress.txt
+tools/_*_out.txt
+sim/xsim.dir/
+sim/*.pb
+sim/*.wdb
+sim/*.jou
+cam/frame_*.jpg
+cam/test*.jpg
