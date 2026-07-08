@@ -1,7 +1,11 @@
 import cv2
-for idx in range(4):
-    for api, name in [(cv2.CAP_MSMF,'MSMF'), (cv2.CAP_DSHOW,'DSHOW')]:
-        cap = cv2.VideoCapture(idx, api)
-        ok, f = cap.read()
-        print(idx, name, ok, f.shape if ok else '')
-        cap.release()
+for i in range(4):
+    cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
+    ok = cap.isOpened()
+    frame_ok = False
+    if ok:
+        for _ in range(5):
+            r, f = cap.read()
+            if r: frame_ok = True; break
+    print(f"cam{i}: opened={ok} frame={frame_ok}", flush=True)
+    cap.release()
