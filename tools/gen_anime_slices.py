@@ -76,6 +76,8 @@ def color_adjust(col, brighten=1.5, gamma=0.9, saturation=2.0):
 
 
 def points_from_glb(path, n_samples, lighting, ambient):
+    if ZYNQ_POV_HOST not in sys.path:
+        sys.path.insert(0, ZYNQ_POV_HOST)
     from glb_to_points import load_glb, sample_triangles
     print(f'[glb] load {path}', flush=True)
     tris = load_glb(path, verbose=True)
@@ -97,8 +99,9 @@ def points_from_bin(path):
     return xyz, col
 
 
-def voxelize(xyz, col, z_stretch):
-    """居中 + 等比缩放到 (±R_BUDGET, ±H_BUDGET, ±R_BUDGET) → 体素格颜色平均。"""
+def normalize_points(xyz, z_stretch, verbose=True):
+    """居中 + 等比缩放到 (±R_BUDGET, ±H_BUDGET, ±R_BUDGET), 返回归一化点。
+    动画调用方可用同一 scale 逐帧变换 (呼吸/摆动) 后再喂 voxel_grid。"""
     p = xyz.copy()
     cmin, cmax = p.min(axis=0), p.max(axis=0)
     p -= (cmin + cmax) / 2
@@ -108,7 +111,13 @@ def voxelize(xyz, col, z_stretch):
     hz = np.abs(p[:, 2]).max()
     s = min(R_BUDGET / max(hx, 1e-6), H_BUDGET / max(hy, 1e-6), R_BUDGET / max(hz, 1e-6))
     p *= s
-    print(f'[vox] scale={s:.3f} extents x±{hx*s:.1f} y±{hy*s:.1f} z±{hz*s:.1f}', flush=True)
+    if verbose:
+        print(f'[vox] scale={s:.3f} extents x±{hx*s:.1f} y±{hy*s:.1f} z±{hz*s:.1f}', flush=True)
+    return p
+
+
+def voxel_grid(p, col, verbose=True):
+    """归一化点 (voxel 坐标, 原点在中心) → 体素格颜色平均 (GR,GH,GR,3)。"""
     gx = np.clip(np.rint(p[:, 0]).astype(np.int32) + GR // 2, 0, GR - 1)
     gy = np.clip(np.rint(p[:, 1]).astype(np.int32) + GH // 2, 0, GH - 1)
     gz = np.clip(np.rint(p[:, 2]).astype(np.int32) + GR // 2, 0, GR - 1)
@@ -118,8 +127,14 @@ def voxelize(xyz, col, z_stretch):
     np.add.at(cnt, (gx, gy, gz), 1.0)
     occ = cnt > 0
     acc[occ] /= cnt[occ][:, None]
-    print(f'[vox] {int(occ.sum())} occupied cells', flush=True)
+    if verbose:
+        print(f'[vox] {int(occ.sum())} occupied cells', flush=True)
     return acc
+
+
+def voxelize(xyz, col, z_stretch):
+    """居中 + 等比缩放 + 体素化 (静态一步到位, 保持旧 API)。"""
+    return voxel_grid(normalize_points(xyz, z_stretch), col)
 
 
 def render_slice(vox, theta, sub, d_step):
@@ -197,7 +212,6 @@ def main():
     if args.points:
         xyz, col = points_from_bin(args.points)
     else:
-        sys.path.insert(0, ZYNQ_POV_HOST)
         xyz, col = points_from_glb(args.glb, args.samples, args.lighting, args.ambient)
     print(f'[pts] {len(xyz)} points', flush=True)
     col = color_adjust(col, args.brighten, args.gamma, args.saturation)
