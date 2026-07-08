@@ -1,0 +1,8 @@
+// MLKPAI-FS03 SD boot image: our v5 FSBL (with HP0 AFI init) + our PL bitstream
+// + factory u-boot (raw partition extracted from factory BOOT.bin, see extract_uboot.py)
+the_ROM_image:
+{
+    [bootloader] fsbl.elf
+    ../../build_panel/mlkpai_panel.runs/impl_1/system_wrapper.bit
+    [load = 0x04000000, startup = 0x04000000] u-boot.bin
+}
