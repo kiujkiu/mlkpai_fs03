@@ -294,6 +294,7 @@ module icnd2049_panel_fb #(
     reg        au_icnd_sdi;
     reg [9:0]  oe_cnt;        // v4 overlap: OE 低窗口计数 (aclk), 独立于 FSM 跑
     reg        oe_done;       // v4: 窗口已收 (OE 已回高), AU_WAIT 的行推进门条件
+    reg        adv_fired;     // v4.1: 本行 3019 推进已发 (overlap 下藏进移位消隐尾并行跑)
 
     //---------- framebuffer: 9 lane × 512 × 32bit (row[5:0],pair[2:0]) ----------
     reg  [8:0]  fb_raddr;
@@ -412,6 +413,7 @@ module icnd2049_panel_fb #(
             au_icnd_sdi <= 1'b0;
             oe_cnt      <= 10'd0;
             oe_done     <= 1'b1;
+            adv_fired   <= 1'b0;
         end else begin
             au_icnd_go <= 1'b0;
             // v4 overlap: OE 窗口独立计数, 到点回高 (在 case 之前, 状态机赋值优先)
@@ -420,6 +422,16 @@ module icnd2049_panel_fb #(
                     auto_oe <= 1'b1;
                     oe_done <= 1'b1;
                 end else oe_cnt <= oe_cnt - 1'b1;
+            end
+            // v4.1: overlap 下 3019 行推进并行藏进移位的消隐尾 (OE 已回高即可发,
+            // 与 2049 DCLK/SDI/LE 完全独立; OE 下降沿前 icnd_busy 必已收尾)
+            if (auto_en && overlap_en && !adv_fired && oe_done &&
+                !icnd_busy && !au_icnd_go &&
+                (au_state == AU_FILL1 || au_state == AU_FBRD ||
+                 au_state == AU_FILL2 || au_state == AU_WAIT)) begin
+                au_icnd_sdi <= (au_row == 9'd0);
+                au_icnd_go  <= 1'b1;
+                adv_fired   <= 1'b1;
             end
             if (!seq_active && cmd_pending) begin
                 // idle 启动: 立即装载 + 驱第一 bit (dclk=0, 半周期后首个上升沿采样)
@@ -541,8 +553,13 @@ module icnd2049_panel_fb #(
                         cmd_pending   <= 1'b1;
                         au_state      <= AU_WAIT;
                     end
-                    // overlap: 行推进还要等 OE 窗口收掉 (行切换必须消隐)
-                    AU_WAIT: if (!busy && !cmd_pending && (!overlap_en || oe_done))
+                    // overlap: 推进已并行发出, 等移位+推进+OE窗三者齐 → 直接 OE 下降
+                    // 非 overlap: 老路径走 AU_ROW 串行推进
+                    AU_WAIT: if (overlap_en) begin
+                        if (!busy && !cmd_pending && oe_done &&
+                            adv_fired && !icnd_busy && !au_icnd_go)
+                            au_state <= AU_ROWW;
+                    end else if (!busy && !cmd_pending)
                         au_state <= AU_ROW;
                     AU_ROW: begin
                         au_icnd_sdi <= (au_row == 9'd0);   // 单 '1' 进链
@@ -553,11 +570,12 @@ module icnd2049_panel_fb #(
                         auto_oe  <= 1'b0;                  // OE 下降沿转移 reg2 + 显示
                         if (overlap_en) begin
                             // 显示刚锁存的 au_row, 同时立刻去移下一行 (2049 双缓存)
-                            oe_cnt   <= dclk_fast ? {1'b0, oe_window, 1'b0}
-                                                  : {oe_window, 2'b0};   // DCLK→aclk
-                            oe_done  <= 1'b0;
-                            au_row   <= (au_row >= au_rows_max) ? 9'd0 : au_row + 1'b1;
-                            au_state <= AU_FILL1;
+                            oe_cnt    <= dclk_fast ? {1'b0, oe_window, 1'b0}
+                                                   : {oe_window, 2'b0};   // DCLK→aclk
+                            oe_done   <= 1'b0;
+                            adv_fired <= 1'b0;
+                            au_row    <= (au_row >= au_rows_max) ? 9'd0 : au_row + 1'b1;
+                            au_state  <= AU_FILL1;
                         end else begin
                             au_cnt   <= auto_disp_cyc;
                             au_state <= AU_DISP;
@@ -574,9 +592,10 @@ module icnd2049_panel_fb #(
                     default: au_state <= AU_IDLE;
                 endcase
             end else begin
-                au_state <= AU_IDLE;
-                auto_oe  <= 1'b1;
-                oe_done  <= 1'b1;
+                au_state  <= AU_IDLE;
+                auto_oe   <= 1'b1;
+                oe_done   <= 1'b1;
+                adv_fired <= 1'b0;
             end
         end
     end
