@@ -5,6 +5,8 @@ open_project $DIR/build_panel/mlkpai_panel.xpr
 set_property STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE RuntimeOptimized [get_runs synth_1]
 set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE RuntimeOptimized [get_runs impl_1]
 set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE RuntimeOptimized [get_runs impl_1]
+# ⚠ module_ref IP 有独立 OOC 综合 run, 只 reset synth_1 会链接旧网表 (2026-07-08 实坑)
+catch { reset_run system_panel_0_0_synth_1 }
 reset_run synth_1
 launch_runs impl_1 -to_step write_bitstream -jobs 8
 wait_on_run impl_1

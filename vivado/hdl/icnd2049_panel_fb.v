@@ -28,12 +28,19 @@
 //     01 → chain_data[wdata[19:16]] = wdata[15:0] (per-chain 模式数据预载)
 //     10 → oe_reg = wdata[0] (0=显示, 1=消隐; 复位默认 1);
 //          wdata[24:16] = auto 扫描行数 (非 0 时更新, 默认 384; 设成真实行数提亮度)
+//          wdata[27]=cfg_we (v4): 为 1 时更新 [29]=dclk_fast (0=12.5M/1=25M),
+//            [28]=overlap_en; wdata[15:8]=oe_window (DCLK 数, 非 0 更新, 默认 48)
+//            — 旧脚本 [27]=0 不受影响。⚠ dclk_fast 只在 auto 停止时切
 //     11 → auto 自主扫描: [0]=auto_en, [23:8]=auto_pattern (每芯片 16bit 图形),
 //          [29:24]=disp 窗 (单位 1024 aclk, 0 当 3 用 → 默认 ~61us)
 //          auto 模式: PL 自己循环 灌12词(LE=4/首行5)→3019走行(384位单'1')→OE低显示,
 //          ~130Hz 帧率, 无需 ARM/JTAG 持续喂
 //
-// 时钟: s_axi_aclk = FCLK0 50 MHz, DCLK = 50/DCLK_DIV = 12.5 MHz (2049 max 25M)
+// v4 overlap 模式 (2026-07-08): 显示行 N (OE 低 oe_window 个 DCLK) 的同时移入行
+//   N+1 (2049 双缓存, latch1→reg2 转移在 OE 下降沿)。行周期 = max(192 DCLK 移位,
+//   oe_window) + 3019 行推进死区; 25M+overlap ≈ 1.9 kHz @54 行。亮度 = oe_window/192。
+//
+// 时钟: s_axi_aclk = FCLK0 50 MHz, DCLK = dclk_fast ? 25M : 12.5M (2049 max 25M)
 //-----------------------------------------------------------------------------
 
 `timescale 1ns / 1ps
@@ -76,7 +83,9 @@ module icnd2049_panel_fb #(
     output reg         icnd_rclk_out
 );
 
-    localparam [7:0] HALF = (DCLK_DIV/2) - 1;
+    // v4: 运行时分频 — dclk_fast=0: aclk/4=12.5M (HALF=1), =1: aclk/2=25M (HALF=0)
+    reg  dclk_fast;
+    wire [7:0] HALF = dclk_fast ? 8'd0 : (DCLK_DIV/2) - 1;
 
     //---------- Sequencer state (声明提前, divider 要用 bits_left) ----------
     reg        busy;
@@ -150,8 +159,10 @@ module icnd2049_panel_fb #(
     reg        use_fb;
     reg        auto_en;
     reg [15:0] auto_pattern;
-    reg [19:0] auto_disp_cyc;   // 显示窗 aclk 数
+    reg [19:0] auto_disp_cyc;   // 显示窗 aclk 数 (非 overlap 模式)
     reg [8:0]  au_rows_max;     // 扫描行数-1
+    reg        overlap_en;      // v4: 显示与下一行移位重叠
+    reg [7:0]  oe_window;       // v4: overlap 模式 OE 低窗口, 单位 DCLK
 
     integer ci;
     always @(posedge s_axi_aclk) begin
@@ -178,6 +189,9 @@ module icnd2049_panel_fb #(
             auto_pattern      <= 16'h8000;   // 每芯片 1 点; 9 路全开单行 ~1.6A 安全
             auto_disp_cyc     <= 20'd3072;
             au_rows_max       <= 9'd383;
+            dclk_fast         <= 1'b0;
+            overlap_en        <= 1'b0;
+            oe_window         <= 8'd48;      // 192 的 1/4
             for (ci = 0; ci < 9; ci = ci + 1)
                 chain_data[ci] <= 16'b0;
         end else begin
@@ -215,6 +229,12 @@ module icnd2049_panel_fb #(
                         oe_set_val   <= s_axi_wdata[0];
                         if (s_axi_wdata[24:16] != 9'd0)
                             au_rows_max <= s_axi_wdata[24:16] - 1'b1;
+                        if (s_axi_wdata[27]) begin       // v4 cfg_we
+                            dclk_fast  <= s_axi_wdata[29];
+                            overlap_en <= s_axi_wdata[28];
+                            if (s_axi_wdata[15:8] != 8'd0)
+                                oe_window <= s_axi_wdata[15:8];
+                        end
                     end else if (s_axi_wdata[31:30] == 2'b11) begin
                         auto_en       <= s_axi_wdata[0];
                         use_fb        <= s_axi_wdata[1];
@@ -245,7 +265,7 @@ module icnd2049_panel_fb #(
         end else begin
             if (!s_axi_arready && s_axi_arvalid && !s_axi_rvalid) begin
                 s_axi_arready <= 1'b1;
-                s_axi_rdata   <= {26'b0, use_fb, auto_en, oe_out, icnd_busy, cmd_pending, busy};
+                s_axi_rdata   <= {24'b0, dclk_fast, overlap_en, use_fb, auto_en, oe_out, icnd_busy, cmd_pending, busy};
                 s_axi_rresp   <= 2'b00;
                 s_axi_rvalid  <= 1'b1;
             end else begin
@@ -272,6 +292,8 @@ module icnd2049_panel_fb #(
     reg        auto_oe;
     reg        au_icnd_go;    // 1 拍脉冲 → 3019 FSM advance
     reg        au_icnd_sdi;
+    reg [9:0]  oe_cnt;        // v4 overlap: OE 低窗口计数 (aclk), 独立于 FSM 跑
+    reg        oe_done;       // v4: 窗口已收 (OE 已回高), AU_WAIT 的行推进门条件
 
     //---------- framebuffer: 9 lane × 512 × 32bit (row[5:0],pair[2:0]) ----------
     reg  [8:0]  fb_raddr;
@@ -388,8 +410,17 @@ module icnd2049_panel_fb #(
             auto_oe     <= 1'b1;
             au_icnd_go  <= 1'b0;
             au_icnd_sdi <= 1'b0;
+            oe_cnt      <= 10'd0;
+            oe_done     <= 1'b1;
         end else begin
             au_icnd_go <= 1'b0;
+            // v4 overlap: OE 窗口独立计数, 到点回高 (在 case 之前, 状态机赋值优先)
+            if (!oe_done) begin
+                if (oe_cnt == 10'd0) begin
+                    auto_oe <= 1'b1;
+                    oe_done <= 1'b1;
+                end else oe_cnt <= oe_cnt - 1'b1;
+            end
             if (!seq_active && cmd_pending) begin
                 // idle 启动: 立即装载 + 驱第一 bit (dclk=0, 半周期后首个上升沿采样)
                 cmd_pending <= 1'b0;
@@ -510,7 +541,9 @@ module icnd2049_panel_fb #(
                         cmd_pending   <= 1'b1;
                         au_state      <= AU_WAIT;
                     end
-                    AU_WAIT: if (!busy && !cmd_pending) au_state <= AU_ROW;
+                    // overlap: 行推进还要等 OE 窗口收掉 (行切换必须消隐)
+                    AU_WAIT: if (!busy && !cmd_pending && (!overlap_en || oe_done))
+                        au_state <= AU_ROW;
                     AU_ROW: begin
                         au_icnd_sdi <= (au_row == 9'd0);   // 单 '1' 进链
                         au_icnd_go  <= 1'b1;
@@ -518,8 +551,17 @@ module icnd2049_panel_fb #(
                     end
                     AU_ROWW: if (!icnd_busy && !au_icnd_go) begin
                         auto_oe  <= 1'b0;                  // OE 下降沿转移 reg2 + 显示
-                        au_cnt   <= auto_disp_cyc;
-                        au_state <= AU_DISP;
+                        if (overlap_en) begin
+                            // 显示刚锁存的 au_row, 同时立刻去移下一行 (2049 双缓存)
+                            oe_cnt   <= dclk_fast ? {1'b0, oe_window, 1'b0}
+                                                  : {oe_window, 2'b0};   // DCLK→aclk
+                            oe_done  <= 1'b0;
+                            au_row   <= (au_row >= au_rows_max) ? 9'd0 : au_row + 1'b1;
+                            au_state <= AU_FILL1;
+                        end else begin
+                            au_cnt   <= auto_disp_cyc;
+                            au_state <= AU_DISP;
+                        end
                     end
                     AU_DISP: begin
                         if (au_cnt == 20'd0) begin
@@ -534,6 +576,7 @@ module icnd2049_panel_fb #(
             end else begin
                 au_state <= AU_IDLE;
                 auto_oe  <= 1'b1;
+                oe_done  <= 1'b1;
             end
         end
     end
