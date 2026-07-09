@@ -209,21 +209,24 @@ _WM = np.array([[c == '#' for c in row.ljust(80, '.')[:80]] for row in WORLD_MAP
 
 
 def globe_frames(args):
-    """实心地球 (zynq_pov _gen_globe_slices 方案移植): NASA earth_clean.jpg 方向投影采样,
-    海纯蓝/陆纯绿/冰白 (实测分类), 逐帧转纹理. 实心圆盘截面 → POV 密度拉满."""
+    """空心壳地球 (用户定): 壳面贴 NASA earth_clean.jpg 真实大陆,
+    海纯蓝/陆纯绿/冰白 (zynq_pov 实测分类), 三层壳保密度, 逐帧转纹理."""
     R = gas.R_BUDGET * 0.48                                 # 直径半幅 (2026-07-09 用户定)
     tex_path = os.path.join(HERE, 'earth_clean.jpg')
     tex = np.asarray(Image.open(tex_path).convert('RGB'), np.int32)
     TH_, TW_ = tex.shape[:2]
-    # 实心球体素点云
-    ax = np.arange(-int(R), int(R) + 1, dtype=np.float32)
-    X, Y, Z = np.meshgrid(ax, ax, ax, indexing='ij')
-    inside = X**2 + Y**2 + Z**2 <= R * R
-    x, y, z = X[inside], Y[inside], Z[inside]
-    p = np.stack([x, y, z], axis=1)
-    rn = np.maximum(np.sqrt(x**2 + y**2 + z**2), 1e-6)
-    la = np.arcsin(np.clip(y / rn, -1, 1))                  # y = 极轴 (竖直)
-    lo = np.arctan2(z, x)
+    n_lat, n_lon = 240, 720
+    lat = np.linspace(-math.pi / 2 * 0.98, math.pi / 2 * 0.98, n_lat, dtype=np.float32)
+    lon = np.linspace(0, 2 * math.pi, n_lon, endpoint=False, dtype=np.float32)
+    LA, LO = np.meshgrid(lat, lon, indexing='ij')
+    la1, lo1 = LA.ravel(), LO.ravel()
+    la = np.concatenate([la1] * 3)
+    lo = np.concatenate([lo1] * 3)
+    rr = np.concatenate([np.full_like(la1, R), np.full_like(la1, R - 1.3),
+                         np.full_like(la1, R - 2.6)])       # 三层壳
+    p = np.stack([rr * np.cos(la) * np.cos(lo),
+                  rr * np.sin(la),
+                  rr * np.cos(la) * np.sin(lo)], axis=1).astype(np.float32)
     n = args.frames
     for t in range(n):
         le = (lo + 2 * math.pi * t / n) % (2 * math.pi)     # 自转: 转纹理不转点
