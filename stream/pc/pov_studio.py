@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     'preset': 'spinpulse',      # PRESETS key (源相关, 见 SOURCE_PRESETS)
     'anim_take': '0',           # glb_anim: 动画 take 名或索引
     'frames': 8,
-    'fps': 4,
+    'fps': 12,                  # 设高于转速, 逐帧 ACK 自动贴住翻页率 (4 会被 RTT 拖到 3.5页/s)
     'loop': True,
     'reconnect': True,
     'render_slices': 120,       # GUI 渲染角度数 (整除 360, 越小越快)

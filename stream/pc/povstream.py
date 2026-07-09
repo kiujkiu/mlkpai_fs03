@@ -318,6 +318,14 @@ def glbseq_frames(args):
                              col, verbose=False)
 
 
+def pure_rgb_snap(col, dom=0.55):
+    """1-bit 海报化: 每点主导通道组合置 1.0 其余置 0 (通道≥dom×max 算主导),
+    抖动存活率 100%, 密度=几何覆盖上限 (地球仪纯通道色经验的通用化).
+    代价: 色彩变 7 色海报风 (R/G/B/黄/品红/青/白)."""
+    m = col.max(axis=1, keepdims=True)
+    return (col >= np.maximum(dom * m, 1e-6)).astype(np.float32) * 255.0
+
+
 def glbanim_frames(args):
     """单 GLB 真 glTF 动画 (骨骼 skinning / morph targets / 节点 TRS,
     见 glb_anim.py). --frames N 均匀采 timeline: t = k/N × duration
@@ -331,12 +339,27 @@ def glbanim_frames(args):
     if smp.duration <= 0:
         print('[glbanim] WARNING: 无动画 timeline, 全帧静态姿态', flush=True)
     times = [smp.duration * k / n for k in range(n)]
-    cmin, cmax = smp.bbox_over(times)
+    if args.robust_fit:
+        # 鲁棒 bbox: 每帧 [2,98] 分位取并集, 排除飞行特效骨骼/技能位移
+        # 拖爆包围盒把人物压小 (LoL R 技能锤/箭/针线能飞 10+ 身位)
+        los, his = [], []
+        for t in times:
+            xyz, _ = smp.points_at(t)
+            los.append(np.percentile(xyz, 2, axis=0))
+            his.append(np.percentile(xyz, 98, axis=0))
+        cmin = np.min(los, axis=0).astype(np.float32)
+        cmax = np.max(his, axis=0).astype(np.float32)
+        print(f'[glbanim] robust bbox {cmin.round(2)}..{cmax.round(2)}', flush=True)
+    else:
+        cmin, cmax = smp.bbox_over(times)
     for t in times:
         xyz, col = smp.points_at(t)
         col = gas.color_adjust(col, args.brighten, args.gamma, args.saturation)
-        yield gas.voxel_grid(normalize_common(xyz, cmin, cmax, args.z_stretch),
-                             col, verbose=False)
+        if args.pure_rgb:
+            col = pure_rgb_snap(col, args.pure_dom)
+        p = normalize_common(xyz, cmin, cmax, args.z_stretch) * args.scale
+        p[:, 0] += args.x_offset
+        yield gas.voxel_grid(p, col, verbose=False)
 
 
 def spin_frames(args):
@@ -669,6 +692,14 @@ def add_render_opts(ap):
                     help='spin: 点云洋葱状向内复制层数 (壳太薄时加厚)')
     ap.add_argument('--shell-gap', type=float, default=1.3,
                     help='spin: 壳层间距 (voxel)')
+    ap.add_argument('--robust-fit', action='store_true',
+                    help='glbanim: [2,98] 分位 bbox 归一, 抗技能位移/特效骨骼压小人物')
+    ap.add_argument('--x-offset', type=float, default=0.0,
+                    help='glbanim: 归一化后 x 平移 (voxel), 正值离转轴 (屏中央显示差规避)')
+    ap.add_argument('--pure-rgb', action='store_true',
+                    help='glbanim: 1-bit 海报化, 每点snap到主导纯通道组合 (密度上限, 7色)')
+    ap.add_argument('--pure-dom', type=float, default=0.55,
+                    help='pure-rgb 主导阈值 (通道≥dom×max 点亮, 越低越偏白)')
     ap.add_argument('--brighten', type=float, default=1.5)
     ap.add_argument('--gamma', type=float, default=0.9)
     ap.add_argument('--saturation', type=float, default=2.0)
@@ -698,7 +729,8 @@ def main():
     s.add_argument('--dir', default=None, help='预渲染 .bin 帧目录 (file 源)')
     s.add_argument('--host', default='127.0.0.1')
     s.add_argument('--port', type=int, default=DEFAULT_PORT)
-    s.add_argument('--fps', type=float, default=10.0)
+    s.add_argument('--fps', type=float, default=12.0,
+                   help='发送节奏上限; 设高于转速让逐帧 ACK 自动贴住翻页率 (设 4 反而被 RTT 拖到 3.5)')
     s.add_argument('--loop', action='store_true')
     s.add_argument('--reconnect', action='store_true',
                    help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推)')
