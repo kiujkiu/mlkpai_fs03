@@ -266,6 +266,14 @@ class AnimatedGLB:
 
 # ================= 采样器 =================
 
+def list_takes(path):
+    """GLB 动画 take 名列表 (无动画 → []); 只解析 glTF 结构, 不解码 mesh,
+    比 AnimatedGLB 轻得多. 未命名 take 用索引字符串占位 (与 --anim-take
+    的索引选择方式一致)."""
+    g = GLTF2().load(path)
+    return [a.name if a.name else str(i) for i, a in enumerate(g.animations or [])]
+
+
 def _resolve_take(takes, sel):
     s = str(sel)
     if s.lstrip('-').isdigit():

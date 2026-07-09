@@ -5,7 +5,9 @@ pov_studio.py — POV Studio: POV 体显示一站式 GUI (Windows Python 3.12, t
 
 三段式界面:
   设备:  IP / 扫描 (/23 网段找板) / 在线·推流口·ssh 状态灯 (5s 刷新) / 板日志
-  内容:  源 (GLB / 内置地球仪 / 预渲染目录) + 预设 + 帧数 → 渲染 + slice 预览
+  内容:  源 (GLB / GLB 序列目录 / 内置地球仪 / 预渲染目录) + 源相关预设
+         (GLB: 静态/呼吸/GLB自带动画+take; 序列目录: 逐帧, 帧数=文件数)
+         + 帧数 → 渲染 + slice 预览
   推流:  fps / 循环 / 自动重连 (板重启每 5s 重连续推) + 实时统计
          + 设为开机默认动画 (scp 覆盖板上 /home/uisrc/anime_slices.bin + md5 校验)
 
@@ -52,10 +54,12 @@ DEFAULT_CONFIG = {
     'ip': '10.10.20.234',
     'ssh_key': (r'C:\Users\kiujkiu\.ssh\pov_ed25519' if os.name == 'nt'
                 else os.path.expanduser('~/.ssh/pov_ed25519')),
-    'source': 'glb',            # glb | globe | dir
+    'source': 'glb',            # glb | glbdir | globe | dir
     'glb': '',                  # 空 = povstream 默认 anime GLB
+    'glb_dir': '',              # GLB 帧序列目录 (glbseq)
     'dir': '',                  # 预渲染目录
-    'preset': 'spinpulse',      # static | spinpulse | globe_spin
+    'preset': 'spinpulse',      # PRESETS key (源相关, 见 SOURCE_PRESETS)
+    'anim_take': '0',           # glb_anim: 动画 take 名或索引
     'frames': 8,
     'fps': 4,
     'loop': True,
@@ -67,10 +71,18 @@ DEFAULT_CONFIG = {
 PRESETS = {                     # key → (中文名, povstream anim)
     'static': ('静态', None),
     'spinpulse': ('呼吸动画 spinpulse', 'spinpulse'),
+    'glb_anim': ('GLB自带动画', 'glbanim'),
     'globe_spin': ('地球仪自转', 'globe'),
+    'glbseq': ('序列逐帧', 'glbseq'),
 }
 PRESET_LABELS = {k: v[0] for k, v in PRESETS.items()}
 LABEL_TO_PRESET = {v[0]: k for k, v in PRESETS.items()}
+SOURCE_PRESETS = {              # source → 可选 preset key (dir 直推, 无预设)
+    'glb': ['static', 'spinpulse', 'glb_anim'],
+    'globe': ['globe_spin'],
+    'glbdir': ['glbseq'],
+    'dir': [],
+}
 
 _IS_WIN = (os.name == 'nt')
 _NOWIN = {'creationflags': 0x08000000} if _IS_WIN else {}   # CREATE_NO_WINDOW
@@ -198,7 +210,20 @@ def scan_subnet(base_ip, port=DEFAULT_PORT, prefix=23, timeout_s=0.4,
 
 # ================= 渲染 =================
 
-def render_args(preset, frames, glb, render_slices):
+def glb_seq_count(glb_dir):
+    """glbseq 目录里 *.glb 文件数 (= 帧数). 目录空/无效 → 0."""
+    if not glb_dir or not os.path.isdir(glb_dir):
+        return 0
+    return len(glob.glob(os.path.join(glb_dir, '*.glb')))
+
+
+def glb_take_names(glb_path):
+    """GLB 动画 take 名列表 ([] = 无动画). 惰性 import glb_anim (pygltflib)."""
+    import glb_anim
+    return glb_anim.list_takes(glb_path)
+
+
+def render_args(preset, frames, glb, render_slices, glb_dir='', anim_take='0'):
     """povstream add_render_opts 默认值 → Namespace, 按 GUI 选择覆盖."""
     ap = argparse.ArgumentParser()
     povstream.add_render_opts(ap)
@@ -207,10 +232,15 @@ def render_args(preset, frames, glb, render_slices):
     args.render_slices = int(render_slices)
     if glb:
         args.glb = glb
+    if glb_dir:
+        args.glb_dir = glb_dir
+    args.anim_take = str(anim_take).strip() or '0'
     anim = PRESETS[preset][1]
     if preset == 'static':
         args.frames = 1
         anim = 'spinpulse'          # 静态源: 用点云但不做动作
+    elif preset == 'glbseq':
+        args.frames = max(glb_seq_count(glb_dir), 1)    # 帧数 = 文件数
     args.anim = anim
     return args
 
@@ -233,19 +263,30 @@ def frame_voxel_iter(preset, source, args):
     return povstream.ANIMS[args.anim](args)
 
 
-def render_dir_name(preset, source, frames, glb, render_slices):
-    tag = os.path.splitext(os.path.basename(glb))[0] if (source == 'glb' and glb) else source
+def render_dir_name(preset, source, frames, glb, render_slices,
+                    glb_dir='', anim_take='0'):
+    if source == 'glb' and glb:
+        tag = os.path.splitext(os.path.basename(glb))[0]
+    elif source == 'glbdir' and glb_dir:
+        tag = os.path.basename(os.path.normpath(glb_dir))
+    else:
+        tag = source
     key = f'{source}|{preset}|{frames}|{glb}|{render_slices}'
+    if source == 'glbdir':
+        key += f'|{glb_dir}'
+    if preset == 'glb_anim':
+        key += f'|take={anim_take}'
     h = hashlib.md5(key.encode('utf-8')).hexdigest()[:8]
     return os.path.join(HERE, f'frames_studio_{tag}_{preset}_{frames}f_{h}')
 
 
 def render_job(preset, source, frames, glb, render_slices=120,
-               out_dir=None, progress=None, stop=None):
+               out_dir=None, progress=None, stop=None, glb_dir='', anim_take='0'):
     """渲染 N 帧 packed bin 到 out_dir. progress(done, total) 逐帧回调.
     已存在完整输出 (meta 匹配) 直接复用. 返回 out_dir."""
-    args = render_args(preset, frames, glb, render_slices)
-    out_dir = out_dir or render_dir_name(preset, source, args.frames, glb, render_slices)
+    args = render_args(preset, frames, glb, render_slices, glb_dir, anim_take)
+    out_dir = out_dir or render_dir_name(preset, source, args.frames, glb,
+                                         render_slices, glb_dir, args.anim_take)
     meta_path = os.path.join(out_dir, 'meta.json')
     if os.path.exists(meta_path):
         try:
@@ -273,6 +314,7 @@ def render_job(preset, source, frames, glb, render_slices=120,
         if progress:
             progress(i + 1, total)
     meta = {'preset': preset, 'source': source, 'glb': glb, 'frames': total,
+            'glb_dir': glb_dir, 'anim_take': args.anim_take,
             'render_slices': args.render_slices, 'frame_raw': FRAME_RAW,
             'generated': time.strftime('%Y-%m-%d %H:%M:%S')}
     with open(meta_path, 'w', encoding='utf-8') as f:
@@ -412,6 +454,15 @@ def main():
             ttk.Button(r, text='浏览...', width=7,
                        command=self.on_browse_glb).pack(side='left')
             r = ttk.Frame(src); r.pack(fill='x', pady=2)
+            ttk.Radiobutton(r, text='GLB 序列目录', value='glbdir',
+                            variable=self.source_var,
+                            command=self.on_source_change).pack(side='left')
+            self.glbdir_var = tk.StringVar(value=self.cfg['glb_dir'])
+            ttk.Entry(r, textvariable=self.glbdir_var, width=30).pack(
+                side='left', padx=4, fill='x', expand=True)
+            ttk.Button(r, text='浏览...', width=7,
+                       command=self.on_browse_glbdir).pack(side='left')
+            r = ttk.Frame(src); r.pack(fill='x', pady=2)
             ttk.Radiobutton(r, text='内置地球仪', value='globe', variable=self.source_var,
                             command=self.on_source_change).pack(side='left')
             r = ttk.Frame(src); r.pack(fill='x')
@@ -431,10 +482,17 @@ def main():
                                           values=list(PRESET_LABELS.values()),
                                           state='readonly', width=20)
             self.preset_cb.pack(side='left', padx=4)
+            self.preset_cb.bind('<<ComboboxSelected>>',
+                                lambda e: self._update_content_widgets())
+            ttk.Label(opts, text='动画take:').pack(side='left', padx=(10, 0))
+            self.take_var = tk.StringVar(value=str(self.cfg['anim_take']))
+            self.take_entry = ttk.Entry(opts, textvariable=self.take_var, width=6)
+            self.take_entry.pack(side='left', padx=4)
             ttk.Label(opts, text='帧数:').pack(side='left', padx=(10, 0))
             self.frames_var = tk.IntVar(value=int(self.cfg['frames']))
-            ttk.Spinbox(opts, from_=1, to=360, textvariable=self.frames_var,
-                        width=5).pack(side='left', padx=4)
+            self.frames_sb = ttk.Spinbox(opts, from_=1, to=360,
+                                         textvariable=self.frames_var, width=5)
+            self.frames_sb.pack(side='left', padx=4)
 
             act = ttk.Frame(left); act.pack(fill='x', **pad)
             self.render_btn = ttk.Button(act, text='渲染', command=self.on_render)
@@ -470,6 +528,12 @@ def main():
             self.default_btn.pack(side='left', padx=6)
             self.stream_msg = tk.StringVar(value='未推流')
             ttk.Label(st, textvariable=self.stream_msg).pack(anchor='w', padx=8, pady=(0, 4))
+
+            # 源相关预设 / take / 帧数 状态初始化 + 序列目录变化即刷帧数
+            self._update_preset_choices()
+            self._update_content_widgets()
+            self.glbdir_var.trace_add(
+                'write', lambda *a: self._update_content_widgets())
 
             # 初始预览: 上次渲染目录
             d = self.cfg.get('last_render_dir')
@@ -602,10 +666,42 @@ def main():
             threading.Thread(target=poll, daemon=True).start()
 
         # ---------- 内容 ----------
+        def _update_preset_choices(self):
+            """预设下拉随源变化; 当前预设不适用时切到该源第一个预设."""
+            keys = SOURCE_PRESETS.get(self.source_var.get(), [])
+            labels = [PRESET_LABELS[k] for k in keys]
+            self.preset_cb.configure(values=labels)
+            if not keys:                        # 预渲染目录: 直推, 无预设
+                self.preset_var.set('')
+                self.preset_cb.configure(state='disabled')
+                return
+            self.preset_cb.configure(state='readonly')
+            if LABEL_TO_PRESET.get(self.preset_var.get()) not in keys:
+                self.preset_var.set(labels[0])
+
+        def _update_content_widgets(self):
+            """动画take 只在 GLB自带动画 预设可编; glbdir 源帧数=文件数只读."""
+            preset = LABEL_TO_PRESET.get(self.preset_var.get())
+            self.take_entry.configure(
+                state='normal' if preset == 'glb_anim' else 'disabled')
+            frames_locked = str(self.frames_sb.cget('state')) == 'disabled'
+            if self.source_var.get() == 'glbdir':
+                if not frames_locked:           # 进入 glbdir 前记住手动帧数
+                    try:
+                        self._frames_manual = max(int(self.frames_var.get()), 1)
+                    except (ValueError, tk.TclError):
+                        pass
+                self.frames_var.set(glb_seq_count(self.glbdir_var.get().strip()))
+                self.frames_sb.configure(state='disabled')
+            else:
+                if frames_locked:
+                    self.frames_var.set(getattr(self, '_frames_manual',
+                                                int(self.cfg['frames'])))
+                self.frames_sb.configure(state='normal')
+
         def on_source_change(self):
-            src = self.source_var.get()
-            if src == 'globe':
-                self.preset_var.set(PRESET_LABELS['globe_spin'])
+            self._update_preset_choices()
+            self._update_content_widgets()
 
         def on_browse_glb(self):
             p = filedialog.askopenfilename(title='选择 GLB 模型',
@@ -613,25 +709,46 @@ def main():
             if p:
                 self.glb_var.set(p)
                 self.source_var.set('glb')
+                self.on_source_change()
+
+        def on_browse_glbdir(self):
+            p = filedialog.askdirectory(
+                title='选择 GLB 帧序列目录 (sorted *.glb, 每文件一帧)',
+                initialdir=HERE)
+            if p:
+                self.glbdir_var.set(p)
+                self.source_var.set('glbdir')
+                self.on_source_change()
 
         def on_browse_dir(self):
             p = filedialog.askdirectory(title='选择预渲染帧目录', initialdir=HERE)
             if p:
                 self.dir_var.set(p)
                 self.source_var.set('dir')
+                self.on_source_change()
                 fb = first_frame_bin(p)
                 if fb:
                     self._show_preview(fb)
 
         def _gather(self):
-            """UI → cfg dict (并持久化)."""
+            """UI → cfg dict (并持久化). glbdir 源帧数=文件数只是显示,
+            持久化仍存手动帧数."""
+            try:
+                frames = max(int(self.frames_var.get() or 1), 1)
+            except (ValueError, tk.TclError):
+                frames = max(int(self.cfg['frames']), 1)
+            if self.source_var.get() == 'glbdir':
+                frames = getattr(self, '_frames_manual',
+                                 max(int(self.cfg['frames']), 1))
             self.cfg.update({
                 'ip': self.ip_var.get().strip(),
                 'source': self.source_var.get(),
                 'glb': self.glb_var.get().strip(),
+                'glb_dir': self.glbdir_var.get().strip(),
                 'dir': self.dir_var.get().strip(),
                 'preset': LABEL_TO_PRESET.get(self.preset_var.get(), 'spinpulse'),
-                'frames': max(int(self.frames_var.get() or 1), 1),
+                'anim_take': self.take_var.get().strip() or '0',
+                'frames': frames,
                 'fps': max(int(self.fps_var.get() or 1), 1),
                 'loop': bool(self.loop_var.get()),
                 'reconnect': bool(self.reconn_var.get()),
@@ -661,6 +778,26 @@ def main():
             if cfg['source'] == 'glb' and cfg['glb'] and not os.path.exists(cfg['glb']):
                 messagebox.showerror('POV Studio', f'GLB 不存在: {cfg["glb"]}')
                 return
+            if cfg['source'] == 'glbdir' and glb_seq_count(cfg['glb_dir']) == 0:
+                messagebox.showerror('POV Studio',
+                                     'GLB 序列目录里没有 *.glb 文件: '
+                                     f'{cfg["glb_dir"] or "(未选)"}')
+                return
+            if cfg['source'] == 'glb' and cfg['preset'] == 'glb_anim':
+                path = cfg['glb'] or gas.DEFAULT_GLB
+                try:
+                    takes = glb_take_names(path)
+                except Exception as e:
+                    messagebox.showerror('POV Studio', f'读 GLB 动画失败: {e}')
+                    return
+                if not takes:
+                    messagebox.showinfo(
+                        'POV Studio',
+                        f'{os.path.basename(path)} 没有自带动画 take,\n'
+                        '将按 "静态" 单帧渲染。')
+                    cfg['preset'] = 'static'
+                    self.preset_var.set(PRESET_LABELS['static'])
+                    self._update_content_widgets()
             self.rendering = True
             self.render_stop = threading.Event()
             self.render_btn.configure(text='取消渲染')
@@ -677,7 +814,9 @@ def main():
             try:
                 out_dir = render_job(cfg['preset'], cfg['source'], cfg['frames'],
                                      cfg['glb'], cfg['render_slices'],
-                                     progress=progress, stop=self.render_stop)
+                                     progress=progress, stop=self.render_stop,
+                                     glb_dir=cfg['glb_dir'],
+                                     anim_take=cfg['anim_take'])
                 self.cfg['last_render_dir'] = out_dir
                 save_config(self.cfg)
                 fb = first_frame_bin(out_dir)

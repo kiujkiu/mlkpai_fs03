@@ -10,6 +10,8 @@ test_studio.py — POV Studio headless 测试 (WSL python3, 无 tkinter 也能�
 2. 自动重连: 推流中 kill fake_board → 重启 → 断言续推 + reconnects 计数.
 3. 配置存取: save/load 往返 + 坏文件回默认.
 4. 预览: packed bin → preview_image 尺寸/亮点断言.
+5. GLB 动画源: render_args glbanim/glbseq 参数映射 + take 入 hash +
+   glb_take_names + spincube glbanim/glbseq mini 全管线渲染.
 """
 import os
 import sys
@@ -41,6 +43,7 @@ def setUpModule():
     """渲一次 mini 帧集 (globe 2 帧, 8 渲染角), 全部测试共用."""
     global _TMP, _FRAMES_DIR
     _TMP = tempfile.mkdtemp(prefix='pov_studio_test_')
+    os.environ['POVSTREAM_CACHE'] = os.path.join(_TMP, 'cache')  # 不污染 pc/cache
     _FRAMES_DIR = os.path.join(_TMP, 'frames_mini')
     t0 = time.time()
     out = pov_studio.render_job('globe_spin', 'globe', 2, '', render_slices=8,
@@ -175,6 +178,93 @@ class TestConfig(unittest.TestCase):
         cfg = pov_studio.load_config(p)
         self.assertEqual(cfg['ip'], '1.2.3.4')
         self.assertNotIn('bogus', cfg)
+
+
+def _spincube_glb():
+    """test_assets/spincube.glb (带 'spin' take 的动画立方体), 缺则现做."""
+    p = os.path.join(HERE, 'test_assets', 'spincube.glb')
+    if not os.path.exists(p):
+        sys.path.insert(0, os.path.join(HERE, 'test_assets'))
+        import make_test_glb as mk
+        mk.make_spincube(p)
+    return p
+
+
+class TestGlbSources(unittest.TestCase):
+    """GLB自带动画 (glbanim) + GLB 序列目录 (glbseq) 接线."""
+
+    def test_render_args_glbanim(self):
+        a = pov_studio.render_args('glb_anim', 4, '/tmp/x.glb', 24,
+                                   anim_take='wave')
+        self.assertEqual(a.anim, 'glbanim')
+        self.assertEqual(a.frames, 4)
+        self.assertEqual(a.glb, '/tmp/x.glb')
+        self.assertEqual(a.anim_take, 'wave')
+        self.assertEqual(a.render_slices, 24)
+        # 空 take 回默认 '0'
+        self.assertEqual(pov_studio.render_args('glb_anim', 2, '', 24,
+                                                anim_take='  ').anim_take, '0')
+
+    def test_render_args_glbseq_frames_from_dir(self):
+        d = os.path.join(_TMP, 'seq_args')
+        os.makedirs(d, exist_ok=True)
+        for n in ('a.glb', 'b.glb'):
+            open(os.path.join(d, n), 'wb').close()
+        a = pov_studio.render_args('glbseq', 99, '', 24, glb_dir=d)
+        self.assertEqual(a.anim, 'glbseq')
+        self.assertEqual(a.glb_dir, d)
+        self.assertEqual(a.frames, 2, '帧数应 = 目录 *.glb 文件数')
+        self.assertEqual(pov_studio.glb_seq_count(d), 2)
+        self.assertEqual(pov_studio.glb_seq_count(''), 0)
+        self.assertEqual(pov_studio.glb_seq_count(d + '_nope'), 0)
+
+    def test_render_args_static_unchanged(self):
+        a = pov_studio.render_args('static', 8, '', 24)
+        self.assertEqual((a.frames, a.anim), (1, 'spinpulse'))
+
+    def test_render_dir_name_take_in_hash(self):
+        d0 = pov_studio.render_dir_name('glb_anim', 'glb', 2, 'a.glb', 24,
+                                        anim_take='0')
+        d1 = pov_studio.render_dir_name('glb_anim', 'glb', 2, 'a.glb', 24,
+                                        anim_take='1')
+        self.assertNotEqual(d0, d1, 'anim_take 必须参与 hash')
+        self.assertTrue(os.path.basename(d0).startswith(
+            'frames_studio_a_glb_anim_2f_'), d0)
+
+    def test_glb_take_names(self):
+        self.assertEqual(pov_studio.glb_take_names(_spincube_glb()), ['spin'])
+        sys.path.insert(0, os.path.join(HERE, 'test_assets'))
+        import make_test_glb as mk
+        static = os.path.join(_TMP, 'static_cube.glb')
+        mk.make_offset_cube(static, (0.0, 0.0, 0.0), (255, 0, 0))
+        self.assertEqual(pov_studio.glb_take_names(static), [],
+                         '无动画 GLB take 列表应为空')
+
+    def test_glbanim_mini_render_two_frames_differ(self):
+        out = os.path.join(_TMP, 'render_glbanim')
+        d = pov_studio.render_job('glb_anim', 'glb', 2, _spincube_glb(),
+                                  render_slices=24, out_dir=out)
+        bins = sorted(glob.glob(os.path.join(d, 'frame_*.bin')))
+        self.assertEqual(len(bins), 2)
+        datas = [open(b, 'rb').read() for b in bins]
+        for x in datas:
+            self.assertEqual(len(x), FRAME_RAW)         # 4,423,680
+        self.assertNotEqual(datas[0], datas[1], 'glbanim 两帧应不同 (立方体在转)')
+        meta = json.load(open(os.path.join(d, 'meta.json')))
+        self.assertEqual(meta['anim_take'], '0')
+
+    def test_glbseq_mini_render_two_files(self):
+        seq = os.path.join(_TMP, 'seq_render')
+        os.makedirs(seq, exist_ok=True)
+        for n in ('f000.glb', 'f001.glb'):
+            shutil.copy(_spincube_glb(), os.path.join(seq, n))
+        out = os.path.join(_TMP, 'render_glbseq')
+        d = pov_studio.render_job('glbseq', 'glbdir', 0, '', render_slices=24,
+                                  out_dir=out, glb_dir=seq)
+        bins = sorted(glob.glob(os.path.join(d, 'frame_*.bin')))
+        self.assertEqual(len(bins), 2, '帧数 = 序列目录文件数')
+        for b in bins:
+            self.assertEqual(os.path.getsize(b), FRAME_RAW)
 
 
 class TestPreview(unittest.TestCase):
