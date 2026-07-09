@@ -1,7 +1,7 @@
 #!/bin/sh
 # FS03 POV 开机 bring-up v4 — bank A 预载默认 anime (无 WiFi 也显示), 推流到达自动切换
 exec > /home/uisrc/pov_boot.log 2>&1
-echo "=== pov_boot v4 uptime=$(cut -d' ' -f1 /proc/uptime)"
+echo "=== pov_boot v4.1 oe192 uptime=$(cut -d' ' -f1 /proc/uptime)"
 dmesg -n 1
 modprobe mt7921u 2>&1
 python3 - <<'PY'
@@ -33,7 +33,7 @@ p = mmap.mmap(f, 4096, offset=0x40010000)
 def pw(off, v): p[off:off+4] = v.to_bytes(4,'little')
 pw(0x18, 0x10000000)                # slice_base = bank A
 pw(0x10, (360 << 16) | 0x1)         # sensor 模式 pov_en
-pw(0x0C, 0x000001FF); pw(0x0C, 0xB8363001); pw(0x0C, 0xC1000003)
+pw(0x0C, 0x000001FF); pw(0x0C, 0xB836C001); pw(0x0C, 0xC1000003)
 print('phy+panel+default-anime OK')
 PY
 pkill pov_rxd 2>/dev/null; sleep 1
