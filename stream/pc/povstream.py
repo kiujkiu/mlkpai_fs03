@@ -10,13 +10,20 @@ frame = 360 slices × 0x3000 = 4,423,680B (pack_obs 硬件实测映射, 不可�
 numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
 
   python3 povstream.py render --anim spinpulse --frames 8 --render-slices 90
+  python3 povstream.py render --anim glbseq --glb-dir my_seq/ --render-slices 90
+  python3 povstream.py render --anim glbanim --glb walk.glb --anim-take 0 --frames 12
   python3 povstream.py stream --dir frames_spinpulse --host <board> --fps 10 --loop
   python3 povstream.py stream --anim globe --frames 60 --loop   # 现渲直推 (慢)
   python3 povstream.py bench                                    # 压缩测量
 
 动画源:
   spinpulse: anime GLB 点云 + 呼吸缩放 ±5% + 上下浮动 + 披风 x-shear 摆动
-  globe:     程序化经纬球点云, 大陆 = 正弦噪声, 逐帧自转
+  globe:     程序化经纬球点云, NASA 贴图大陆, 逐帧自转
+  glbseq:    --glb-dir 目录内 sorted *.glb 逐文件一帧 (外部工具烘的帧序列),
+             全序列共用 bbox 归一 (防帧间 jitter), 逐文件采样结果 npz 缓存
+  glbanim:   --glb 单文件真 glTF 动画 (骨骼 skinning / morph targets / 节点
+             TRS), --anim-take 选 take, --frames N 均匀采样 timeline
+             (t = k/N × duration, 首尾相接可 loop), 见 glb_anim.py
   (stream --dir = 预渲染 .bin 目录, 即任务里的 'file' 源)
 """
 import os
@@ -127,16 +134,21 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither):
 
 # ================= 动画源: spinpulse =================
 
+def _cache_dir():
+    return os.environ.get('POVSTREAM_CACHE', os.path.join(HERE, 'cache'))
+
+
 def load_anime_points(args):
     """GLB 采样点云, 结果缓存 npz (采样是最贵的一步, 只做一次)."""
-    key = f'{os.path.splitext(os.path.basename(args.glb))[0]}_{args.samples}'
-    cache = os.path.join(HERE, 'cache', f'pts_{key}.npz')
+    samples = args.samples or 1800000
+    key = f'{os.path.splitext(os.path.basename(args.glb))[0]}_{samples}'
+    cache = os.path.join(_cache_dir(), f'pts_{key}.npz')
     if os.path.exists(cache):
         z = np.load(cache)
         xyz, col = z['xyz'], z['col']
         print(f'[cache] {cache}: {len(xyz)} pts', flush=True)
     else:
-        xyz, col = gas.points_from_glb(args.glb, args.samples, args.lighting, args.ambient)
+        xyz, col = gas.points_from_glb(args.glb, samples, args.lighting, args.ambient)
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         np.savez_compressed(cache, xyz=xyz, col=col)
         print(f'[cache] saved {cache}', flush=True)
@@ -242,7 +254,84 @@ def globe_frames(args):
         yield gas.voxel_grid(p, col, verbose=False)
 
 
-ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames}
+# ================= 动画源: glbseq / glbanim (GLB 动画装载器) =================
+# TODO: pov_studio.py PRESETS 尚未接入 glbseq/glbanim (本轮不做 GUI 集成)
+
+def normalize_common(xyz, cmin, cmax, z_stretch):
+    """gas.normalize_points 的固定-bbox 版: 整段动画所有帧共用同一
+    center/scale (逐帧各自归一会让动画整体缩放/平移抖动)."""
+    p = xyz - (cmin + cmax) / 2.0
+    p[:, 2] *= z_stretch
+    h = np.maximum((cmax - cmin) / 2.0, 1e-6)
+    s = min(gas.R_BUDGET / h[0], gas.H_BUDGET / h[1],
+            gas.R_BUDGET / max(h[2] * z_stretch, 1e-6))
+    return (p * s).astype(np.float32)
+
+
+def _load_glb_points_cached(path, samples, lighting, ambient):
+    """单 GLB 文件采样点云 + npz 缓存 (同 load_anime_points, key 加路径
+    hash 防序列目录里同名文件互撞)."""
+    tag = hashlib.md5(os.path.abspath(path).encode()).hexdigest()[:8]
+    key = f'{os.path.splitext(os.path.basename(path))[0]}_{tag}_{samples}'
+    cache = os.path.join(_cache_dir(), f'pts_{key}.npz')
+    if os.path.exists(cache):
+        z = np.load(cache)
+        xyz, col = z['xyz'], z['col']
+        print(f'[cache] {cache}: {len(xyz)} pts', flush=True)
+    else:
+        xyz, col = gas.points_from_glb(path, samples, lighting, ambient)
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        np.savez_compressed(cache, xyz=xyz, col=col)
+        print(f'[cache] saved {cache}', flush=True)
+    return np.asarray(xyz, np.float32), np.asarray(col, np.float32)
+
+
+def glbseq_frames(args):
+    """GLB 帧序列: --glb-dir 内 sorted *.glb, 每文件 = 一帧 (外部 DCC 工具
+    逐帧导出的动画). 帧数 = 文件数 (--frames 被忽略). 先全量装载算全局
+    bbox, 所有帧共用同一归一变换."""
+    if not args.glb_dir:
+        sys.exit('--anim glbseq 需要 --glb-dir <目录>')
+    files = sorted(glob.glob(os.path.join(args.glb_dir, '*.glb')))
+    if not files:
+        sys.exit(f'no .glb files in {args.glb_dir}')
+    samples = args.samples or 400000
+    seq = [_load_glb_points_cached(f, samples, args.lighting, args.ambient)
+           for f in files]
+    cmin = np.min([x.min(axis=0) for x, _ in seq], axis=0)
+    cmax = np.max([x.max(axis=0) for x, _ in seq], axis=0)
+    args.frames = len(files)
+    print(f'[glbseq] {len(files)} frames x {samples} pts, '
+          f'bbox {cmin.round(2)}..{cmax.round(2)}', flush=True)
+    for xyz, col in seq:
+        col = gas.color_adjust(col, args.brighten, args.gamma, args.saturation)
+        yield gas.voxel_grid(normalize_common(xyz, cmin, cmax, args.z_stretch),
+                             col, verbose=False)
+
+
+def glbanim_frames(args):
+    """单 GLB 真 glTF 动画 (骨骼 skinning / morph targets / 节点 TRS,
+    见 glb_anim.py). --frames N 均匀采 timeline: t = k/N × duration
+    (k=0..N-1, 首尾相接可 loop); --anim-take 选 take (名或索引).
+    所有帧共用全时段 bbox 归一."""
+    import glb_anim
+    samples = args.samples or 400000
+    smp = glb_anim.AnimSampler(args.glb, take=args.anim_take, samples=samples,
+                               lighting=args.lighting, ambient=args.ambient)
+    n = args.frames
+    if smp.duration <= 0:
+        print('[glbanim] WARNING: 无动画 timeline, 全帧静态姿态', flush=True)
+    times = [smp.duration * k / n for k in range(n)]
+    cmin, cmax = smp.bbox_over(times)
+    for t in times:
+        xyz, col = smp.points_at(t)
+        col = gas.color_adjust(col, args.brighten, args.gamma, args.saturation)
+        yield gas.voxel_grid(normalize_common(xyz, cmin, cmax, args.z_stretch),
+                             col, verbose=False)
+
+
+ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
+         'glbseq': glbseq_frames, 'glbanim': glbanim_frames}
 
 
 def gen_packed_frames(args):
@@ -475,9 +564,10 @@ def add_render_opts(ap):
     ap.add_argument('--sub', type=int, default=3)
     ap.add_argument('--thresh', type=float, default=128)
     ap.add_argument('--no-dither', action='store_true')
-    # spinpulse
+    # spinpulse / glbanim
     ap.add_argument('--glb', default=gas.DEFAULT_GLB)
-    ap.add_argument('--samples', type=int, default=1800000)
+    ap.add_argument('--samples', type=int, default=None,
+                    help='GLB 采样点数 (默认: spinpulse 1800000, glbseq/glbanim 400000)')
     ap.add_argument('--z-stretch', type=float, default=1.0)
     ap.add_argument('--brighten', type=float, default=1.5)
     ap.add_argument('--gamma', type=float, default=0.9)
@@ -487,6 +577,11 @@ def add_render_opts(ap):
     ap.add_argument('--breath', type=float, default=0.05, help='呼吸缩放幅度')
     ap.add_argument('--bob', type=float, default=2.5, help='竖直浮动幅度 (voxel)')
     ap.add_argument('--sway', type=float, default=3.0, help='披风 x-shear 幅度 (voxel)')
+    # glbseq / glbanim
+    ap.add_argument('--glb-dir', default=None,
+                    help='glbseq: GLB 帧序列目录 (sorted *.glb, 每文件一帧)')
+    ap.add_argument('--anim-take', default='0',
+                    help='glbanim: 动画 take 名或索引 (默认 0)')
 
 
 def main():
