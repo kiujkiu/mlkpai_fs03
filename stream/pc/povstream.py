@@ -30,6 +30,7 @@ import socket
 import struct
 import hashlib
 import argparse
+import threading
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -216,6 +217,132 @@ def cmd_render(args):
     print(f'[render] {args.frames} frames -> {out_dir} ({time.time() - t0:.1f}s total)', flush=True)
 
 
+# ================= 推流核心 (类 + 回调, GUI/CLI 共用) =================
+
+class StreamerError(Exception):
+    """协议级致命错 (NAK / 无重连时连接失败)。"""
+
+
+class Streamer:
+    """PVS1 推流器. run(make_iter) 阻塞直到帧尽/stop/致命错.
+
+    make_iter: 无参可调用, 返回逐帧 FRAME_RAW 字节迭代器 (loop 时反复调用).
+    reconnect=True 时 ACK 超时/连接断 (板重启) → 每 retry_interval 秒重连,
+    重连成功后重发当前帧继续; NAK 永远致命 (协议规定 sender abort).
+    回调 (可选, 在推流线程里调):
+      on_frame(stats)               每帧 ACK 后
+      on_status(event, detail)      event ∈ connected/lost/retry/done
+    stop: threading.Event, 置位后尽快退出 (sleep/重连等待均可打断).
+    """
+
+    def __init__(self, host, port=DEFAULT_PORT, fps=10.0, loop=False,
+                 codec='zlib', zlevel=6, reconnect=False, retry_interval=5.0,
+                 ack_timeout=30.0, on_frame=None, on_status=None, stop=None):
+        self.host, self.port = host, port
+        self.fps, self.loop = fps, loop
+        self.codec, self.zlevel = codec, zlevel
+        self.reconnect, self.retry_interval = reconnect, retry_interval
+        self.ack_timeout = ack_timeout
+        self.on_frame = on_frame or (lambda st: None)
+        self.on_status = on_status or (lambda ev, detail: None)
+        self.stop = stop if stop is not None else threading.Event()
+        self.frames = 0                 # 已 ACK 帧数
+        self.sent_raw = 0
+        self.sent_wire = 0
+        self.last_wire = 0              # 最近一帧线上字节 (含 16B 头)
+        self.reconnects = 0
+        self.t_start = None
+
+    # -- 内部: 连接 (reconnect 时无限重试, stop 可打断; 返回 None = 被停) --
+    def _connect(self, first):
+        while not self.stop.is_set():
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(self.ack_timeout)
+                self.on_status('connected', f'{self.host}:{self.port}')
+                return sock
+            except OSError as e:
+                if not self.reconnect:
+                    raise StreamerError(f'connect {self.host}:{self.port} failed: {e}')
+                if not first:
+                    self.reconnects += 1
+                self.on_status('retry', f'{e}; retry in {self.retry_interval}s')
+                self.stop.wait(self.retry_interval)
+        return None
+
+    def _send_one(self, sock, hdr, payload):
+        """发一帧等 ACK. 返回存活 sock (可能重连过) 或 None (被停)."""
+        while not self.stop.is_set():
+            if sock is None:
+                sock = self._connect(first=False)
+                if sock is None:
+                    return None
+            try:
+                sock.sendall(hdr + payload)
+                ack = sock.recv(1)
+                if ack == bytes([ACK]):
+                    return sock
+                if ack == bytes([NAK]):
+                    sock.close()
+                    raise StreamerError(f'frame {self.frames}: NAK, abort')
+                raise OSError(f'bad/empty ack {ack!r} (peer closed?)')
+            except (socket.timeout, OSError) as e:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                if not self.reconnect:
+                    raise StreamerError(f'frame {self.frames}: {e}')
+                self.reconnects += 1
+                self.on_status('lost', f'{e}; reconnect in {self.retry_interval}s')
+                self.stop.wait(self.retry_interval)
+        return None
+
+    def run(self, make_iter):
+        self.t_start = time.time()
+        t_next = self.t_start
+        sock = self._connect(first=True)
+        try:
+            while sock is not None and not self.stop.is_set():
+                for raw in make_iter():
+                    if self.stop.is_set():
+                        break
+                    payload, flags = compress_frame(raw, self.codec, self.zlevel)
+                    hdr = HDR.pack(MAGIC, len(payload), len(raw), N_SLICES, flags)
+                    sock = self._send_one(sock, hdr, payload)
+                    if sock is None:
+                        break
+                    self.frames += 1
+                    self.sent_raw += len(raw)
+                    self.last_wire = len(hdr) + len(payload)
+                    self.sent_wire += self.last_wire
+                    self.on_frame(self)
+                    if self.fps > 0:
+                        t_next = max(t_next + 1.0 / self.fps, time.time() - 1.0 / self.fps)
+                        dt = t_next - time.time()
+                        if dt > 0:
+                            self.stop.wait(dt)
+                if not self.loop:
+                    break
+        finally:
+            if sock is not None:
+                sock.close()
+            self.on_status('done', f'{self.frames} frames')
+        return self
+
+    # -- 统计便利 --
+    def elapsed(self):
+        return max(time.time() - (self.t_start or time.time()), 1e-6)
+
+    def wire_mbps(self):
+        return self.sent_wire / self.elapsed() / 1e6
+
+    def ratio(self):
+        return self.sent_raw / max(self.sent_wire, 1)
+
+
 # ================= stream 子命令 =================
 
 def frame_iter_from_dir(d):
@@ -233,42 +360,34 @@ def cmd_stream(args):
     def make_iter():
         return frame_iter_from_dir(args.dir) if args.dir else gen_packed_frames(args)
 
-    sock = socket.create_connection((args.host, args.port), timeout=30)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    print(f'[net] connected {args.host}:{args.port} codec={args.codec} fps={args.fps}', flush=True)
-    sent_raw = sent_wire = nframes = 0
-    t_start = time.time()
+    def on_status(ev, detail):
+        if ev == 'connected':
+            print(f'[net] connected {detail} codec={args.codec} fps={args.fps}', flush=True)
+        elif ev in ('lost', 'retry'):
+            print(f'[net] {ev}: {detail}', flush=True)
+
+    def on_frame(st):
+        if args.verbose:
+            print(f'  frame {st.frames}: {st.last_wire - HDR.size}B wire '
+                  f'({FRAME_RAW / max(st.last_wire - HDR.size, 1):.1f}x)', flush=True)
+
+    s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop,
+                 codec=args.codec, zlevel=args.zlevel, reconnect=args.reconnect,
+                 on_frame=on_frame, on_status=on_status)
     try:
-        while True:
-            for raw in make_iter():
-                payload, flags = compress_frame(raw, args.codec, args.zlevel)
-                hdr = HDR.pack(MAGIC, len(payload), len(raw), N_SLICES, flags)
-                deadline = t_start + (nframes + 1) / args.fps
-                sock.sendall(hdr + payload)
-                ack = sock.recv(1)
-                if ack != bytes([ACK]):
-                    sys.exit(f'[net] frame {nframes}: bad ack {ack!r}, abort')
-                nframes += 1
-                sent_raw += len(raw)
-                sent_wire += len(hdr) + len(payload)
-                if args.verbose:
-                    print(f'  frame {nframes}: {len(payload)}B wire '
-                          f'({len(raw) / len(payload):.1f}x)', flush=True)
-                now = time.time()
-                if now < deadline:
-                    time.sleep(deadline - now)
-            if not args.loop:
-                break
+        s.run(make_iter)
     except KeyboardInterrupt:
         print('[net] interrupted', flush=True)
-    finally:
-        sock.close()
-    dt = max(time.time() - t_start, 1e-6)
-    print(f'[stats] {nframes} frames in {dt:.2f}s = {nframes / dt:.2f} model fps | '
-          f'wire {sent_wire / dt / 1e6:.2f} MB/s (raw {sent_raw / dt / 1e6:.2f} MB/s) | '
-          f'compression {sent_raw / max(sent_wire, 1):.1f}x', flush=True)
+    except StreamerError as e:
+        print(f'[net] {e}', flush=True)
+        if s.frames == 0:
+            sys.exit(1)
+    dt = s.elapsed()
+    print(f'[stats] {s.frames} frames in {dt:.2f}s = {s.frames / dt:.2f} model fps | '
+          f'wire {s.wire_mbps():.2f} MB/s (raw {s.sent_raw / dt / 1e6:.2f} MB/s) | '
+          f'compression {s.ratio():.1f}x', flush=True)
     print(f'[stats] projected fps @ 9.4 MB/s link: '
-          f'{9.4e6 / (sent_wire / max(nframes, 1)):.1f}', flush=True)
+          f'{9.4e6 / (s.sent_wire / max(s.frames, 1)):.1f}', flush=True)
 
 
 # ================= bench 子命令 =================
@@ -330,6 +449,8 @@ def main():
     s.add_argument('--port', type=int, default=DEFAULT_PORT)
     s.add_argument('--fps', type=float, default=10.0)
     s.add_argument('--loop', action='store_true')
+    s.add_argument('--reconnect', action='store_true',
+                   help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推)')
     s.add_argument('--codec', choices=['zlib', 'rle', 'raw'], default='zlib')
     s.add_argument('--zlevel', type=int, default=6)
     s.add_argument('-v', '--verbose', action='store_true')
