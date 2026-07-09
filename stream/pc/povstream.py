@@ -27,6 +27,9 @@ numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
   spin:      任意静态 GLB 绕竖轴 (y) 自转, --frames = 一圈; --scale 整体
              缩放 (地球仪用 0.48 = 直径半幅), 贴图色要过 1-bit 用
              --lighting none + brighten/gamma/saturation 全 1.0
+  palace:    程序化紫禁城空中巡游 (palace.py): 绕 y 轴一整圈 yaw +
+             zoom 0.75→1.15→0.75 正弦一循环 (拉远/拉近), 红墙金顶
+             白玉台/金水河/角楼, 全 1-bit 纯色, 首尾相接可 loop
   (stream --dir = 预渲染 .bin 目录, 即任务里的 'file' 源)
 """
 import os
@@ -358,9 +361,44 @@ def spin_frames(args):
         yield gas.voxel_grid(p, col, verbose=False)
 
 
+# ================= 动画源: palace (紫禁城空中巡游) =================
+
+PALACE_ZOOM_MAX = 1.15
+
+
+def palace_points_prescaled():
+    """紫禁城点云 (palace.py), 预缩放到 zoom 最大 (1.15) 时任意 yaw 角
+    都不出预算: 旋转约束是径向 sqrt(x²+z²) ≤ R_BUDGET (footprint 对角
+    在 45° 时甩到最远, 出圆柱会被 clip 糊边), 竖直 |y| ≤ H_BUDGET."""
+    import palace
+    p0, col = palace.build_palace()
+    r_max = float(np.hypot(p0[:, 0], p0[:, 2]).max())
+    y_max = float(np.abs(p0[:, 1]).max())
+    s = min((gas.R_BUDGET - 0.5) / (r_max * PALACE_ZOOM_MAX),
+            (gas.H_BUDGET - 0.5) / (y_max * PALACE_ZOOM_MAX))
+    return (p0 * s).astype(np.float32), col.astype(np.float32)
+
+
+def palace_frames(args):
+    """紫禁城空中巡游: 每循环绕 y 轴 yaw 一整圈, 同时 zoom 按正弦
+    0.75→1.15→0.75 一循环 (拉远→拉近→拉远, 读作 fly-out/fly-in).
+    先旋转再缩放再体素化, --frames = 循环周期, 首尾相接可 loop."""
+    p0, col = palace_points_prescaled()
+    n = args.frames
+    for t in range(n):
+        u = 2 * math.pi * t / n
+        zoom = 0.95 - 0.20 * math.cos(u)         # 0.75 → 1.15 → 0.75
+        c, s = math.cos(u), math.sin(u)          # yaw 一整圈
+        p = np.empty_like(p0)
+        p[:, 0] = (p0[:, 0] * c - p0[:, 2] * s) * zoom
+        p[:, 1] = p0[:, 1] * zoom
+        p[:, 2] = (p0[:, 0] * s + p0[:, 2] * c) * zoom
+        yield gas.voxel_grid(p, col, verbose=False)
+
+
 ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
          'glbseq': glbseq_frames, 'glbanim': glbanim_frames,
-         'spin': spin_frames}
+         'spin': spin_frames, 'palace': palace_frames}
 
 
 def gen_packed_frames(args):
