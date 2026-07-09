@@ -162,7 +162,7 @@ def spinpulse_frames(args):
 
 def globe_frames(args):
     """程序化经纬球: 正弦噪声大陆 + 极地冰盖, 逐帧自转 (转纹理不转点)."""
-    R = gas.R_BUDGET * 0.96
+    R = gas.R_BUDGET * 0.48                                 # 直径半幅 (2026-07-09 用户定)
     n_lat, n_lon = 240, 720
     lat = np.linspace(-math.pi / 2 * 0.98, math.pi / 2 * 0.98, n_lat, dtype=np.float32)
     lon = np.linspace(0, 2 * math.pi, n_lon, endpoint=False, dtype=np.float32)
@@ -178,10 +178,9 @@ def globe_frames(args):
                  + 0.6 * np.sin(5 * le - 2.1) * np.sin(3 * la + 0.4)
                  + 0.45 * np.cos(7 * le + 4.2) * np.cos(5 * la - 1.0))
         col = np.zeros((len(p), 3), np.float32)
-        col[:] = (0, 70, 255)                               # 海
+        col[:] = (0, 0, 255)                                # 海 = 纯蓝 (1-bit 混通道会偏色)
         land = noise > 0.35
-        col[land] = (40, 230, 40)                           # 陆
-        col[noise > 0.95] = (230, 200, 60)                  # 高地
+        col[land] = (0, 255, 0)                             # 陆 = 纯绿 (2026-07-09 用户定)
         col[np.abs(la) > math.radians(70)] = (255, 255, 255)  # 冰盖
         yield gas.voxel_grid(p, col, verbose=False)
 
