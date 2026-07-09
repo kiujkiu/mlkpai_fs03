@@ -54,7 +54,6 @@ for t in $(seq 1 30); do
 done
 echo "IF=[$IF]"
 [ -n "$IF" ] || { echo NO_WLAN_STATIC_ONLY; exit 0; }
-for P in /sys/class/ieee80211/phy*; do iw phy $(basename $P) set txpower fixed 700 2>&1; done
 pkill wpa_supplicant 2>/dev/null; sleep 1
 wpa_supplicant -B -i $IF -c /etc/wpa_supplicant/wpa.conf
 for t in $(seq 1 20); do
