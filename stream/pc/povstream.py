@@ -30,6 +30,9 @@ numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
   palace:    程序化紫禁城空中巡游 (palace.py): 绕 y 轴一整圈 yaw +
              zoom 0.75→1.15→0.75 正弦一循环 (拉远/拉近), 红墙金顶
              白玉台/金水河/角楼, 全 1-bit 纯色, 首尾相接可 loop
+  notredame: 程序化巴黎圣母院空中巡游 (notredame.py), 同 palace 巡游
+             (共用 orbit_frames): 白石双塔/玫瑰窗(蓝盘红心)/铜绿坡顶/
+             飞扶壁/交叉点尖塔(黄尖)/半圆后殿, 哥特竖直感, 全 1-bit 纯色
   (stream --dir = 预渲染 .bin 目录, 即任务里的 'file' 源)
 """
 import os
@@ -361,44 +364,68 @@ def spin_frames(args):
         yield gas.voxel_grid(p, col, verbose=False)
 
 
-# ================= 动画源: palace (紫禁城空中巡游) =================
+# ================= 动画源: palace / notredame (空中巡游 orbit) =================
 
-PALACE_ZOOM_MAX = 1.15
+ORBIT_ZOOM_MAX = 1.15
+PALACE_ZOOM_MAX = ORBIT_ZOOM_MAX          # 兼容旧名 (test_palace.py 引用)
 
 
-def palace_points_prescaled():
-    """紫禁城点云 (palace.py), 预缩放到 zoom 最大 (1.15) 时任意 yaw 角
-    都不出预算: 旋转约束是径向 sqrt(x²+z²) ≤ R_BUDGET (footprint 对角
-    在 45° 时甩到最远, 出圆柱会被 clip 糊边), 竖直 |y| ≤ H_BUDGET."""
-    import palace
-    p0, col = palace.build_palace()
+def orbit_prescale(p0, col):
+    """建筑点云预缩放到 zoom 最大 (1.15) 时任意 yaw 角都不出预算:
+    旋转约束是径向 sqrt(x²+z²) ≤ R_BUDGET (footprint 对角在 45° 时甩到
+    最远, 出圆柱会被 clip 糊边), 竖直 |y| ≤ H_BUDGET."""
     r_max = float(np.hypot(p0[:, 0], p0[:, 2]).max())
     y_max = float(np.abs(p0[:, 1]).max())
-    s = min((gas.R_BUDGET - 0.5) / (r_max * PALACE_ZOOM_MAX),
-            (gas.H_BUDGET - 0.5) / (y_max * PALACE_ZOOM_MAX))
+    s = min((gas.R_BUDGET - 0.5) / (r_max * ORBIT_ZOOM_MAX),
+            (gas.H_BUDGET - 0.5) / (y_max * ORBIT_ZOOM_MAX))
     return (p0 * s).astype(np.float32), col.astype(np.float32)
 
 
-def palace_frames(args):
-    """紫禁城空中巡游: 每循环绕 y 轴 yaw 一整圈, 同时 zoom 按正弦
-    0.75→1.15→0.75 一循环 (拉远→拉近→拉远, 读作 fly-out/fly-in).
-    先旋转再缩放再体素化, --frames = 循环周期, 首尾相接可 loop."""
-    p0, col = palace_points_prescaled()
+def palace_points_prescaled():
+    """紫禁城点云 (palace.py), 已 orbit 预缩放."""
+    import palace
+    return orbit_prescale(*palace.build_palace())
+
+
+def notredame_points_prescaled():
+    """巴黎圣母院点云 (notredame.py), 已 orbit 预缩放."""
+    import notredame
+    return orbit_prescale(*notredame.build_notredame())
+
+
+def orbit_frames(points, colors, args):
+    """空中巡游 (palace/notredame 共用): 每循环绕 y 轴 yaw 一整圈, 同时
+    zoom 按正弦 0.75→1.15→0.75 一循环 (拉远→拉近→拉远, 读作 fly-out/
+    fly-in). points 须已 orbit_prescale. 先旋转再缩放再体素化,
+    --frames = 循环周期, 首尾相接可 loop."""
     n = args.frames
     for t in range(n):
         u = 2 * math.pi * t / n
         zoom = 0.95 - 0.20 * math.cos(u)         # 0.75 → 1.15 → 0.75
         c, s = math.cos(u), math.sin(u)          # yaw 一整圈
-        p = np.empty_like(p0)
-        p[:, 0] = (p0[:, 0] * c - p0[:, 2] * s) * zoom
-        p[:, 1] = p0[:, 1] * zoom
-        p[:, 2] = (p0[:, 0] * s + p0[:, 2] * c) * zoom
-        yield gas.voxel_grid(p, col, verbose=False)
+        p = np.empty_like(points)
+        p[:, 0] = (points[:, 0] * c - points[:, 2] * s) * zoom
+        p[:, 1] = points[:, 1] * zoom
+        p[:, 2] = (points[:, 0] * s + points[:, 2] * c) * zoom
+        yield gas.voxel_grid(p, colors, verbose=False)
+
+
+def palace_frames(args):
+    """紫禁城空中巡游 (几何 palace.py, 巡游 orbit_frames)."""
+    p0, col = palace_points_prescaled()
+    yield from orbit_frames(p0, col, args)
+
+
+def notredame_frames(args):
+    """巴黎圣母院空中巡游 (几何 notredame.py, 巡游 orbit_frames)."""
+    p0, col = notredame_points_prescaled()
+    yield from orbit_frames(p0, col, args)
 
 
 ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
          'glbseq': glbseq_frames, 'glbanim': glbanim_frames,
-         'spin': spin_frames, 'palace': palace_frames}
+         'spin': spin_frames, 'palace': palace_frames,
+         'notredame': notredame_frames}
 
 
 def gen_packed_frames(args):
