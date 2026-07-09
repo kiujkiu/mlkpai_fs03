@@ -29,6 +29,7 @@ import zlib
 import socket
 import struct
 import hashlib
+from PIL import Image
 import argparse
 import threading
 import numpy as np
@@ -208,30 +209,33 @@ _WM = np.array([[c == '#' for c in row.ljust(80, '.')[:80]] for row in WORLD_MAP
 
 
 def globe_frames(args):
-    """真实大陆经纬球: 内嵌世界掩膜 + 极地冰盖, 双层壳加密, 逐帧自转."""
+    """实心地球 (zynq_pov _gen_globe_slices 方案移植): NASA earth_clean.jpg 方向投影采样,
+    海纯蓝/陆纯绿/冰白 (实测分类), 逐帧转纹理. 实心圆盘截面 → POV 密度拉满."""
     R = gas.R_BUDGET * 0.48                                 # 直径半幅 (2026-07-09 用户定)
-    n_lat, n_lon = 240, 720
-    lat = np.linspace(-math.pi / 2 * 0.98, math.pi / 2 * 0.98, n_lat, dtype=np.float32)
-    lon = np.linspace(0, 2 * math.pi, n_lon, endpoint=False, dtype=np.float32)
-    LA, LO = np.meshgrid(lat, lon, indexing='ij')
-    la1, lo1 = LA.ravel(), LO.ravel()
-    la = np.concatenate([la1, la1])
-    lo = np.concatenate([lo1, lo1])
-    rr = np.concatenate([np.full_like(la1, R), np.full_like(la1, R - 1.6)])  # 双层壳
-    p = np.stack([rr * np.cos(la) * np.cos(lo),
-                  rr * np.sin(la),
-                  rr * np.cos(la) * np.sin(lo)], axis=1).astype(np.float32)
-    H_, W_ = _WM.shape
+    tex_path = os.path.join(HERE, 'earth_clean.jpg')
+    tex = np.asarray(Image.open(tex_path).convert('RGB'), np.int32)
+    TH_, TW_ = tex.shape[:2]
+    # 实心球体素点云
+    ax = np.arange(-int(R), int(R) + 1, dtype=np.float32)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing='ij')
+    inside = X**2 + Y**2 + Z**2 <= R * R
+    x, y, z = X[inside], Y[inside], Z[inside]
+    p = np.stack([x, y, z], axis=1)
+    rn = np.maximum(np.sqrt(x**2 + y**2 + z**2), 1e-6)
+    la = np.arcsin(np.clip(y / rn, -1, 1))                  # y = 极轴 (竖直)
+    lo = np.arctan2(z, x)
     n = args.frames
     for t in range(n):
-        le = (lo + 2 * math.pi * t / n) % (2 * math.pi)     # 自转: 经度偏移采样纹理
-        row = np.clip(((math.pi / 2 - la) / math.pi * H_).astype(np.int32), 0, H_ - 1)
-        col_i = np.clip((le / (2 * math.pi) * W_).astype(np.int32), 0, W_ - 1)
-        land = _WM[row, col_i]
+        le = (lo + 2 * math.pi * t / n) % (2 * math.pi)     # 自转: 转纹理不转点
+        row = np.clip(((math.pi / 2 - la) / math.pi * TH_).astype(np.int32), 0, TH_ - 1)
+        ci = np.clip((le / (2 * math.pi) * TW_).astype(np.int32), 0, TW_ - 1)
+        r_, g_, b_ = tex[row, ci, 0], tex[row, ci, 1], tex[row, ci, 2]
+        ocean = (b_ > g_ + 10) & (b_ > r_ + 10)
+        ice = (r_ > 170) & (g_ > 170) & (b_ > 170)
         col = np.zeros((len(p), 3), np.float32)
-        col[:] = (0, 0, 255)                                # 海 = 纯蓝 (1-bit 混通道会偏色)
-        col[land] = (0, 255, 0)                             # 陆 = 纯绿 (2026-07-09 用户定)
-        col[np.abs(la) > math.radians(72)] = (255, 255, 255)  # 冰盖
+        col[:] = (0, 255, 0)                                # 默认陆 = 纯绿
+        col[ocean] = (0, 0, 255)                            # 海 = 纯蓝
+        col[ice] = (255, 255, 255)                          # 冰盖 = 白
         yield gas.voxel_grid(p, col, verbose=False)
 
 
