@@ -1,11 +1,15 @@
 /*
- * pov_rxd.c - board-side receiver daemon for the PVS1 POV frame stream.
+ * pov_rxd.c - board-side receiver daemon for the PVS POV frame stream
+ * (PVS1 + v2 delta, see stream/protocol.h + stream/pc/protocol.md).
  *
  * Target: Zynq-7020 (MLKPAI-FS03), ARM Cortex-A9, Debian buster userspace,
  * kernel 6.6. Build static with arm-linux-gnueabihf-gcc (see Makefile).
  *
- * Protocol: stream/protocol.h + stream/pc/protocol.md (PVS1).
- * TCP server on :9500; per frame: 16B header | payload; reply 1 ACK byte.
+ * Protocol: TCP server on :9500; per frame: 16B header | payload; reply
+ * 1 ACK byte. v2 adds flags bit2 = delta (XOR mask vs previous frame,
+ * normally RLE-coded). First frame of each connection must be a full
+ * frame; a delta that cannot be anchored is NAKed WITHOUT closing the
+ * connection (sender resends as keyframe).
  *
  * Hardware contract (verified PL POV engine @ 0x40010000):
  *   0x00 R  STATUS       engine health
@@ -25,15 +29,31 @@
  * page) are not kernel-managed RAM, so the /dev/mem mmap is uncached /
  * strongly-ordered: CPU stores go straight to DRAM, nothing is stuck in
  * L1/L2, and the PL HP-port reads see the data with no cache maintenance.
- * We still issue __sync_synchronize() (DMB) after the frame memcpy and
+ * We still issue __sync_synchronize() (DMB) after the bank writes and
  * before/after the slice_base register write so the frame data is
  * globally observable before the engine can latch the new base.
+ *
+ * 30 fps ingest path (v2): the current raw frame lives in a CACHED
+ * malloc'd shadow. Deltas are RLE-applied directly to the shadow (cost
+ * scales with changed bytes, not the 4.4 MB frame), tracking dirty 4 KiB
+ * pages. Each DDR bank keeps a dirty accumulator = pages where the bank
+ * differs from the shadow; after every frame only the accumulated dirty
+ * spans of the inactive bank are memcpy'd through the uncached mapping
+ * and its accumulator cleared, while this frame's dirty pages are OR-ed
+ * into BOTH accumulators. This holds the invariant "bank == shadow for
+ * every page not in its accumulator" regardless of flips, drops (same
+ * bank written twice) or keyframes (all pages dirty), so the stale
+ * inactive bank (normally 2 frames behind = union of last two deltas)
+ * always comes out exactly equal to the current frame. --verify memcmps
+ * the invariant after every frame (test/debug).
  *
  * Display-never-blocks policy: the PL engine keeps refetching whatever
  * slice_base points at; we only flip banks when the slice counter wraps
  * near 0. If the sender outruns the display (data already pending on the
  * socket while we wait for the wrap), the just-received frame is ACKed
  * and dropped (no flip) and we immediately receive the newer one.
+ * --bench disables the wrap gate (flip + ACK immediately) so raw ingest
+ * throughput is measurable beyond the rotation rate.
  *
  * Build modes:
  *   default          real /dev/mem + PL registers (ARM board)
@@ -61,6 +81,7 @@
 #include <zlib.h>
 
 #include "../protocol.h"
+#include "pvs_codec.h"
 
 /* ---- hardware constants ------------------------------------------------ */
 #define REG_PHYS_DEFAULT   0x40010000u
@@ -79,6 +100,7 @@
 #define SLICE_WRAP_THRESH  8                    /* "near 0" */
 #define FLIP_TIMEOUT_MS    2000                 /* engine idle? flip anyway */
 #define COMP_LEN_MAX       (PVS_FRAME_RAW + 0x10000u)
+#define STAT_EVERY         30                   /* frames per stats line */
 
 /* ---- logging ------------------------------------------------------------ */
 static void logts(const char *fmt, ...)
@@ -97,12 +119,29 @@ static void logts(const char *fmt, ...)
     fflush(stdout);
 }
 
+static uint64_t now_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)(t.tv_nsec / 1000);
+}
+
 /* ---- register + bank access (real vs sim) ------------------------------- */
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int sig) { (void)sig; g_stop = 1; }
 
 static uint8_t  *g_bank[2];      /* virtual addresses of bank A/B */
 static uint32_t  g_bank_phys[2]; /* physical addresses (what 0x18 wants) */
+
+/* options */
+static int g_bench  = 0;         /* ACK right after decode+write, no wrap gate */
+static int g_verify = 0;         /* memcmp bank-union invariant every frame */
+static int g_crc    = 0;         /* crc32 the shadow every frame (tests) */
+
+/* v2 state: cached shadow of the current raw frame + per-bank dirty accum */
+static uint8_t *g_shadow;
+static int      g_shadow_valid;                  /* delta anchor available? */
+static uint8_t  g_dirty_accum[2][PVS_N_PAGES];   /* bank differs from shadow */
 
 #ifndef SIM_NO_DEVMEM
 
@@ -196,28 +235,28 @@ static int sock_has_pending(int fd)
     return poll(&pf, 1, 0) > 0;
 }
 
-/* ---- decompression -------------------------------------------------------
- * Zero-run RLE (protocol.md): 0x00 escape byte followed by run:u16le emits
- * that many zero bytes; any other byte is a literal. Bare 0x00 never occurs.
+/* ---- bank sync ------------------------------------------------------------
+ * Copy every page accumulated as dirty for bank `b` from the shadow into the
+ * uncached bank mapping, coalescing consecutive pages into single memcpy
+ * spans (glibc memcpy uses NEON on the A9), then clear the accumulator.
+ * Returns bytes written.
  */
-static int rle_decode(const uint8_t *src, size_t slen, uint8_t *dst, size_t dlen)
+static size_t sync_bank(int b)
 {
-    size_t si = 0, di = 0;
-    while (si < slen) {
-        uint8_t b = src[si++];
-        if (b == 0x00) {
-            if (si + 2 > slen) return -1;
-            uint32_t run = (uint32_t)src[si] | ((uint32_t)src[si + 1] << 8);
-            si += 2;
-            if (di + run > dlen) return -1;
-            memset(dst + di, 0, run);
-            di += run;
-        } else {
-            if (di >= dlen) return -1;
-            dst[di++] = b;
-        }
+    uint8_t *acc = g_dirty_accum[b];
+    size_t written = 0;
+    for (unsigned p = 0; p < PVS_N_PAGES; ) {
+        if (!acc[p]) { p++; continue; }
+        unsigned q = p;
+        while (q < PVS_N_PAGES && acc[q]) q++;
+        size_t off = (size_t)p << PVS_PAGE_SHIFT;
+        size_t len = (size_t)(q - p) << PVS_PAGE_SHIFT;
+        memcpy(g_bank[b] + off, g_shadow + off, len);
+        written += len;
+        p = q;
     }
-    return di == dlen ? 0 : -1;
+    memset(acc, 0, PVS_N_PAGES);
+    return written;
 }
 
 /* ---- flip logic ----------------------------------------------------------
@@ -251,11 +290,35 @@ static int flip_when_wrapped(int client_fd, int bank)
 }
 
 /* ---- per-connection frame loop ------------------------------------------ */
+static int flags_ok(uint16_t f)
+{
+    switch (f) {
+    case 0:
+    case PVS_FLAG_RLE:
+    case PVS_FLAG_ZLIB:
+    case PVS_FLAG_DELTA:                    /* raw XOR mask */
+    case PVS_FLAG_DELTA | PVS_FLAG_RLE:     /* RLE-coded mask */
+    case PVS_FLAG_DELTA | PVS_FLAG_ZLIB:    /* zlib'd raw mask */
+    case PVS_FLAG_DELTA | PVS_FLAG_RLE | PVS_FLAG_ZLIB: /* zlib'd RLE stream
+                                             * (normal v2 wire form) */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int serve_client(int fd, uint8_t *cbuf, uint8_t *staging)
 {
-    int inactive_bank = -1;   /* set below from current active */
     static int active = 0;    /* persists across connections */
     unsigned seq = 0;
+    uint64_t st_recv = 0, st_dec = 0, st_wr = 0;      /* µs accumulators */
+    uint64_t mx_recv = 0, mx_dec = 0, mx_wr = 0;
+    uint64_t st_dirty = 0, st_wire = 0;
+    unsigned st_n = 0;
+
+    /* v2: sender state is per-connection - a fresh connection means the
+     * sender can't know our shadow, so require a keyframe before deltas. */
+    g_shadow_valid = 0;
 
     for (;;) {
         pvs_hdr_t h;
@@ -266,58 +329,180 @@ static int serve_client(int fd, uint8_t *cbuf, uint8_t *staging)
             h.raw_len  != PVS_FRAME_RAW        ||
             h.n_slices != PVS_N_SLICES         ||
             h.comp_len == 0 || h.comp_len > COMP_LEN_MAX ||
-            (h.flags != 0 && h.flags != PVS_FLAG_RLE && h.flags != PVS_FLAG_ZLIB)) {
+            !flags_ok(h.flags)) {
             logts("NAK: bad header (magic=%.4s comp=%u raw=%u n=%u flags=0x%x)",
                   h.magic, h.comp_len, h.raw_len, h.n_slices, h.flags);
             send_byte(fd, PVS_NAK);
             return -1;
         }
 
-        /* receive payload; raw frames go straight into staging */
-        uint8_t *dst = (h.flags == 0) ? staging : cbuf;
-        if (h.flags == 0 && h.comp_len != h.raw_len) {
-            logts("NAK: raw frame but comp_len %u != raw_len", h.comp_len);
+        int is_delta = (h.flags & PVS_FLAG_DELTA) != 0;
+        uint16_t codec = h.flags & (PVS_FLAG_RLE | PVS_FLAG_ZLIB);
+
+        if (codec == 0 && h.comp_len != h.raw_len) {
+            logts("NAK: uncoded payload but comp_len %u != raw_len", h.comp_len);
             send_byte(fd, PVS_NAK);
             return -1;
         }
+
+        /* receive payload. Full raw frames go straight into the shadow
+         * (cached), everything else into cbuf. */
+        uint64_t t0 = now_us();
+        uint8_t *dst = cbuf;
+        if (!is_delta && codec == 0) {
+            dst = g_shadow;
+            g_shadow_valid = 0;           /* invalid while partially written */
+        }
         r = recv_full(fd, dst, h.comp_len);
         if (r <= 0) return r;
+        uint64_t t1 = now_us();
 
-        /* decompress into staging */
-        if (h.flags & PVS_FLAG_ZLIB) {
-            uLongf dlen = PVS_FRAME_RAW;
-            int zr = uncompress(staging, &dlen, cbuf, h.comp_len);
-            if (zr != Z_OK || dlen != PVS_FRAME_RAW) {
-                logts("NAK: zlib inflate failed (rc=%d dlen=%lu)", zr, (unsigned long)dlen);
-                send_byte(fd, PVS_NAK);
-                return -1;
-            }
-        } else if (h.flags & PVS_FLAG_RLE) {
-            if (rle_decode(cbuf, h.comp_len, staging, PVS_FRAME_RAW) != 0) {
-                logts("NAK: RLE decode failed");
-                send_byte(fd, PVS_NAK);
-                return -1;
-            }
-        } /* else raw: already in staging */
+        /* v2: delta without an anchor -> NAK but keep the connection; the
+         * sender recovers by resending this frame as a keyframe. */
+        if (is_delta && !g_shadow_valid) {
+            logts("NAK: delta frame without anchor (keyframe needed), conn kept");
+            if (send_byte(fd, PVS_NAK) != 0) return -1;
+            continue;
+        }
 
-        /* copy into the inactive bank (uncached: reaches DRAM directly) */
-        inactive_bank = active ^ 1;
-        memcpy(g_bank[inactive_bank], staging, PVS_FRAME_RAW);
+        /* decode into the cached shadow, tracking dirty 4K pages */
+        uint8_t this_dirty[PVS_N_PAGES];
+        memset(this_dirty, 0, sizeof this_dirty);
+        uint32_t n_lit = 0;
+
+        if (!is_delta) {
+            if (h.flags & PVS_FLAG_ZLIB) {
+                uLongf dlen = PVS_FRAME_RAW;
+                g_shadow_valid = 0;
+                int zr = uncompress(g_shadow, &dlen, cbuf, h.comp_len);
+                if (zr != Z_OK || dlen != PVS_FRAME_RAW) {
+                    logts("NAK: zlib inflate failed (rc=%d dlen=%lu)", zr,
+                          (unsigned long)dlen);
+                    send_byte(fd, PVS_NAK);
+                    return -1;
+                }
+            } else if (h.flags & PVS_FLAG_RLE) {
+                g_shadow_valid = 0;
+                if (pvs_rle_decode(cbuf, h.comp_len, g_shadow, PVS_FRAME_RAW) != 0) {
+                    logts("NAK: RLE decode failed");
+                    send_byte(fd, PVS_NAK);
+                    return -1;
+                }
+            } /* else raw: already in shadow */
+            /* keyframe: whole frame dirty for both banks */
+            memset(g_dirty_accum[0], 1, PVS_N_PAGES);
+            memset(g_dirty_accum[1], 1, PVS_N_PAGES);
+            n_lit = PVS_FRAME_RAW;
+        } else {
+            const uint8_t *stream = cbuf;
+            size_t slen = h.comp_len;
+            if (codec == (PVS_FLAG_RLE | PVS_FLAG_ZLIB)) {
+                /* zlib-wrapped RLE stream: inflate cost scales with the
+                 * (small) RLE stream, not the 4.4MB frame */
+                uLongf dlen = PVS_FRAME_RAW;   /* RLE stream must fit */
+                int zr = uncompress(staging, &dlen, cbuf, h.comp_len);
+                if (zr != Z_OK) {
+                    logts("NAK: delta rle+zlib inflate failed (rc=%d)", zr);
+                    send_byte(fd, PVS_NAK);
+                    return -1;
+                }
+                stream = staging;
+                slen = dlen;
+                codec = PVS_FLAG_RLE;          /* fall through to RLE apply */
+            }
+            if (codec == PVS_FLAG_RLE) {
+                /* fast path: streaming apply, touches only changed bytes */
+                if (pvs_delta_rle_apply(stream, slen, g_shadow,
+                                        PVS_FRAME_RAW, this_dirty, &n_lit) != 0) {
+                    g_shadow_valid = 0;   /* shadow possibly half-applied */
+                    logts("NAK: delta RLE apply failed");
+                    send_byte(fd, PVS_NAK);
+                    return -1;
+                }
+            } else {
+                const uint8_t *mask = cbuf;
+                if (codec == PVS_FLAG_ZLIB) {
+                    uLongf dlen = PVS_FRAME_RAW;
+                    int zr = uncompress(staging, &dlen, cbuf, h.comp_len);
+                    if (zr != Z_OK || dlen != PVS_FRAME_RAW) {
+                        logts("NAK: delta zlib inflate failed (rc=%d)", zr);
+                        send_byte(fd, PVS_NAK);
+                        return -1;
+                    }
+                    mask = staging;
+                }
+                pvs_xor_apply_pages(mask, g_shadow, PVS_FRAME_RAW, this_dirty);
+            }
+            /* this frame's dirt goes into BOTH bank accumulators */
+            for (unsigned p = 0; p < PVS_N_PAGES; p++)
+                if (this_dirty[p]) {
+                    g_dirty_accum[0][p] = 1;
+                    g_dirty_accum[1][p] = 1;
+                }
+        }
+        g_shadow_valid = 1;
+        uint64_t t2 = now_us();
+
+        /* write only the accumulated dirty spans of the inactive bank */
+        int inactive_bank = active ^ 1;
+        size_t wrote = sync_bank(inactive_bank);
         __sync_synchronize();
+        uint64_t t3 = now_us();
 
-        uint32_t crc = crc32(0L, staging, PVS_FRAME_RAW);
+        uint32_t crc = g_crc ? crc32(0L, g_shadow, PVS_FRAME_RAW) : 0;
 
-        /* drop path: newer frame already queued? ACK + skip flip */
+        if (g_verify) {   /* THE invariant: synced bank == current frame */
+            if (memcmp(g_bank[inactive_bank], g_shadow, PVS_FRAME_RAW) != 0) {
+                logts("VERIFY FAIL seq=%u bank=%d != shadow", seq, inactive_bank);
+                send_byte(fd, PVS_NAK);
+                return -1;
+            }
+            logts("VERIFY OK seq=%u bank=%d", seq, inactive_bank);
+        }
+
         int flipped = 0;
-        if (!sock_has_pending(fd))
+        if (g_bench) {
+            /* bench: no wrap gate, no drop path - flip + ACK immediately */
+            __sync_synchronize();
+            reg_wr(REG_SLICE_BASE, g_bank_phys[inactive_bank]);
+            __sync_synchronize();
+            flipped = 1;
+        } else if (!sock_has_pending(fd)) {
+            /* drop path: newer frame already queued? ACK + skip flip */
             flipped = flip_when_wrapped(fd, inactive_bank);
+        }
 
         if (send_byte(fd, PVS_ACK) != 0) return -1;
         if (flipped) active = inactive_bank;
 
-        logts("FRAME seq=%u comp=%u flags=0x%x crc=%08x bank=%d %s",
+        logts("FRAME seq=%u comp=%u flags=0x%x crc=%08x bank=%d %s "
+              "lit=%u wrote=%uK",
               seq++, h.comp_len, h.flags, crc, inactive_bank,
-              flipped ? "flipped" : "DROPPED(no-flip)");
+              flipped ? "flipped" : "DROPPED(no-flip)",
+              n_lit, (unsigned)(wrote >> 10));
+
+        /* timing stats */
+        uint64_t d_recv = t1 - t0, d_dec = t2 - t1, d_wr = t3 - t2;
+        st_recv += d_recv; st_dec += d_dec; st_wr += d_wr;
+        if (d_recv > mx_recv) mx_recv = d_recv;
+        if (d_dec  > mx_dec)  mx_dec  = d_dec;
+        if (d_wr   > mx_wr)   mx_wr   = d_wr;
+        st_dirty += wrote; st_wire += h.comp_len;
+        if (++st_n == STAT_EVERY) {
+            logts("STAT %u frames: recv avg %lluus max %llu | decode avg %lluus "
+                  "max %llu | write avg %lluus max %llu | wrote avg %lluK | "
+                  "wire avg %lluK",
+                  st_n,
+                  (unsigned long long)(st_recv / st_n), (unsigned long long)mx_recv,
+                  (unsigned long long)(st_dec / st_n),  (unsigned long long)mx_dec,
+                  (unsigned long long)(st_wr / st_n),   (unsigned long long)mx_wr,
+                  (unsigned long long)(st_dirty / st_n >> 10),
+                  (unsigned long long)(st_wire / st_n >> 10));
+            st_recv = st_dec = st_wr = 0;
+            mx_recv = mx_dec = mx_wr = 0;
+            st_dirty = st_wire = 0;
+            st_n = 0;
+        }
         if (g_stop) return -1;
     }
 }
@@ -327,12 +512,17 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
         "usage: %s [--port N] [--base HEXADDR] [--regs HEXADDR] [--fake RPS]\n"
+        "          [--bench] [--verify] [--crc]\n"
         "  --port N       TCP listen port (default %d)\n"
         "  --base ADDR    frame region phys base (default 0x%08x)\n"
         "  --regs ADDR    POV engine AXI base    (default 0x%08x)\n"
         "  --fake RPS     enable motor-less fake-spin at RPS revs/sec\n"
         "                 (programs fake_period + POV_CTRL; otherwise the\n"
-        "                  daemon never touches POV_CTRL - JTAG owns it)\n",
+        "                  daemon never touches POV_CTRL - JTAG owns it)\n"
+        "  --bench        ACK right after decode+write (no slice-wrap gate):\n"
+        "                 measures ingest rate beyond the rotation speed\n"
+        "  --verify       memcmp bank-vs-shadow after every frame (slow; test)\n"
+        "  --crc          log crc32 of every decoded frame (slow; test)\n",
         argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT);
 }
 
@@ -351,6 +541,9 @@ int main(int argc, char **argv)
             reg_phys = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--fake") && i + 1 < argc)
             fake_rps = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--bench"))  g_bench = 1;
+        else if (!strcmp(argv[i], "--verify")) g_verify = 1;
+        else if (!strcmp(argv[i], "--crc"))    g_crc = 1;
         else { usage(argv[0]); return 2; }
     }
 
@@ -362,8 +555,10 @@ int main(int argc, char **argv)
 
     if (hw_init(reg_phys, frame_phys) != 0) return 1;
 
-    logts("pov_rxd: banks A=0x%08x B=0x%08x (%u B each), regs=0x%08x",
-          g_bank_phys[0], g_bank_phys[1], (unsigned)BANK_BYTES, reg_phys);
+    logts("pov_rxd v2: banks A=0x%08x B=0x%08x (%u B each), regs=0x%08x%s%s%s",
+          g_bank_phys[0], g_bank_phys[1], (unsigned)BANK_BYTES, reg_phys,
+          g_bench ? " [bench]" : "", g_verify ? " [verify]" : "",
+          g_crc ? " [crc]" : "");
     logts("engine STATUS=0x%08x POV_CTRL=0x%08x",
           reg_rd(REG_STATUS), reg_rd(REG_POV_CTRL));
 
@@ -378,8 +573,11 @@ int main(int argc, char **argv)
     }
 
     uint8_t *cbuf    = malloc(COMP_LEN_MAX);
-    uint8_t *staging = malloc(PVS_FRAME_RAW);
-    if (!cbuf || !staging) { perror("malloc"); return 1; }
+    uint8_t *staging = malloc(PVS_FRAME_RAW);   /* delta-zlib mask scratch */
+    g_shadow         = malloc(PVS_FRAME_RAW);   /* cached current frame */
+    if (!cbuf || !staging || !g_shadow) { perror("malloc"); return 1; }
+    memset(g_shadow, 0, PVS_FRAME_RAW);
+    memset(g_dirty_accum, 1, sizeof g_dirty_accum);  /* banks = garbage */
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { perror("socket"); return 1; }

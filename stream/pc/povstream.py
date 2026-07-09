@@ -56,11 +56,11 @@ sys.path.insert(0, TOOLS)
 import pack_obs
 import gen_anime_slices as gas
 
-# ---- PVS1 协议常量 (= stream/protocol.h) ----
+# ---- PVS 协议常量 (= stream/protocol.h; v2 加 FLAG_DELTA) ----
 MAGIC = b'PVS1'
 N_SLICES = 360
 FRAME_RAW = N_SLICES * pack_obs.SLICE_STRIDE          # 4423680
-FLAG_RLE, FLAG_ZLIB = 0x0001, 0x0002
+FLAG_RLE, FLAG_ZLIB, FLAG_DELTA = 0x0001, 0x0002, 0x0004
 ACK, NAK = 0x06, 0x15
 HDR = struct.Struct('<4sIIHH')                        # 16B
 PAD = b'\0' * (pack_obs.SLICE_STRIDE - pack_obs.SLICE_DATA)
@@ -69,25 +69,36 @@ DEFAULT_PORT = 9500
 
 # ================= 压缩 =================
 
-def rle_encode(data):
-    """零游程 RLE: 0x00 → [0x00][run:u16le], 其余字节字面直传."""
-    a = np.frombuffer(data, np.uint8)
-    out = bytearray()
-    pos = 0
-    for j in np.flatnonzero(a):
-        j = int(j)
-        run = j - pos
-        while run > 0:
-            r = min(run, 65535)
-            out += b'\x00' + r.to_bytes(2, 'little')
-            run -= r
-        out.append(int(a[j]))
-        pos = j + 1
-    run = len(a) - pos
+def _rle_runs(out, run):
+    """追加 run 个零的游程编码 (拆 65535 上限)."""
     while run > 0:
         r = min(run, 65535)
         out += b'\x00' + r.to_bytes(2, 'little')
         run -= r
+
+
+def rle_encode(data):
+    """零游程 RLE: 0x00 → [0x00][run:u16le], 其余字节字面直传.
+    按连续非零段向量化 (delta 帧 30fps 编码预算内, 段数 << 字节数)."""
+    a = np.frombuffer(data, np.uint8) if not isinstance(data, np.ndarray) \
+        else data.reshape(-1)
+    nz = np.flatnonzero(a)
+    out = bytearray()
+    if len(nz) == 0:
+        _rle_runs(out, len(a))
+        return bytes(out)
+    brk = np.flatnonzero(np.diff(nz) > 1) + 1              # 段边界
+    starts = nz[np.concatenate(([0], brk))]
+    ends = nz[np.concatenate((brk - 1, [len(nz) - 1]))] + 1
+    pos = 0
+    ab = a.tobytes()
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        if s > pos:
+            _rle_runs(out, s - pos)
+        out += ab[s:e]
+        pos = e
+    if pos < len(a):
+        _rle_runs(out, len(a) - pos)
     return bytes(out)
 
 
@@ -114,11 +125,65 @@ def compress_frame(raw, codec, zlevel):
 
 
 def decompress_frame(payload, flags):
+    if flags & FLAG_DELTA:
+        raise ValueError('delta 帧需要影子帧状态, 见 DeltaEncoder/板端 pov_rxd')
     if flags & FLAG_ZLIB:
         return zlib.decompress(payload)
     if flags & FLAG_RLE:
         return rle_decode(payload)
     return payload
+
+
+class DeltaEncoder:
+    """v2 delta 编码器 (--codec delta).
+
+    delta 帧 = raw XOR 上一已发送帧 → 零游程 RLE; 若 zlib 包一层更小
+    (孤立变化字节 RLE 4B/字节开销大, 实测纯色动画 zlib 包完 2x 小于
+    zlib 全帧) 则发 flags=DELTA|RLE|ZLIB (板端只 inflate 小 payload,
+    代价随变化量不随 4.4MB 帧), 否则 DELTA|RLE. 板端解码只碰变化字节.
+    关键帧 (= zlib 全帧, flags=ZLIB, 即合法 PVS1 帧):
+      - 每连接首帧 / force_keyframe() 后 (重连 / 收到 NAK)
+      - 每 GOP 帧一个 (gop=0 关闭周期关键帧)
+      - delta 退化时自动回退 (RLE payload > raw/4, 场景切换)
+    """
+
+    def __init__(self, gop=30, zlevel=6):
+        self.gop, self.zlevel = gop, zlevel
+        self.prev = None                # 上一已发送 raw (bytes)
+        self.since_kf = 0
+        self.force_kf = True
+        self.keyframes = 0
+        self.deltas = 0
+
+    def force_keyframe(self):
+        """下一帧强制关键帧 (重连后板端 shadow 丢失 / delta 被 NAK)."""
+        self.force_kf = True
+
+    def _keyframe(self, raw):
+        self.prev = raw
+        self.since_kf = 0
+        self.force_kf = False
+        self.keyframes += 1
+        return zlib.compress(raw, self.zlevel), FLAG_ZLIB
+
+    def encode(self, raw):
+        """→ (payload, flags). 每帧调用; 同一帧重发 (NAK/重连) 直接再调.
+        gop=N: 每 N 帧一个关键帧 (1 kf + N-1 delta)."""
+        if (self.force_kf or self.prev is None
+                or (self.gop > 0 and self.since_kf + 1 >= self.gop)):
+            return self._keyframe(raw)
+        mask = np.frombuffer(raw, np.uint8) ^ np.frombuffer(self.prev, np.uint8)
+        payload = rle_encode(mask)
+        if len(payload) >= len(raw) // 4:      # 差分退化 → 关键帧兜底
+            return self._keyframe(raw)
+        flags = FLAG_DELTA | FLAG_RLE
+        z = zlib.compress(payload, self.zlevel)
+        if len(z) < len(payload):              # zlib 包一层更省线 → 0x7
+            payload, flags = z, FLAG_DELTA | FLAG_RLE | FLAG_ZLIB
+        self.prev = raw
+        self.since_kf += 1
+        self.deltas += 1
+        return payload, flags
 
 
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
@@ -463,23 +528,26 @@ class StreamerError(Exception):
 
 
 class Streamer:
-    """PVS1 推流器. run(make_iter) 阻塞直到帧尽/stop/致命错.
+    """PVS 推流器 (PVS1 + v2 delta). run(make_iter) 阻塞直到帧尽/stop/致命错.
 
     make_iter: 无参可调用, 返回逐帧 FRAME_RAW 字节迭代器 (loop 时反复调用).
     reconnect=True 时 ACK 超时/连接断 (板重启) → 每 retry_interval 秒重连,
-    重连成功后重发当前帧继续; NAK 永远致命 (协议规定 sender abort).
+    重连后重发当前帧 (codec='delta' 时强制关键帧: 板端 shadow 按连接失效).
+    NAK: codec='delta' 时前 2 次触发关键帧重发 (v2 恢复协议), 之后致命;
+    其余 codec 永远致命 (PVS1 语义 sender abort).
     回调 (可选, 在推流线程里调):
       on_frame(stats)               每帧 ACK 后
-      on_status(event, detail)      event ∈ connected/lost/retry/done
+      on_status(event, detail)      event ∈ connected/lost/retry/nak/done
     stop: threading.Event, 置位后尽快退出 (sleep/重连等待均可打断).
     """
 
     def __init__(self, host, port=DEFAULT_PORT, fps=10.0, loop=False,
-                 codec='zlib', zlevel=6, reconnect=False, retry_interval=5.0,
-                 ack_timeout=30.0, on_frame=None, on_status=None, stop=None):
+                 codec='zlib', zlevel=6, gop=30, reconnect=False,
+                 retry_interval=5.0, ack_timeout=30.0, on_frame=None,
+                 on_status=None, stop=None):
         self.host, self.port = host, port
         self.fps, self.loop = fps, loop
-        self.codec, self.zlevel = codec, zlevel
+        self.codec, self.zlevel, self.gop = codec, zlevel, gop
         self.reconnect, self.retry_interval = reconnect, retry_interval
         self.ack_timeout = ack_timeout
         self.on_frame = on_frame or (lambda st: None)
@@ -489,8 +557,14 @@ class Streamer:
         self.sent_raw = 0
         self.sent_wire = 0
         self.last_wire = 0              # 最近一帧线上字节 (含 16B 头)
+        self.last_flags = 0
+        self.kf_frames = 0              # 已 ACK 关键帧/全帧数
+        self.delta_frames = 0           # 已 ACK delta 帧数
+        self.delta_wire = 0             # delta 帧线上字节合计
         self.reconnects = 0
+        self.naks = 0
         self.t_start = None
+        self._enc = DeltaEncoder(gop, zlevel) if codec == 'delta' else None
 
     # -- 内部: 连接 (reconnect 时无限重试, stop 可打断; 返回 None = 被停) --
     def _connect(self, first):
@@ -510,21 +584,23 @@ class Streamer:
                 self.stop.wait(self.retry_interval)
         return None
 
-    def _send_one(self, sock, hdr, payload):
-        """发一帧等 ACK. 返回存活 sock (可能重连过) 或 None (被停)."""
+    def _send_one(self, sock, data):
+        """发一帧数据等 ACK. 返回 (sock, ev), ev ∈ ack/nak/reconnected/stopped.
+        reconnected = 连接曾断并已重连, 本帧未确认送达, caller 需重发
+        (delta 模式先 force_keyframe); nak = 板拒收 (v2 连接可能仍活)."""
         while not self.stop.is_set():
             if sock is None:
                 sock = self._connect(first=False)
                 if sock is None:
-                    return None
+                    return None, 'stopped'
+                return sock, 'reconnected'
             try:
-                sock.sendall(hdr + payload)
+                sock.sendall(data)
                 ack = sock.recv(1)
                 if ack == bytes([ACK]):
-                    return sock
+                    return sock, 'ack'
                 if ack == bytes([NAK]):
-                    sock.close()
-                    raise StreamerError(f'frame {self.frames}: NAK, abort')
+                    return sock, 'nak'
                 raise OSError(f'bad/empty ack {ack!r} (peer closed?)')
             except (socket.timeout, OSError) as e:
                 try:
@@ -537,7 +613,12 @@ class Streamer:
                 self.reconnects += 1
                 self.on_status('lost', f'{e}; reconnect in {self.retry_interval}s')
                 self.stop.wait(self.retry_interval)
-        return None
+        return sock, 'stopped'
+
+    def _encode(self, raw):
+        if self._enc is not None:
+            return self._enc.encode(raw)
+        return compress_frame(raw, self.codec, self.zlevel)
 
     def run(self, make_iter):
         self.t_start = time.time()
@@ -548,15 +629,41 @@ class Streamer:
                 for raw in make_iter():
                     if self.stop.is_set():
                         break
-                    payload, flags = compress_frame(raw, self.codec, self.zlevel)
-                    hdr = HDR.pack(MAGIC, len(payload), len(raw), N_SLICES, flags)
-                    sock = self._send_one(sock, hdr, payload)
-                    if sock is None:
+                    naks = 0
+                    while not self.stop.is_set():
+                        payload, flags = self._encode(raw)
+                        hdr = HDR.pack(MAGIC, len(payload), len(raw), N_SLICES, flags)
+                        sock, ev = self._send_one(sock, hdr + payload)
+                        if ev == 'ack':
+                            break
+                        if ev == 'stopped':
+                            return self
+                        if ev == 'reconnected':
+                            # 板端 shadow 按连接失效 → 重发本帧, delta 先关键帧
+                            if self._enc is not None:
+                                self._enc.force_keyframe()
+                            continue
+                        # ev == 'nak'
+                        self.naks += 1
+                        if self._enc is not None and naks < 2:
+                            naks += 1
+                            self._enc.force_keyframe()
+                            self.on_status('nak',
+                                           f'frame {self.frames}: NAK → 重发关键帧')
+                            continue
+                        raise StreamerError(f'frame {self.frames}: NAK, abort')
+                    if self.stop.is_set():
                         break
                     self.frames += 1
                     self.sent_raw += len(raw)
-                    self.last_wire = len(hdr) + len(payload)
+                    self.last_wire = HDR.size + len(payload)
+                    self.last_flags = flags
                     self.sent_wire += self.last_wire
+                    if flags & FLAG_DELTA:
+                        self.delta_frames += 1
+                        self.delta_wire += self.last_wire
+                    else:
+                        self.kf_frames += 1
                     self.on_frame(self)
                     if self.fps > 0:
                         t_next = max(t_next + 1.0 / self.fps, time.time() - 1.0 / self.fps)
@@ -602,17 +709,30 @@ def cmd_stream(args):
     def on_status(ev, detail):
         if ev == 'connected':
             print(f'[net] connected {detail} codec={args.codec} fps={args.fps}', flush=True)
-        elif ev in ('lost', 'retry'):
+        elif ev in ('lost', 'retry', 'nak'):
             print(f'[net] {ev}: {detail}', flush=True)
+
+    bench_t = [time.time(), 0, 0]      # [t_last, frames_last, wire_last]
 
     def on_frame(st):
         if args.verbose:
-            print(f'  frame {st.frames}: {st.last_wire - HDR.size}B wire '
+            kind = 'delta' if st.last_flags & FLAG_DELTA else 'full'
+            print(f'  frame {st.frames}: {st.last_wire - HDR.size}B wire {kind} '
                   f'({FRAME_RAW / max(st.last_wire - HDR.size, 1):.1f}x)', flush=True)
+        if args.bench and st.frames % 30 == 0:
+            now = time.time()
+            df = st.frames - bench_t[1]
+            dw = st.sent_wire - bench_t[2]
+            dt = max(now - bench_t[0], 1e-6)
+            print(f'[bench] {st.frames} frames | last {df}: {df / dt:.1f} fps, '
+                  f'{dw / dt / 1e6:.2f} MB/s wire | kf {st.kf_frames} '
+                  f'delta {st.delta_frames}', flush=True)
+            bench_t[:] = [now, st.frames, st.sent_wire]
 
-    s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop,
-                 codec=args.codec, zlevel=args.zlevel, reconnect=args.reconnect,
-                 on_frame=on_frame, on_status=on_status)
+    fps = 0.0 if args.bench else args.fps      # bench: ACK 即发, 不限速
+    s = Streamer(args.host, args.port, fps=fps, loop=args.loop,
+                 codec=args.codec, zlevel=args.zlevel, gop=args.gop,
+                 reconnect=args.reconnect, on_frame=on_frame, on_status=on_status)
     try:
         s.run(make_iter)
     except KeyboardInterrupt:
@@ -625,8 +745,15 @@ def cmd_stream(args):
     print(f'[stats] {s.frames} frames in {dt:.2f}s = {s.frames / dt:.2f} model fps | '
           f'wire {s.wire_mbps():.2f} MB/s (raw {s.sent_raw / dt / 1e6:.2f} MB/s) | '
           f'compression {s.ratio():.1f}x', flush=True)
+    if s.delta_frames:
+        dw = s.delta_wire / s.delta_frames
+        kw = (s.sent_wire - s.delta_wire) / max(s.kf_frames, 1)
+        print(f'[stats] delta: {s.delta_frames} 帧 avg {dw / 1e3:.1f} KB '
+              f'({FRAME_RAW / dw:.0f}x) | keyframe: {s.kf_frames} 帧 '
+              f'avg {kw / 1e3:.1f} KB | NAK {s.naks} 重连 {s.reconnects}', flush=True)
     print(f'[stats] projected fps @ 9.4 MB/s link: '
-          f'{9.4e6 / (s.sent_wire / max(s.frames, 1)):.1f}', flush=True)
+          f'{9.4e6 / (s.sent_wire / max(s.frames, 1)):.1f} | '
+          f'@ 3.5 MB/s WiFi: {3.5e6 / (s.sent_wire / max(s.frames, 1)):.1f}', flush=True)
 
 
 # ================= bench 子命令 =================
@@ -646,6 +773,55 @@ def cmd_bench(args):
     print(f'{"codec":8} {"bytes":>9} {"ratio":>6} {"enc_ms":>7} {"dec_ms":>7} {"fps@9.4MB/s":>12}')
     for name, sz, ratio, te, td in rows:
         print(f'{name:8} {sz:9} {ratio:5.1f}x {te * 1e3:7.0f} {td * 1e3:7.0f} {9.4e6 / sz:12.1f}')
+
+
+def cmd_bench_delta(args):
+    """真实动画帧目录上测 delta 压缩比 (相邻帧 XOR + RLE vs zlib 全帧),
+    含循环回绕对 (尾→首), 报 GOP 平摊线上量 + 3.5MB/s WiFi 投影 fps."""
+    files = sorted(glob.glob(os.path.join(args.dir, 'frame_*.bin')) or
+                   glob.glob(os.path.join(args.dir, '*.bin')))
+    if len(files) < 2:
+        sys.exit(f'need >= 2 .bin frames in {args.dir}')
+    frames = [open(p, 'rb').read() for p in files]
+    for p, f in zip(files, frames):
+        if len(f) != FRAME_RAW:
+            sys.exit(f'{p}: {len(f)}B != FRAME_RAW {FRAME_RAW}')
+    print(f'{args.dir}: {len(frames)} frames')
+    print(f'{"pair":>9} {"changed%":>8} {"dirty4K":>7} {"delta+RLE":>10} '
+          f'{"+zlib(0x7)":>10} {"wire-ratio":>10} {"zlib-6":>9} {"enc_ms":>6}')
+    d_sizes, w_sizes, z_sizes, dirty_counts = [], [], [], []
+    n_pages = FRAME_RAW // 4096
+    for i in range(len(frames)):            # 含尾→首回绕 (loop 播放)
+        a = np.frombuffer(frames[i - 1], np.uint8)
+        b = np.frombuffer(frames[i], np.uint8)
+        mask = a ^ b
+        t0 = time.time()
+        payload = rle_encode(mask)
+        wrapped = zlib.compress(payload, args.zlevel)
+        wire = min(len(payload), len(wrapped))          # = DeltaEncoder 实发
+        te = (time.time() - t0) * 1e3
+        z = len(zlib.compress(frames[i], args.zlevel))
+        changed = int(np.count_nonzero(mask))
+        dirty = int(np.count_nonzero(mask.reshape(n_pages, 4096).any(axis=1)))
+        d_sizes.append(len(payload))
+        w_sizes.append(wire)
+        z_sizes.append(z)
+        dirty_counts.append(dirty)
+        tag = f'{i - 1 if i else len(frames) - 1}->{i}'
+        print(f'{tag:>9} {100 * changed / FRAME_RAW:8.2f} {dirty:7d} '
+              f'{len(payload):10d} {wire:10d} '
+              f'{FRAME_RAW / max(wire, 1):9.1f}x {z:9d} {te:6.1f}')
+    d_avg, w_avg, z_avg = np.mean(d_sizes), np.mean(w_sizes), np.mean(z_sizes)
+    dirty_avg = np.mean(dirty_counts)
+    gop = max(args.gop, 1)
+    wire_avg = (z_avg + (gop - 1) * w_avg) / gop        # GOP 平摊 (1 kf + N-1 delta)
+    print(f'[avg] delta wire {w_avg / 1e3:.1f} KB ({FRAME_RAW / w_avg:.0f}x, '
+          f'裸 RLE {d_avg / 1e3:.1f} KB) | zlib 全帧 {z_avg / 1e3:.1f} KB '
+          f'({FRAME_RAW / z_avg:.1f}x) | delta/zlib = {z_avg / w_avg:.2f}x | '
+          f'dirty {dirty_avg:.0f}/{n_pages} pages ({dirty_avg * 4:.0f} KB bank write)')
+    print(f'[avg] GOP={gop} 平摊 wire {wire_avg / 1e3:.1f} KB/frame | '
+          f'projected fps @ 3.5 MB/s WiFi: delta-only {3.5e6 / w_avg:.1f}, '
+          f'GOP 平摊 {3.5e6 / wire_avg:.1f}, zlib {3.5e6 / z_avg:.1f}')
 
 
 # ================= CLI =================
@@ -701,15 +877,26 @@ def main():
     s.add_argument('--fps', type=float, default=10.0)
     s.add_argument('--loop', action='store_true')
     s.add_argument('--reconnect', action='store_true',
-                   help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推)')
-    s.add_argument('--codec', choices=['zlib', 'rle', 'raw'], default='zlib')
+                   help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推, '
+                        'delta 模式重连后自动关键帧)')
+    s.add_argument('--codec', choices=['delta', 'zlib', 'rle', 'raw'], default='zlib')
+    s.add_argument('--gop', type=int, default=30,
+                   help='delta 模式关键帧间隔 (0=只在必须时, 默认 30)')
     s.add_argument('--zlevel', type=int, default=6)
+    s.add_argument('--bench', action='store_true',
+                   help='不按 --fps 限速, ACK 到立刻发下一帧 + 每 30 帧吞吐统计')
     s.add_argument('-v', '--verbose', action='store_true')
     s.set_defaults(fn=cmd_stream)
 
     b = sub.add_parser('bench', help='压缩方案测量')
     b.add_argument('--file', default=os.path.join(TOOLS, 'anime_slices.bin'))
     b.set_defaults(fn=cmd_bench)
+
+    bd = sub.add_parser('bench-delta', help='delta 压缩比测量 (预渲染帧目录)')
+    bd.add_argument('--dir', required=True, help='frames_<anim> 目录')
+    bd.add_argument('--gop', type=int, default=30)
+    bd.add_argument('--zlevel', type=int, default=6)
+    bd.set_defaults(fn=cmd_bench_delta)
 
     args = ap.parse_args()
     args.fn(args)

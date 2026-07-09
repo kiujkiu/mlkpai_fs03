@@ -12,8 +12,8 @@
 
 CROSS   ?= arm-linux-gnueabihf-
 DEPS    := deps/arm
-CFLAGS  := -O2 -Wall -Wextra
-PROTO   := ../protocol.h
+CFLAGS  := -O2 -Wall -Wextra -fno-strict-aliasing
+PROTO   := ../protocol.h pvs_codec.h
 
 all: arm
 arm: pov_rxd
@@ -23,13 +23,16 @@ pov_rxd: pov_rxd.c $(PROTO) $(DEPS)/libz.a
 	$(CROSS)strip $@
 	file $@ || true
 
-sim: pov_rxd_sim test_local
+sim: pov_rxd_sim test_local bench_delta
 
 pov_rxd_sim: pov_rxd.c $(PROTO)
 	gcc $(CFLAGS) -DSIM_NO_DEVMEM -o $@ pov_rxd.c -lz
 
 test_local: test_local.c $(PROTO)
 	gcc $(CFLAGS) -o $@ test_local.c -lz
+
+bench_delta: bench_delta.c $(PROTO)
+	gcc $(CFLAGS) -o $@ bench_delta.c -lz
 
 test: sim
 	./test_local
@@ -47,7 +50,7 @@ deps:
 	rm -rf build
 
 clean:
-	rm -f pov_rxd pov_rxd_sim test_local
+	rm -f pov_rxd pov_rxd_sim test_local bench_delta
 	rm -rf build
 
 .PHONY: all arm sim test deps clean

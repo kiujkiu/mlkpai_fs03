@@ -1,4 +1,4 @@
-# pov_rxd — board-side PVS1 stream receiver
+# pov_rxd — board-side PVS stream receiver (PVS1 + v2 delta)
 
 TCP daemon for the Zynq-7020 (MLKPAI-FS03, Debian buster, kernel 6.6) that
 receives compressed POV frames from the PC sender
@@ -7,8 +7,10 @@ buffer, and flips the PL POV engine (`0x40010000`) to the new bank at the
 slice-counter wrap so the display never glitches or blocks.
 
 Protocol: [`stream/protocol.h`](../protocol.h) +
-[`stream/pc/protocol.md`](../pc/protocol.md) (PVS1: 16 B header, zlib
-default / zero-run RLE / raw, 1-byte ACK per frame).
+[`stream/pc/protocol.md`](../pc/protocol.md) (16 B header, 1-byte ACK per
+frame; full frames zlib / zero-run RLE / raw, v2 adds flags bit2 = delta:
+XOR mask vs previous frame, applied to a **cached shadow** with dirty-page
+tracking so per-frame cost scales with changed bytes, not 4.4 MB).
 
 ## Memory / hardware assumptions
 
@@ -75,6 +77,11 @@ Options:
 --regs ADDR    POV engine AXI base             (default 0x40010000)
 --fake RPS     motor-less test: program fake_period (0x14) and
                POV_CTRL (0x10) for RPS revolutions/sec fake spin
+--bench        ACK immediately after decode+write (no slice-wrap gate):
+               measures pure ingest rate beyond the rotation speed
+--verify       memcmp inactive bank vs shadow after every frame (slow,
+               proves the bank-union invariant; tests/debug only)
+--crc          crc32 every decoded frame into the log (slow; tests)
 ```
 
 Example — bench test without the motor, 15 rps:
@@ -90,16 +97,29 @@ Then stream from the PC: `python stream/pc/povstream.py stream --host
 
 - One client at a time; on disconnect the daemon goes back to `accept()`
   (state, including the active bank, persists across connections).
-- Frames are decompressed into a RAM staging buffer, then `memcpy`'d into
-  the **inactive** bank; the flip (write to 0x18) waits until the engine's
-  `slice_idx` (low 16 bits of 0x10) wraps below 8, so a frame swap always
-  lands at a revolution boundary. If the counter never wraps within 2 s
-  (engine idle / not spinning) it flips anyway with a warning.
+- The current raw frame lives in a **cached** malloc'd shadow. Full frames
+  decode into it whole; delta frames are RLE-applied in place (only changed
+  bytes touched), marking dirty 4 KiB pages. Each bank keeps a dirty
+  accumulator (= pages where it differs from the shadow); every frame the
+  daemon copies only the accumulated dirty **spans** of the inactive bank
+  through the uncached mapping and clears that accumulator, while OR-ing
+  this frame's dirt into both. Keyframes mark everything dirty. This keeps
+  `inactive bank == current frame` after every sync regardless of flips,
+  drops or keyframes (`--verify` proves it per frame).
+- The flip (write to 0x18) waits until the engine's `slice_idx` (low 16
+  bits of 0x10) wraps below 8, so a frame swap always lands at a
+  revolution boundary. If the counter never wraps within 2 s (engine idle /
+  not spinning) it flips anyway with a warning.
 - If the sender outruns the display (new data already pending on the
   socket before the flip), the just-received frame is ACKed and **dropped**
   (no flip) — the display is never blocked, the newest frame wins.
 - Bad header / failed decompress → 1-byte NAK (0x15) and the connection is
-  closed; the sender reconnects.
-- Every frame logs `FRAME seq=… crc=… bank=… flipped|DROPPED` — the CRC32
-  of the decompressed frame, handy for end-to-end payload verification
-  against the sender.
+  closed; the sender reconnects. Exception (v2): a **delta frame that
+  cannot be anchored** (no full frame received yet on this connection) is
+  NAKed with the connection kept open — the sender resends as keyframe
+  (povstream does this automatically; it also forces a keyframe after any
+  reconnect since the anchor is per-connection).
+- Every frame logs `FRAME seq=… flags=… crc=… bank=… flipped|DROPPED
+  lit=… wrote=…K` (crc only with `--crc`); every 30 frames a `STAT` line
+  with avg/max recv / decode / write µs — the numbers to read when
+  qualifying 30 fps on the board (with `--bench`).

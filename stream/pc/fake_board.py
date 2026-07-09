@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fake_board.py — PVS1 协议回环测试服务器 (零硬件测 PC 侧全链路).
+fake_board.py — PVS 协议回环测试服务器 (零硬件测 PC 侧全链路, 含 v2 delta).
 
-收帧 → 按 flags 解压 → 校验 raw_len==4,423,680 → sha256 → ACK.
+收帧 → 按 flags 解压 (delta 帧对连接内影子帧 XOR 应用; 无锚点 NAK 但保持
+连接, 等 sender 重发关键帧) → 校验 raw_len==4,423,680 → sha256 → ACK.
 可选 --save-png 每帧 unpack slice 0 (pack_obs.unpack_slice) 存 PNG 目验.
 
   python3 fake_board.py --once --save-png out/           # 收一条连接后退出
@@ -20,7 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
 sys.path.insert(0, HERE)
 import pack_obs
-from povstream import MAGIC, HDR, FRAME_RAW, N_SLICES, ACK, NAK, decompress_frame
+from povstream import (MAGIC, HDR, FRAME_RAW, N_SLICES, ACK, NAK,
+                       FLAG_DELTA, FLAG_ZLIB, decompress_frame, rle_decode)
 
 
 def recv_exact(conn, n):
@@ -44,6 +46,7 @@ def handle(conn, args):
     n = 0
     t0 = time.time()
     wire = 0
+    shadow = None                       # v2 delta 锚点, 按连接失效
     while True:
         hdr = recv_exact(conn, HDR.size)
         if hdr is None:
@@ -58,7 +61,20 @@ def handle(conn, args):
         if payload is None:
             print('[fake_board] EOF mid-payload', flush=True)
             return False
-        raw = decompress_frame(payload, flags)
+        if flags & FLAG_DELTA:
+            if shadow is None:          # 无锚点: NAK 但保持连接 (v2)
+                print('[fake_board] delta without anchor -> NAK (conn kept)',
+                      flush=True)
+                conn.sendall(bytes([NAK]))
+                continue
+            import numpy as np
+            if flags & FLAG_ZLIB:       # 0x7: zlib 包 RLE 流
+                import zlib
+                payload = zlib.decompress(payload)
+            mask = np.frombuffer(rle_decode(payload), np.uint8)
+            raw = (np.frombuffer(shadow, np.uint8) ^ mask).tobytes()
+        else:
+            raw = decompress_frame(payload, flags)
         if len(raw) != raw_len:
             print(f'[fake_board] LEN MISMATCH {len(raw)} != {raw_len}', flush=True)
             conn.sendall(bytes([NAK]))
@@ -70,6 +86,7 @@ def handle(conn, args):
             os.makedirs(args.save_png, exist_ok=True)
             save_slice0_png(raw, os.path.join(args.save_png, f'frame_{n:04d}_slice0.png'))
         conn.sendall(bytes([ACK]))
+        shadow = raw
         n += 1
         wire += HDR.size + comp_len
     dt = max(time.time() - t0, 1e-6)
