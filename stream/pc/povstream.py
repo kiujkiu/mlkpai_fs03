@@ -24,6 +24,9 @@ numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
   glbanim:   --glb 单文件真 glTF 动画 (骨骼 skinning / morph targets / 节点
              TRS), --anim-take 选 take, --frames N 均匀采样 timeline
              (t = k/N × duration, 首尾相接可 loop), 见 glb_anim.py
+  spin:      任意静态 GLB 绕竖轴 (y) 自转, --frames = 一圈; --scale 整体
+             缩放 (地球仪用 0.48 = 直径半幅), 贴图色要过 1-bit 用
+             --lighting none + brighten/gamma/saturation 全 1.0
   (stream --dir = 预渲染 .bin 目录, 即任务里的 'file' 源)
 """
 import os
@@ -330,8 +333,34 @@ def glbanim_frames(args):
                              col, verbose=False)
 
 
+def spin_frames(args):
+    """任意静态 GLB 绕竖轴 (y) 自转: 采样一次, 逐帧旋转点云 (--frames =
+    一圈, 首尾相接可 loop). --scale 归一化后整体缩放 (<1 缩小留白);
+    --shells N 洋葱状向内复制 N 层 (间距 --shell-gap voxel, 表面网格壳
+    太薄时加厚, 同 globe 源三层壳套路)."""
+    xyz, col = _load_glb_points_cached(args.glb, args.samples or 400000,
+                                       args.lighting, args.ambient)
+    col = gas.color_adjust(col, args.brighten, args.gamma, args.saturation)
+    p0 = gas.normalize_points(xyz, args.z_stretch) * args.scale
+    if args.shells > 1:
+        r_eff = float(np.linalg.norm(p0, axis=1).max())
+        p0 = np.concatenate([p0 * (1.0 - k * args.shell_gap / r_eff)
+                             for k in range(args.shells)])
+        col = np.concatenate([col] * args.shells)
+    n = args.frames
+    for t in range(n):
+        a = 2 * math.pi * t / n
+        c, s = math.cos(a), math.sin(a)
+        p = np.empty_like(p0)
+        p[:, 0] = p0[:, 0] * c - p0[:, 2] * s
+        p[:, 1] = p0[:, 1]
+        p[:, 2] = p0[:, 0] * s + p0[:, 2] * c
+        yield gas.voxel_grid(p, col, verbose=False)
+
+
 ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
-         'glbseq': glbseq_frames, 'glbanim': glbanim_frames}
+         'glbseq': glbseq_frames, 'glbanim': glbanim_frames,
+         'spin': spin_frames}
 
 
 def gen_packed_frames(args):
@@ -569,6 +598,12 @@ def add_render_opts(ap):
     ap.add_argument('--samples', type=int, default=None,
                     help='GLB 采样点数 (默认: spinpulse 1800000, glbseq/glbanim 400000)')
     ap.add_argument('--z-stretch', type=float, default=1.0)
+    ap.add_argument('--scale', type=float, default=1.0,
+                    help='spin: 归一化后整体缩放 (地球仪 0.48=直径半幅)')
+    ap.add_argument('--shells', type=int, default=1,
+                    help='spin: 点云洋葱状向内复制层数 (壳太薄时加厚)')
+    ap.add_argument('--shell-gap', type=float, default=1.3,
+                    help='spin: 壳层间距 (voxel)')
     ap.add_argument('--brighten', type=float, default=1.5)
     ap.add_argument('--gamma', type=float, default=0.9)
     ap.add_argument('--saturation', type=float, default=2.0)
