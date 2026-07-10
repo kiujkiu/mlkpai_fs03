@@ -176,6 +176,8 @@ static int recv_full(int fd, void *buf, size_t len)
         if (n == 0) return 0;                       /* peer closed */
         if (n < 0) {
             if (errno == EINTR) { if (g_stop) return -1; continue; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                logts("recv timeout: dropping stale client (ghost guard)");
             return -1;
         }
         p += n; len -= (size_t)n;
@@ -402,6 +404,18 @@ int main(int argc, char **argv)
             break;
         }
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        /* ghost guard: a killed WSL sender leaves this socket ESTAB forever
+         * (FIN/RST never reaches us) and the single client slot deadlocks.
+         * Keepalive detects a dead peer in ~10+3*3 s; the recv/send timeouts
+         * cover the black-hole case where probes are silently eaten. */
+        setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+        int ka = 10; setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE,  &ka, sizeof ka);
+        ka = 3;      setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &ka, sizeof ka);
+        ka = 3;      setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT,   &ka, sizeof ka);
+        struct timeval rto = { .tv_sec = 30, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof rto);
+        rto.tv_sec = 10;
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &rto, sizeof rto);
         logts("client %s:%d connected", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
         serve_client(cfd, cbuf, staging);
         close(cfd);
