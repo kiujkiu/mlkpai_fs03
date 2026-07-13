@@ -116,8 +116,11 @@ def normalize_points(xyz, z_stretch, verbose=True):
     return p
 
 
-def voxel_grid(p, col, verbose=True):
-    """归一化点 (voxel 坐标, 原点在中心) → 体素格颜色平均 (GR,GH,GR,3)。"""
+def voxel_grid(p, col, verbose=True, ssaa=1):
+    """归一化点 (voxel 坐标, 原点在中心) → 体素格颜色平均 (GR,GH,GR,3)。
+    ssaa>1: N× 细分格占据率作覆盖权重 — 表面片穿满一格 ≈ N² 子格 = 1.0,
+    边缘体素按覆盖率调暗, 下游 Bayer 抖动把灰度变点密度 (1-bit 灰度抗锯齿)。
+    覆盖率统计靠点采样撑, ssaa=3 建议 --samples ≥ 1.2M。"""
     gx = np.clip(np.rint(p[:, 0]).astype(np.int32) + GR // 2, 0, GR - 1)
     gy = np.clip(np.rint(p[:, 1]).astype(np.int32) + GH // 2, 0, GH - 1)
     gz = np.clip(np.rint(p[:, 2]).astype(np.int32) + GR // 2, 0, GR - 1)
@@ -127,6 +130,22 @@ def voxel_grid(p, col, verbose=True):
     np.add.at(cnt, (gx, gy, gz), 1.0)
     occ = cnt > 0
     acc[occ] /= cnt[occ][:, None]
+    if ssaa > 1:
+        n = int(ssaa)
+        # 子格 rint 对齐主格: 主格 i 的子格集 = {n*i-n//2 .. n*i+n//2}
+        f = np.rint(p * n).astype(np.int64)
+        subs = np.unique(f, axis=0)
+        mx = np.clip((subs[:, 0] + n // 2) // n + GR // 2, 0, GR - 1).astype(np.int32)
+        my = np.clip((subs[:, 1] + n // 2) // n + GH // 2, 0, GH - 1).astype(np.int32)
+        mz = np.clip((subs[:, 2] + n // 2) // n + GR // 2, 0, GR - 1).astype(np.int32)
+        cov = np.zeros((GR, GH, GR), np.float32)
+        np.add.at(cov, (mx, my, mz), 1.0)
+        np.clip(cov / float(n * n), 0.0, 1.0, out=cov)
+        acc *= cov[:, :, :, None]
+        if verbose:
+            e = cov[occ]
+            print(f'[vox] ssaa{n} coverage mean={e.mean():.2f} '
+                  f'edge(<0.67)={(e < 0.67).mean():.0%}', flush=True)
     if verbose:
         print(f'[vox] {int(occ.sum())} occupied cells', flush=True)
     return acc

@@ -177,7 +177,7 @@ def spinpulse_frames(args):
         p[:, 1] += args.bob * math.sin(u + math.pi / 2)     # 上下浮动
         # 披风摆动: 按离质心竖直距离的 x 方向剪切 (上下反相)
         p[:, 0] += args.sway * math.sin(2 * u + 0.7) * (p0[:, 1] / gas.H_BUDGET)
-        yield gas.voxel_grid(p, col, verbose=False)
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
 # ================= 动画源: globe =================
@@ -260,7 +260,7 @@ def globe_frames(args):
         col[:] = (0, 255, 0)                                # 默认陆 = 纯绿
         col[ocean] = (0, 0, 255)                            # 海 = 纯蓝
         col[ice] = (255, 255, 255)                          # 冰盖 = 白
-        yield gas.voxel_grid(p, col, verbose=False)
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
 # ================= 动画源: glbseq / glbanim (GLB 动画装载器) =================
@@ -315,7 +315,7 @@ def glbseq_frames(args):
     for xyz, col in seq:
         col = gas.color_adjust(col, args.brighten, args.gamma, args.saturation)
         yield gas.voxel_grid(normalize_common(xyz, cmin, cmax, args.z_stretch),
-                             col, verbose=False)
+                             col, verbose=False, ssaa=args.ssaa)
 
 
 def pure_rgb_snap(col, dom=0.55):
@@ -359,7 +359,7 @@ def glbanim_frames(args):
             col = pure_rgb_snap(col, args.pure_dom)
         p = normalize_common(xyz, cmin, cmax, args.z_stretch) * args.scale
         p[:, 0] += args.x_offset
-        yield gas.voxel_grid(p, col, verbose=False)
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
 def spin_frames(args):
@@ -384,7 +384,7 @@ def spin_frames(args):
         p[:, 0] = p0[:, 0] * c - p0[:, 2] * s
         p[:, 1] = p0[:, 1]
         p[:, 2] = p0[:, 0] * s + p0[:, 2] * c
-        yield gas.voxel_grid(p, col, verbose=False)
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
 # ================= 动画源: palace / notredame (空中巡游 orbit) =================
@@ -430,7 +430,7 @@ def orbit_frames(points, colors, args):
         p[:, 0] = (points[:, 0] * c - points[:, 2] * s) * zoom
         p[:, 1] = points[:, 1] * zoom
         p[:, 2] = (points[:, 0] * s + points[:, 2] * c) * zoom
-        yield gas.voxel_grid(p, colors, verbose=False)
+        yield gas.voxel_grid(p, colors, verbose=False, ssaa=args.ssaa)
 
 
 def palace_frames(args):
@@ -686,6 +686,8 @@ def add_render_opts(ap):
     ap.add_argument('--samples', type=int, default=None,
                     help='GLB 采样点数 (默认: spinpulse 1800000, glbseq/glbanim 400000)')
     ap.add_argument('--z-stretch', type=float, default=1.0)
+    ap.add_argument('--ssaa', type=int, default=1,
+                    help='N× 空间超采样抗锯齿: 细分格覆盖率→边缘调暗→Bayer 变点密度 (3 推荐, 配 --samples 1.2M+)')
     ap.add_argument('--scale', type=float, default=1.0,
                     help='spin: 归一化后整体缩放 (地球仪 0.48=直径半幅)')
     ap.add_argument('--shells', type=int, default=1,
