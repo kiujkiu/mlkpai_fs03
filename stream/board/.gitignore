@@ -1,3 +1,11 @@
 pov_rxd_sim
 test_local
+bench_s0_x86
 build/
+povmem/*.o
+povmem/*.ko
+povmem/*.mod
+povmem/*.mod.c
+povmem/.*.cmd
+povmem/Module.symvers
+povmem/modules.order

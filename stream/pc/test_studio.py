@@ -154,9 +154,10 @@ class TestConfig(unittest.TestCase):
         cfg = pov_studio.load_config(p)                  # 不存在 → 默认
         self.assertEqual(cfg['ip'], '10.10.20.234')
         self.assertEqual(cfg['frames'], 8)
-        self.assertEqual(cfg['fps'], 4)
+        self.assertEqual(cfg['fps'], 12)
         self.assertTrue(cfg['loop'])
         self.assertTrue(cfg['reconnect'])
+        self.assertFalse(cfg['delta'])
         cfg['ip'] = '10.10.21.99'
         cfg['preset'] = 'globe_spin'
         cfg['frames'] = 16

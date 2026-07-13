@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
     'fps': 12,                  # 设高于转速, 逐帧 ACK 自动贴住翻页率 (4 会被 RTT 拖到 3.5页/s)
     'loop': True,
     'reconnect': True,
+    'delta': False,             # 帧间 XOR delta (PVS_FLAG_DELTA, 板端需新版 pov_rxd)
     'render_slices': 120,       # GUI 渲染角度数 (整除 360, 越小越快)
     'last_render_dir': '',
 }
@@ -521,6 +522,9 @@ def main():
             ttk.Checkbutton(r, text='循环', variable=self.loop_var).pack(side='left', padx=8)
             self.reconn_var = tk.BooleanVar(value=bool(self.cfg['reconnect']))
             ttk.Checkbutton(r, text='自动重连', variable=self.reconn_var).pack(side='left', padx=8)
+            self.delta_var = tk.BooleanVar(value=bool(self.cfg.get('delta', False)))
+            ttk.Checkbutton(r, text='delta 帧间压缩',
+                            variable=self.delta_var).pack(side='left', padx=8)
             self.stream_btn = ttk.Button(r, text='开始推流', command=self.on_stream_toggle)
             self.stream_btn.pack(side='left', padx=10)
             self.default_btn = ttk.Button(r, text='设为开机默认动画',
@@ -752,6 +756,7 @@ def main():
                 'fps': max(int(self.fps_var.get() or 1), 1),
                 'loop': bool(self.loop_var.get()),
                 'reconnect': bool(self.reconn_var.get()),
+                'delta': bool(self.delta_var.get()),
             })
             try:
                 save_config(self.cfg)
@@ -867,6 +872,7 @@ def main():
             self.stream_stop = threading.Event()
             self.streamer = Streamer(
                 cfg['ip'], DEFAULT_PORT, fps=cfg['fps'], loop=cfg['loop'],
+                delta=cfg.get('delta', False),
                 reconnect=cfg['reconnect'], retry_interval=5.0, ack_timeout=15.0,
                 on_frame=lambda st: self.ui(self._stream_stats, st),
                 on_status=lambda ev, det: self.ui(self._stream_status, ev, det),
@@ -895,8 +901,9 @@ def main():
             self.ui(fin)
 
         def _stream_stats(self, st):
-            self.stream_msg.set(f'推流中: {st.frames} 帧 | {st.wire_mbps():.2f} MB/s | '
-                                f'压缩 {st.ratio():.1f}x | 实际 {st.frames / st.elapsed():.1f} fps'
+            self.stream_msg.set(f'推流中: {st.frames} 帧 | 页率 {st.frames / st.elapsed():.1f}/s | '
+                                f'码率 {st.wire_mbps() * 8:.1f} Mbps | 压缩 {st.ratio():.1f}x'
+                                + (f' | delta {st.delta_frames} 帧' if st.delta else '')
                                 + (f' | 重连 {st.reconnects} 次' if st.reconnects else ''))
 
         def _stream_status(self, ev, detail):

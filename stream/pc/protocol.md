@@ -26,8 +26,15 @@ All integers **little-endian**.
 | 4   | 4    | comp_len   | payload bytes as transmitted                   |
 | 8   | 4    | raw_len    | decompressed size, **must be 4423680**         |
 | 12  | 2    | n_slices   | **360**                                        |
-| 14  | 2    | flags      | bit0 = RLE, bit1 = zlib, 0 = raw               |
+| 14  | 2    | flags      | bit0 = RLE, bit1 = zlib, bit2 = DELTA, 0 = raw |
 | 16  | comp_len | payload |                                                |
+
+**DELTA (bit2, PVS1.1)**: payload (after RLE/zlib decode) = `cur XOR prev_raw`,
+where `prev_raw` is the previous successfully-ACKed raw frame of this
+connection. Composes with zlib: `ZLIB|DELTA` = `zlib(prev ^ cur)`. The first
+frame of a connection MUST NOT set DELTA (keyframe); the receiver NAKs a DELTA
+frame with no reference. Keyframe cadence (default every 26 frames, and on
+(re)connect) is sender policy, not protocol.
 
 ### Flow control (ACK)
 
@@ -35,6 +42,9 @@ After each frame is received, decompressed and verified (raw_len match), the
 board sends **1 byte**: `0x06` (ACK, send next) or `0x15` (NAK, sender aborts).
 Sender does not transmit frame N+1 until frame N is ACKed — this self-paces the
 link and bounds board-side buffering to one frame.
+Exception (PVS1.1, design doc §2.3): on a NAK for a **DELTA** frame the sender
+does not abort — it immediately re-sends that frame as a keyframe and
+continues (board restart / lost reference recovery).
 
 ## Compression — measured on a real rendered frame
 

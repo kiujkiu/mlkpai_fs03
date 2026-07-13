@@ -1,10 +1,15 @@
-# pov_rxd - board-side PVS1 stream receiver
+# pov_rxd - board-side PVS1 stream receiver (v2: 三缓冲/双线程/DELTA/26pps)
 #
 # Targets:
-#   make / make arm   cross-compile static ARM binary `pov_rxd` (ships in git,
-#                     board needs no toolchain). Links deps/arm/libz.a.
+#   make / make arm   cross-compile static ARM binaries `pov_rxd` + `bench_s0`
+#                     (ship in git, board needs no toolchain). Links
+#                     deps/arm/libz.a. NEON on (Zynq A9 has it).
 #   make sim          x86 dev build: pov_rxd_sim (-DSIM_NO_DEVMEM) + test_local
 #   make test         build sim + run the loopback protocol test
+#   make bench        bench_s0 (ARM static) + bench_s0_x86 (local sanity)
+#   make ko           povmem.ko WC-mmap kernel module (needs board kernel
+#                     headers: make -C povmem KDIR=... ARCH=arm
+#                     CROSS_COMPILE=arm-linux-gnueabihf-)
 #   make deps         (re)build deps/arm/{libz.a,zlib.h,zconf.h} from zlib
 #                     1.3.1 source (downloads via curl; only needed if the
 #                     committed prebuilt libz.a is deleted)
@@ -12,16 +17,21 @@
 
 CROSS   ?= arm-linux-gnueabihf-
 DEPS    := deps/arm
-CFLAGS  := -O2 -Wall -Wextra
+CFLAGS  := -O2 -Wall -Wextra -pthread
+ARMTUNE := -march=armv7-a -mfpu=neon -mfloat-abi=hard
 PROTO   := ../protocol.h
 
 all: arm
-arm: pov_rxd
+arm: pov_rxd bench_s0
 
 pov_rxd: pov_rxd.c $(PROTO) $(DEPS)/libz.a
-	$(CROSS)gcc $(CFLAGS) -static -I$(DEPS) -o $@ pov_rxd.c $(DEPS)/libz.a
+	$(CROSS)gcc $(CFLAGS) $(ARMTUNE) -static -I$(DEPS) -o $@ pov_rxd.c $(DEPS)/libz.a
 	$(CROSS)strip $@
 	file $@ || true
+
+bench_s0: bench_s0.c $(PROTO) $(DEPS)/libz.a
+	$(CROSS)gcc $(CFLAGS) $(ARMTUNE) -static -I$(DEPS) -o $@ bench_s0.c $(DEPS)/libz.a
+	$(CROSS)strip $@
 
 sim: pov_rxd_sim test_local
 
@@ -33,6 +43,14 @@ test_local: test_local.c $(PROTO)
 
 test: sim
 	./test_local
+
+bench: bench_s0 bench_s0_x86
+
+bench_s0_x86: bench_s0.c $(PROTO)
+	gcc $(CFLAGS) -o $@ bench_s0.c -lz
+
+ko:
+	$(MAKE) -C povmem
 
 # Rebuild the prebuilt static zlib for ARM (needs network + cross gcc).
 ZLIB_VER := 1.3.1
@@ -47,7 +65,8 @@ deps:
 	rm -rf build
 
 clean:
-	rm -f pov_rxd pov_rxd_sim test_local
+	rm -f pov_rxd pov_rxd_sim test_local bench_s0 bench_s0_x86
 	rm -rf build
+	-$(MAKE) -C povmem clean
 
-.PHONY: all arm sim test deps clean
+.PHONY: all arm sim test bench ko deps clean

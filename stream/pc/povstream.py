@@ -45,6 +45,7 @@ import zlib
 import socket
 import struct
 import hashlib
+import collections
 from PIL import Image
 import argparse
 import threading
@@ -60,11 +61,14 @@ import gen_anime_slices as gas
 MAGIC = b'PVS1'
 N_SLICES = 360
 FRAME_RAW = N_SLICES * pack_obs.SLICE_STRIDE          # 4423680
-FLAG_RLE, FLAG_ZLIB = 0x0001, 0x0002
+FLAG_RLE, FLAG_ZLIB, FLAG_DELTA = 0x0001, 0x0002, 0x0004
 ACK, NAK = 0x06, 0x15
 HDR = struct.Struct('<4sIIHH')                        # 16B
 PAD = b'\0' * (pack_obs.SLICE_STRIDE - pack_obs.SLICE_DATA)
 DEFAULT_PORT = 9500
+DEFAULT_KEYINT = 26                                   # 关键帧周期 (发送端策略, 不进协议)
+DEFAULT_LINK_MBPS = 28.0                              # 2.4G WiFi 实测链路估值
+CACHE_WARN_MB = 1024                                  # 预压缩缓存内存告警线
 
 
 # ================= 压缩 =================
@@ -119,6 +123,75 @@ def decompress_frame(payload, flags):
     if flags & FLAG_RLE:
         return rle_decode(payload)
     return payload
+
+
+def xor_frames(a, b):
+    """raw XOR raw (delta 编码/解码共用, numpy 向量化)."""
+    return (np.frombuffer(a, np.uint8) ^ np.frombuffer(b, np.uint8)).tobytes()
+
+
+# ================= 预压缩缓存 (26fps: 推流热路径零压缩开销) =================
+# FrameEntry: 每帧线上 payload 预先算好. delta 模式 key/delta 双份都存 —
+# 关键帧周期与重连恢复由发送时刻决定, 任意帧都可能被要求当 keyframe.
+FrameEntry = collections.namedtuple(
+    'FrameEntry', 'key delta key_flags delta_flags raw_len')
+
+
+def _precomp_job(job):
+    """进程池 worker: 读帧 (+前帧), 出 (zlib(raw), zlib(prev^raw)|None)."""
+    path, prev_path, zlevel = job
+    raw = open(path, 'rb').read()
+    if len(raw) != FRAME_RAW:
+        raise ValueError(f'{path}: {len(raw)}B != FRAME_RAW {FRAME_RAW}')
+    key = zlib.compress(raw, zlevel)
+    delta = None
+    if prev_path is not None:
+        prev = open(prev_path, 'rb').read()
+        if len(prev) != FRAME_RAW:
+            raise ValueError(f'{prev_path}: {len(prev)}B != FRAME_RAW {FRAME_RAW}')
+        delta = zlib.compress(xor_frames(prev, raw), zlevel)
+    return key, delta
+
+
+def frame_files_from_dir(d):
+    files = sorted(glob.glob(os.path.join(d, 'frame_*.bin'))
+                   or glob.glob(os.path.join(d, '*.bin')))
+    if not files:
+        sys.exit(f'no .bin frames in {d}')
+    return files
+
+
+def build_precomp(d, zlevel=6, delta=False, jobs=0):
+    """--dir 整目录预压缩到内存: [FrameEntry]. delta=True 时每帧还预算
+    对流序前一帧的 XOR+zlib delta 链; 帧 0 的 delta 参考最后一帧 (loop 回
+    绕), 非 loop/首连时帧 0 由发送策略强制走 key payload, 回绕 delta 只在
+    loop 第 2 圈起被用到, 语义正确."""
+    files = frame_files_from_dir(d)
+    n = len(files)
+    jl = [(f, files[(i - 1) % n] if delta else None, zlevel)
+          for i, f in enumerate(files)]
+    t0 = time.time()
+    if jobs == 1 or n == 1:
+        results = [_precomp_job(j) for j in jl]
+    else:
+        import multiprocessing as mp
+        with mp.Pool(processes=jobs or None) as pool:
+            results = pool.map(_precomp_job, jl, chunksize=1)
+    entries = [FrameEntry(key=k, delta=dl, key_flags=FLAG_ZLIB,
+                          delta_flags=FLAG_ZLIB | FLAG_DELTA,
+                          raw_len=FRAME_RAW)
+               for k, dl in results]
+    key_mb = sum(len(e.key) for e in entries) / 1e6
+    delta_mb = sum(len(e.delta or b'') for e in entries) / 1e6
+    total_mb = key_mb + delta_mb
+    print(f'[precomp] {n} 帧预压缩完成 {time.time() - t0:.1f}s: '
+          f'key {key_mb:.1f}MB'
+          + (f' + delta {delta_mb:.1f}MB' if delta else '')
+          + f' = {total_mb:.1f}MB 常驻内存', flush=True)
+    if total_mb > CACHE_WARN_MB:
+        print(f'[precomp] ⚠ 缓存 {total_mb:.0f}MB 超过告警线 {CACHE_WARN_MB}MB, '
+              f'注意内存压力 (帧多/压缩比差时考虑分段或去 --delta 双份)', flush=True)
+    return entries
 
 
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
@@ -488,32 +561,50 @@ class StreamerError(Exception):
 class Streamer:
     """PVS1 推流器. run(make_iter) 阻塞直到帧尽/stop/致命错.
 
-    make_iter: 无参可调用, 返回逐帧 FRAME_RAW 字节迭代器 (loop 时反复调用).
+    make_iter: 无参可调用, 返回逐帧迭代器 (loop 时反复调用), 每项是
+    FRAME_RAW 字节 (现场压缩) 或 FrameEntry (预压缩缓存, 热路径零压缩).
+    delta=True: 帧间 XOR delta (PVS_FLAG_DELTA), 关键帧周期 keyint;
+    连接建立/重连后首帧强制 keyframe; 收到 delta 帧的 NAK (板端丢参考帧)
+    自动降级重发 keyframe 后继续 (设计稿 §2.3), keyframe 的 NAK 仍致命.
     reconnect=True 时 ACK 超时/连接断 (板重启) → 每 retry_interval 秒重连,
-    重连成功后重发当前帧继续; NAK 永远致命 (协议规定 sender abort).
+    重连成功后重发当前帧继续.
     回调 (可选, 在推流线程里调):
       on_frame(stats)               每帧 ACK 后
-      on_status(event, detail)      event ∈ connected/lost/retry/done
+      on_status(event, detail)      event ∈ connected/lost/retry/nak_delta/done
+      on_stats(line)                每 stats_interval 秒一行统计 (默认 print)
     stop: threading.Event, 置位后尽快退出 (sleep/重连等待均可打断).
     """
 
     def __init__(self, host, port=DEFAULT_PORT, fps=10.0, loop=False,
                  codec='zlib', zlevel=6, reconnect=False, retry_interval=5.0,
-                 ack_timeout=30.0, on_frame=None, on_status=None, stop=None):
+                 ack_timeout=30.0, delta=False, keyint=DEFAULT_KEYINT,
+                 link_mbps=DEFAULT_LINK_MBPS, stats_interval=5.0,
+                 max_frames=0, on_frame=None, on_status=None, on_stats=None,
+                 stop=None):
         self.host, self.port = host, port
         self.fps, self.loop = fps, loop
         self.codec, self.zlevel = codec, zlevel
         self.reconnect, self.retry_interval = reconnect, retry_interval
         self.ack_timeout = ack_timeout
+        self.delta, self.keyint = delta, max(int(keyint), 1)
+        self.link_mbps = link_mbps
+        self.stats_interval = stats_interval
+        self.max_frames = max_frames    # >0: ACK 满 N 帧自动停 (测试用)
         self.on_frame = on_frame or (lambda st: None)
         self.on_status = on_status or (lambda ev, detail: None)
+        self.on_stats = on_stats or (lambda line: print(line, flush=True))
         self.stop = stop if stop is not None else threading.Event()
         self.frames = 0                 # 已 ACK 帧数
         self.sent_raw = 0
         self.sent_wire = 0
         self.last_wire = 0              # 最近一帧线上字节 (含 16B 头)
+        self.last_raw_len = 0
         self.reconnects = 0
+        self.delta_frames = 0           # 累计已 ACK 的 delta 帧数
         self.t_start = None
+        self._since_key = None          # None = 下一帧必须 keyframe
+        self._prev_raw = None           # 现场压缩 delta 的参考帧
+        self._win = None                # 5s 统计窗 dict
 
     # -- 内部: 连接 (reconnect 时无限重试, stop 可打断; 返回 None = 被停) --
     def _connect(self, first):
@@ -533,19 +624,53 @@ class Streamer:
                 self.stop.wait(self.retry_interval)
         return None
 
-    def _send_one(self, sock, hdr, payload):
-        """发一帧等 ACK. 返回存活 sock (可能重连过) 或 None (被停)."""
+    # -- 内部: 按 keyframe 策略从 item 出线上 (payload, flags, is_delta, raw) --
+    def _build_frame(self, item, want_key):
+        if isinstance(item, FrameEntry):
+            if want_key or item.delta is None:
+                return item.key, item.key_flags, False, None
+            return item.delta, item.delta_flags, True, None
+        raw = item                       # 现场压缩路径 (bytes)
+        if (self.delta and not want_key and self._prev_raw is not None
+                and self.codec == 'zlib'):
+            payload = zlib.compress(xor_frames(self._prev_raw, raw), self.zlevel)
+            return payload, FLAG_ZLIB | FLAG_DELTA, True, raw
+        payload, flags = compress_frame(raw, self.codec, self.zlevel)
+        return payload, flags, False, raw
+
+    def _send_one(self, sock, item):
+        """发一帧等 ACK. 返回存活 sock (可能重连过) 或 None (被停).
+        重连后 / delta 被 NAK 后, 本帧强制以 keyframe 形态重发."""
+        force_key = False
         while not self.stop.is_set():
             if sock is None:
                 sock = self._connect(first=False)
                 if sock is None:
                     return None
+                force_key = True         # 重连: 板端参考帧已失效
+            want_key = (force_key or self._since_key is None
+                        or self._since_key + 1 >= self.keyint)
+            payload, flags, is_delta, raw = self._build_frame(item, want_key)
+            hdr = HDR.pack(MAGIC, len(payload), FRAME_RAW, N_SLICES, flags)
             try:
                 sock.sendall(hdr + payload)
                 ack = sock.recv(1)
                 if ack == bytes([ACK]):
+                    self._since_key = self._since_key + 1 if is_delta else 0
+                    if raw is not None:
+                        self._prev_raw = raw
+                    self.last_wire = len(hdr) + len(payload)
+                    self.last_raw_len = FRAME_RAW
+                    if is_delta:
+                        self.delta_frames += 1
+                    self._stat_frame(is_delta, self.last_wire)
                     return sock
                 if ack == bytes([NAK]):
+                    if is_delta:         # 板端丢参考帧 → 降级重发 keyframe (§2.3)
+                        self.on_status('nak_delta',
+                                       f'frame {self.frames}: NAK on delta, resend keyframe')
+                        force_key = True
+                        continue
                     sock.close()
                     raise StreamerError(f'frame {self.frames}: NAK, abort')
                 raise OSError(f'bad/empty ack {ack!r} (peer closed?)')
@@ -562,25 +687,54 @@ class Streamer:
                 self.stop.wait(self.retry_interval)
         return None
 
+    # -- 内部: 5s 滑窗统计 (页率 / 码率 / 链路占用 / delta 命中压缩比) --
+    def _stat_frame(self, is_delta, wire):
+        now = time.time()
+        w = self._win
+        if w is None:
+            w = self._win = dict(t0=now, frames=0, wire=0,
+                                 d_frames=0, d_wire=0, k_frames=0, k_wire=0)
+        w['frames'] += 1
+        w['wire'] += wire
+        if is_delta:
+            w['d_frames'] += 1; w['d_wire'] += wire
+        else:
+            w['k_frames'] += 1; w['k_wire'] += wire
+        dt = now - w['t0']
+        if dt < self.stats_interval:
+            return
+        mbps = w['wire'] * 8 / dt / 1e6
+        line = (f"[stats/{self.stats_interval:.0f}s] 页率 {w['frames'] / dt:.1f}/s"
+                f" | 码率 {mbps:.2f} Mbps"
+                f" | 链路占用 {mbps / max(self.link_mbps, 1e-6) * 100:.0f}%"
+                f" (@{self.link_mbps:g} Mbps)")
+        if self.delta:
+            dr = (FRAME_RAW * w['d_frames'] / w['d_wire']) if w['d_wire'] else 0.0
+            kr = (FRAME_RAW * w['k_frames'] / w['k_wire']) if w['k_wire'] else 0.0
+            line += (f" | delta {w['d_frames']}/{w['frames']} 帧"
+                     f" 压缩 {dr:.0f}x (key {kr:.0f}x)")
+        self._win = None
+        self.on_stats(line)
+
     def run(self, make_iter):
         self.t_start = time.time()
         t_next = self.t_start
         sock = self._connect(first=True)
         try:
             while sock is not None and not self.stop.is_set():
-                for raw in make_iter():
+                for item in make_iter():
                     if self.stop.is_set():
                         break
-                    payload, flags = compress_frame(raw, self.codec, self.zlevel)
-                    hdr = HDR.pack(MAGIC, len(payload), len(raw), N_SLICES, flags)
-                    sock = self._send_one(sock, hdr, payload)
+                    sock = self._send_one(sock, item)
                     if sock is None:
                         break
                     self.frames += 1
-                    self.sent_raw += len(raw)
-                    self.last_wire = len(hdr) + len(payload)
+                    self.sent_raw += self.last_raw_len
                     self.sent_wire += self.last_wire
                     self.on_frame(self)
+                    if self.max_frames and self.frames >= self.max_frames:
+                        self.stop.set()
+                        break
                     if self.fps > 0:
                         t_next = max(t_next + 1.0 / self.fps, time.time() - 1.0 / self.fps)
                         dt = t_next - time.time()
@@ -608,10 +762,7 @@ class Streamer:
 # ================= stream 子命令 =================
 
 def frame_iter_from_dir(d):
-    files = sorted(glob.glob(os.path.join(d, 'frame_*.bin')) or glob.glob(os.path.join(d, '*.bin')))
-    if not files:
-        sys.exit(f'no .bin frames in {d}')
-    for p in files:
+    for p in frame_files_from_dir(d):
         raw = open(p, 'rb').read()
         if len(raw) != FRAME_RAW:
             sys.exit(f'{p}: {len(raw)}B != FRAME_RAW {FRAME_RAW}')
@@ -619,13 +770,23 @@ def frame_iter_from_dir(d):
 
 
 def cmd_stream(args):
+    if args.delta and args.codec != 'zlib':
+        sys.exit('--delta 需要 --codec zlib (协议 DELTA|ZLIB 组合)')
+    entries = None
+    if args.dir and args.codec == 'zlib' and not args.no_precomp:
+        entries = build_precomp(args.dir, zlevel=args.zlevel,
+                                delta=args.delta, jobs=args.jobs)
+
     def make_iter():
+        if entries is not None:
+            return iter(entries)
         return frame_iter_from_dir(args.dir) if args.dir else gen_packed_frames(args)
 
     def on_status(ev, detail):
         if ev == 'connected':
-            print(f'[net] connected {detail} codec={args.codec} fps={args.fps}', flush=True)
-        elif ev in ('lost', 'retry'):
+            print(f'[net] connected {detail} codec={args.codec} fps={args.fps}'
+                  + (f' delta keyint={args.keyint}' if args.delta else ''), flush=True)
+        elif ev in ('lost', 'retry', 'nak_delta'):
             print(f'[net] {ev}: {detail}', flush=True)
 
     def on_frame(st):
@@ -635,6 +796,8 @@ def cmd_stream(args):
 
     s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop,
                  codec=args.codec, zlevel=args.zlevel, reconnect=args.reconnect,
+                 delta=args.delta, keyint=args.keyint, link_mbps=args.link_mbps,
+                 max_frames=args.max_frames,
                  on_frame=on_frame, on_status=on_status)
     try:
         s.run(make_iter)
@@ -738,6 +901,18 @@ def main():
                    help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推)')
     s.add_argument('--codec', choices=['zlib', 'rle', 'raw'], default='zlib')
     s.add_argument('--zlevel', type=int, default=6)
+    s.add_argument('--delta', action='store_true',
+                   help='帧间 XOR delta (PVS_FLAG_DELTA), 首帧/重连首帧自动 keyframe')
+    s.add_argument('--keyint', type=int, default=DEFAULT_KEYINT,
+                   help=f'delta 关键帧周期 (默认 {DEFAULT_KEYINT})')
+    s.add_argument('--link-mbps', type=float, default=DEFAULT_LINK_MBPS,
+                   help=f'链路估值 Mbps, 统计行算占用%% (默认 {DEFAULT_LINK_MBPS:g}: 2.4G)')
+    s.add_argument('--no-precomp', action='store_true',
+                   help='禁用 --dir 预压缩缓存 (回退逐帧现场压缩)')
+    s.add_argument('--jobs', type=int, default=0,
+                   help='预压缩进程数 (0=CPU 数)')
+    s.add_argument('--max-frames', type=int, default=0,
+                   help='ACK 满 N 帧自动停 (回环测试用, 0=不限)')
     s.add_argument('-v', '--verbose', action='store_true')
     s.set_defaults(fn=cmd_stream)
 

@@ -219,3 +219,22 @@ DDR 带宽旁证: 26 fps 下 inflate 写 115 MB/s + 拷贝读写 230 MB/s + PL �
 - 协议: PVS1 头不动, **只加 flags bit2=DELTA**; 关键帧是发送端策略, 双屏相位是 PL 配置, 都不进协议。
 - 板端: 真瓶颈在 CPU 不在网 —— 串行路径 130–230 ms/帧 (SO 拷贝 37–73 ms + inflate 30–90 ms 两大头), 必改 = 三缓冲双线程 (ACK 与翻页解耦) + WC 映射 + 半圈双窗口翻页 + 去 crc32; inflate 实测 (S0) 决定是否动用 zlib-ng/zstd/180 片后手。
 - PC 端: 预渲染循环推 + **预压缩缓存** (否则 zlib-6 的 41 ms/帧 先把 PC 卡死), Studio 加页率/链路占用/delta/片数四组控件。
+
+---
+
+## 6. 实测记录 (PC 端回环, 2026-07-13)
+
+环境: WSL python3 + fake_board.py 本机回环 (127.0.0.1, 无网络/板子), 素材
+`stream/pc/frames_robot_s08_ssaa3` (144 帧, ssaa3 时域抖动开, 相位逐帧变),
+zlib-6。fake_board `--md5` 逐帧与源 .bin 比对校验 raw 重建。
+
+| 组 | 命令要点 | 帧数 | md5 校验 | 平均帧大小 (wire) | 估算 26fps 码率 | 压缩比 |
+|---|---|---|---|---|---|---|
+| ① 纯 zlib 基线 | `stream --dir ... --fps 0` | 144 | **144/144 PASS** | **161,549 B** (157.8 KB) | **33.60 Mbps** | 27.4× |
+| ② delta | `--delta --keyint 26 --loop --max-frames 288` (2 圈, 含回绕 delta) | 288 | **288/288 PASS** | **148,114 B** (144.6 KB); key 12 帧 avg 162,275 B / delta 276 帧 avg 147,499 B | **30.81 Mbps** | 29.9× |
+
+- 预压缩缓存: 144 帧 key 23.3 MB (~1.2 s, 进程池); delta 模式 key+delta 双份 44.5 MB (~2.4 s)。热路径纯 sendall+ACK, 回环实测 ~74–92 fps (PC 侧完全不是瓶颈)。
+- 回绕 delta 验证: 第 2 圈帧 0 以 "对帧 143 的 XOR delta" 发送, md5 PASS (frame 287 sha 与源帧 143 一致)。
+- 重连恢复验证: 推流中 kill fake_board → 重启, 发送端重连后首帧自动 keyframe (flags=0x2 K), 后续 delta 链重建正确。
+- **delta 命中压缩比结论: 本素材 delta 帧仅 0.91× keyframe (整体省 ~8%)** — 与 §1② 预警一致: ssaa3 时域抖动相位逐帧变 (`phase = slot + frame_idx*7`), 静止区域也逐帧变字节, 吃掉了 delta 的静止红利。**冻结抖动相位 (S5 A/B) 才是 delta 兑现 0.45–0.6× 的前提**; 现状 delta 只作重连恢复/协议验证价值。
+- ⚠ 本素材 26 fps 需 30.8–33.6 Mbps, 已超 2.4G 28 Mbps 链路 — ssaa3 密集素材比 §0 估算的 80–130 KB 帧重 ~30%, 5G 锁频 (§1①) 必要性再 +1。

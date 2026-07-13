@@ -1,48 +1,95 @@
-# pov_rxd — board-side PVS1 stream receiver
+# pov_rxd — board-side PVS1 stream receiver (v2, 26 页/秒)
 
 TCP daemon for the Zynq-7020 (MLKPAI-FS03, Debian buster, kernel 6.6) that
 receives compressed POV frames from the PC sender
-(`stream/pc/povstream.py`), decompresses them into a reserved-DDR double
-buffer, and flips the PL POV engine (`0x40010000`) to the new bank at the
-slice-counter wrap so the display never glitches or blocks.
+(`stream/pc/povstream.py`), decompresses them (zlib / RLE / raw, 可选
+DELTA 帧间差分), and flips the PL POV engine (`0x40010000`) between two
+reserved-DDR banks inside a flip window so the display never glitches or
+blocks.
 
 Protocol: [`stream/protocol.h`](../protocol.h) +
 [`stream/pc/protocol.md`](../pc/protocol.md) (PVS1: 16 B header, zlib
-default / zero-run RLE / raw, 1-byte ACK per frame).
+default / zero-run RLE / raw, flags bit2 = DELTA, 1-byte ACK per frame).
+
+v2 design: `docs/design_icnd2047/04_sw_stream_26fps.md` §3 — 三缓冲 +
+RX/flip 双线程 (ACK 与翻页解耦), DELTA 重建, WC 映射 (povmem.ko), 半圈
+双窗口翻页, crc32 挪到 `--crc` 后面。
 
 ## Memory / hardware assumptions
 
 - Linux boots with `mem=256M` → phys `0x10000000..0x1FFFFFFF` is invisible
   to the kernel and reserved for frames (boot setup is handled elsewhere).
-- Double buffer: bank A @ `0x10000000`, bank B @ `0x10500000`, each
-  `360 × 0x3000 = 4,423,680` B.
+- DDR double buffer: bank A @ `0x10000000`, bank B @ `0x10500000`, each
+  `360 × 0x3000 = 4,423,680` B. 另有 3 个 cached malloc staging 缓冲
+  (写入/就绪/拷贝) 在 RX 线程和 flip 线程之间轮转。
 - On start the daemon writes bank A to `slice_base` (0x18). It does NOT
   touch `POV_CTRL` (0x10) — the JTAG side owns mode config — unless you
   pass `--fake`.
-- Cache coherency: on 32-bit ARM (kernel 6.6, `arch/arm/mm/mmu.c
-  phys_mem_access_prot()`), an mmap of `/dev/mem` for a pfn with
-  `!pfn_valid()` — true for both the frame region above `mem=256M` and the
-  PL register page — is mapped **uncached** (`pgprot_noncached`). CPU
-  stores therefore reach DRAM directly and the PL HP port sees them with
-  no cache flushing. The daemon additionally issues `__sync_synchronize()`
-  (DMB) after the frame memcpy and around the `slice_base` write so the
-  data is globally observable before the engine can latch the new base.
-  (If a future kernel were built with `CONFIG_IO_STRICT_DEVMEM` or the
-  region became kernel-managed RAM, revisit this — symptom would be stale
-  or torn frames.)
+- Frame-region mapping: `/dev/povmem` (povmem.ko, **write-combine**,
+  memcpy ~300–800 MB/s) preferred; falls back to `/dev/mem`
+  (strongly-ordered uncached, ~60–120 MB/s) when the module isn't loaded.
+  The PL register page always uses `/dev/mem` (registers want SO). Either
+  way nothing is cached in L1/L2, so the PL HP port needs no cache
+  maintenance; WC being weakly ordered, the daemon issues a DSB after the
+  bank memcpy and around the `slice_base` write.
 
 ## Build (WSL / dev machine)
 
 ```sh
 cd stream/board
-make            # cross ARM static binary ./pov_rxd (arm-linux-gnueabihf-gcc)
-make test       # x86 sim build + loopback protocol/double-buffer test
+make            # cross ARM static binaries ./pov_rxd + ./bench_s0
+make test       # x86 sim build + loopback protocol/delta/NAK/flip test
+make bench      # bench_s0 (ARM) + bench_s0_x86 (local sanity run)
+make ko         # povmem.ko - needs board kernel headers, see povmem/Makefile
 ```
 
-The ARM binary is fully **static** (glibc + `deps/arm/libz.a`, zlib 1.3.1
-cross-built, prebuilt copy committed; `make deps` re-fetches/rebuilds it),
-so the board needs no toolchain and no matching libz. The binary itself is
-committed too — the board may have no compiler.
+The ARM binaries are fully **static** (glibc + `deps/arm/libz.a`, zlib
+1.3.1 cross-built, prebuilt copy committed; `make deps` re-fetches/rebuilds
+it), so the board needs no toolchain and no matching libz. NEON is enabled
+(`-mfpu=neon`, Zynq A9 has it) for the DELTA XOR loop.
+
+`povmem.ko` cannot be built on the dev machine without the board kernel
+tree (6.6.0-xilinx headers): `make -C povmem KDIR=~/mlkpai-kernel/linux-xlnx
+ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-` once it's around, or build
+natively on the board if linux-headers are installed.
+
+## Local test (no board, x86 loopback)
+
+```sh
+cd stream/board
+make test
+```
+
+Spawns `pov_rxd_sim` (`--crc --flip-window dual --fake 20`) on
+localhost:9517 and asserts:
+
+- raw / RLE / zlib frames each ACK and the daemon-logged crc32 of the
+  decoded frame matches the sender's raw crc;
+- a zlib keyframe + 3 `DELTA|ZLIB` frames rebuild to the exact raw frames
+  (`raw = prev_acked_raw ^ decoded`, crc-verified);
+- two frames sent back-to-back with no ACK wait both ACK (RX decoupled
+  from the flip; newest-frame-wins drop path);
+- NAK + close on: garbage magic, unknown flag bit (0x8), DELTA as the
+  first frame of a connection, and DELTA right after a reconnect (the
+  delta reference must reset per connection);
+- at least one FLIP happened (flip thread + window logic alive).
+
+`PASS` + exit 0 = good.
+
+## S0 microbenchmark (bench_s0)
+
+Board-side numbers that decide the §3.5-7 后手 (zlib-ng / zstd / 180 片):
+
+```sh
+scp stream/board/bench_s0 uisrc@<board>:/home/uisrc/
+ssh root@<board> /home/uisrc/bench_s0            # 10 loops, median, ms
+```
+
+Prints one number per line: `so_memcpy_ms` (4.4 MB → /dev/mem SO map),
+`wc_memcpy_ms` (→ /dev/povmem, `skip` if module not loaded), `inflate_ms`
+(typical ~130 KB frame → 4.4 MB), `crc32_ms`, `xor_ms`. It writes to bank
+B (`base+0x500000`); don't run it while streaming. `--loops N --base ADDR`
+supported. `bench_s0_x86` runs the three CPU-only items locally.
 
 ## Deploy to the board
 
@@ -51,6 +98,9 @@ serial console). Users: `uisrc` / `root`.
 
 ```sh
 scp stream/board/pov_rxd uisrc@10.168.168.189:/home/uisrc/
+# optional (WC copy speedup), once povmem.ko is built for 6.6.0-xilinx:
+scp stream/board/povmem/povmem.ko root@10.168.168.189:/root/
+ssh root@10.168.168.189 insmod /root/povmem.ko
 ```
 
 ## Run (no systemd, just nohup)
@@ -60,7 +110,7 @@ scp stream/board/pov_rxd uisrc@10.168.168.189:/home/uisrc/
 ```sh
 ssh root@10.168.168.189
 nohup /home/uisrc/pov_rxd > /var/log/pov_rxd.log 2>&1 &
-tail -f /var/log/pov_rxd.log       # timestamped per-frame log lines
+tail -f /var/log/pov_rxd.log       # per-frame FRAME/FLIP + 1 Hz STAT lines
 ```
 
 Stop with `kill -INT <pid>` (clean exit; SIGTERM also handled). The listen
@@ -70,17 +120,21 @@ socket uses `SO_REUSEADDR`, so an immediate restart never hits
 Options:
 
 ```
---port N       TCP listen port                 (default 9500)
---base ADDR    frame region phys base          (default 0x10000000)
---regs ADDR    POV engine AXI base             (default 0x40010000)
---fake RPS     motor-less test: program fake_period (0x14) and
-               POV_CTRL (0x10) for RPS revolutions/sec fake spin
+--port N            TCP listen port                 (default 9500)
+--base ADDR         frame region phys base          (default 0x10000000)
+--regs ADDR         POV engine AXI base             (default 0x40010000)
+--fake RPS          motor-less test: program fake_period (0x14) and
+                    POV_CTRL (0x10) for RPS revolutions/sec fake spin
+--crc               crc32 + log every decoded frame (costs 11-18 ms/frame
+                    on the A9; debug only, default off)
+--flip-window MODE  single = flip near slice 0 only (default, 现行为);
+                    dual   = also near slice 180 (双屏对置, 26 页/秒)
 ```
 
-Example — bench test without the motor, 15 rps:
+Example — dual-panel bench without the motor, 13 rps:
 
 ```sh
-nohup /home/uisrc/pov_rxd --fake 15 > /var/log/pov_rxd.log 2>&1 &
+nohup /home/uisrc/pov_rxd --fake 13 --flip-window dual > /var/log/pov_rxd.log 2>&1 &
 ```
 
 Then stream from the PC: `python stream/pc/povstream.py stream --host
@@ -88,18 +142,26 @@ Then stream from the PC: `python stream/pc/povstream.py stream --host
 
 ## Behaviour notes
 
+- Two threads: the **RX thread** (recv → inflate → DELTA XOR rebuild →
+  publish → **ACK immediately**) and the **flip thread** (grab the newest
+  ready staging buffer → memcpy into the idle DDR bank → wait for a flip
+  window → write `slice_base`). ACK pacing = decode throughput; the sender
+  (`--fps 26+`) auto-locks to the page rate via the ACK gate.
+- Flip window: `slice_idx < 8`, plus `|slice_idx − 180| < 8` in dual mode.
+  A window that was just used must be left before it can trigger again
+  (no double flips in one pass). If no window shows up within 2 s (engine
+  idle / not spinning) it flips anyway (`FORCED`, counted in STAT).
+- If the sender outruns the display, the ready buffer is overwritten in
+  place — frames are ACKed and **dropped** (STAT `drop=`), the display is
+  never blocked, the newest frame wins.
+- DELTA (`flags` bit2): `raw = prev_acked_raw ^ decoded`; the reference is
+  the previous successfully-ACKed frame, kept in cached RAM (never read
+  back from the uncached banks). It resets on every (re)connect — a DELTA
+  frame with no reference is NAKed and the sender falls back to a keyframe.
+- Bad header / unknown flag bits / failed decompress → 1-byte NAK (0x15)
+  and the connection is closed; the sender reconnects.
+- Logs: per-frame `FRAME seq=… comp=… flags=…[ crc=…] dec=…ms`, per-flip
+  `FLIP gen=… bank=… win=…`, plus a 1 Hz
+  `STAT rx=… flip=… drop=… forced=… dec_avg=…` line while active.
 - One client at a time; on disconnect the daemon goes back to `accept()`
-  (state, including the active bank, persists across connections).
-- Frames are decompressed into a RAM staging buffer, then `memcpy`'d into
-  the **inactive** bank; the flip (write to 0x18) waits until the engine's
-  `slice_idx` (low 16 bits of 0x10) wraps below 8, so a frame swap always
-  lands at a revolution boundary. If the counter never wraps within 2 s
-  (engine idle / not spinning) it flips anyway with a warning.
-- If the sender outruns the display (new data already pending on the
-  socket before the flip), the just-received frame is ACKed and **dropped**
-  (no flip) — the display is never blocked, the newest frame wins.
-- Bad header / failed decompress → 1-byte NAK (0x15) and the connection is
-  closed; the sender reconnects.
-- Every frame logs `FRAME seq=… crc=… bank=… flipped|DROPPED` — the CRC32
-  of the decompressed frame, handy for end-to-end payload verification
-  against the sender.
+  (the active bank persists across connections).

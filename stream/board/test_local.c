@@ -1,12 +1,18 @@
 /*
- * test_local.c - x86 loopback test for pov_rxd (SIM_NO_DEVMEM build).
+ * test_local.c - x86 loopback test for pov_rxd v2 (SIM_NO_DEVMEM build).
  *
- * Spawns ./pov_rxd_sim on a local port, connects, streams frames in all
- * three codecs (raw / zero-run RLE / zlib), verifies the ACK bytes, then
- * checks the CRC32 the daemon logged for every frame against the CRC of
- * what was sent (proves header parse + decompress + double-buffer copy).
- * Also sends two frames back-to-back with no ACK wait (exercises the
- * drop/no-flip path) and a garbage header (expects NAK + close).
+ * Spawns ./pov_rxd_sim (--crc --flip-window dual) on a local port, connects,
+ * and exercises:
+ *   - all three codecs (raw / zero-run RLE / zlib), ACK-paced
+ *   - DELTA chain: zlib keyframe + 3x DELTA|ZLIB, asserts the daemon's
+ *     logged crc32 of every reconstructed raw frame == crc of what the
+ *     PC-side raw was (proves prev_acked_raw ^ decoded reconstruction)
+ *   - two frames back-to-back with no ACK wait (ready-buffer overwrite /
+ *     drop path; both must still ACK - RX is decoupled from the flip)
+ *   - NAK cases, each on a fresh connection (daemon closes after NAK):
+ *     garbage magic / unknown flag bit / DELTA as first frame (no
+ *     reference) / DELTA first after reconnect (reference must reset)
+ *   - at least one FLIP line (flip thread alive, window logic ran)
  *
  * Exit 0 = pass.
  */
@@ -28,7 +34,7 @@
 #include "../protocol.h"
 
 #define TEST_PORT 9517
-#define MAX_FRAMES 16
+#define MAX_FRAMES 32
 
 static uint32_t sent_crc[MAX_FRAMES];
 static int n_sent = 0;
@@ -75,8 +81,10 @@ static int send_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-static int send_frame(int fd, const uint8_t *raw, uint16_t flags,
-                      uint8_t *scratch)
+/* send one frame; `prev` != NULL + DELTA flag -> payload = zlib(prev^raw)
+ * (or bare prev^raw). Records crc of RAW (what the daemon must rebuild). */
+static int send_frame(int fd, const uint8_t *raw, const uint8_t *prev,
+                      uint16_t flags, uint8_t *xbuf, uint8_t *scratch)
 {
     pvs_hdr_t h;
     memcpy(h.magic, PVS_MAGIC, 4);
@@ -84,14 +92,22 @@ static int send_frame(int fd, const uint8_t *raw, uint16_t flags,
     h.n_slices = PVS_N_SLICES;
     h.flags = flags;
 
-    const uint8_t *payload = raw;
+    const uint8_t *body = raw;               /* what the codec layer sees */
+    if (flags & PVS_FLAG_DELTA) {
+        if (!prev) { fprintf(stderr, "test bug: DELTA without prev\n"); return -1; }
+        for (size_t i = 0; i < PVS_FRAME_RAW; i++)
+            xbuf[i] = raw[i] ^ prev[i];
+        body = xbuf;
+    }
+
+    const uint8_t *payload = body;
     if (flags & PVS_FLAG_ZLIB) {
         uLongf clen = compressBound(PVS_FRAME_RAW);
-        if (compress2(scratch, &clen, raw, PVS_FRAME_RAW, 6) != Z_OK) return -1;
+        if (compress2(scratch, &clen, body, PVS_FRAME_RAW, 6) != Z_OK) return -1;
         h.comp_len = (uint32_t)clen;
         payload = scratch;
     } else if (flags & PVS_FLAG_RLE) {
-        h.comp_len = (uint32_t)rle_encode(raw, PVS_FRAME_RAW, scratch);
+        h.comp_len = (uint32_t)rle_encode(body, PVS_FRAME_RAW, scratch);
         payload = scratch;
     } else {
         h.comp_len = PVS_FRAME_RAW;
@@ -133,11 +149,28 @@ static int connect_retry(int port)
     return -1;
 }
 
+/* send a bare header, expect NAK then close (daemon NAKs before payload) */
+static int expect_nak_close(int fd, const pvs_hdr_t *h, const char *what)
+{
+    if (send_all(fd, h, sizeof *h)) { fprintf(stderr, "FAIL: send hdr (%s)\n", what); return -1; }
+    uint8_t b; ssize_t n;
+    do n = recv(fd, &b, 1, 0); while (n < 0 && errno == EINTR);
+    if (n != 1 || b != PVS_NAK) {
+        fprintf(stderr, "FAIL: %s: expected NAK, n=%zd b=0x%02x\n", what, n, n == 1 ? b : 0);
+        return -1;
+    }
+    do n = recv(fd, &b, 1, 0); while (n < 0 && errno == EINTR);
+    if (n != 0) { fprintf(stderr, "FAIL: %s: connection not closed after NAK\n", what); return -1; }
+    printf("test: NAK + close on %s OK\n", what);
+    return 0;
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
 
-    /* spawn the sim daemon with stdout -> pipe */
+    /* spawn the sim daemon with stdout -> pipe. --crc so every FRAME line
+     * carries the reconstructed-raw crc; dual window to exercise §3.2. */
     int pfd[2];
     if (pipe(pfd)) { perror("pipe"); return 1; }
     pid_t pid = fork();
@@ -148,7 +181,7 @@ int main(void)
         dup2(pfd[1], 1);
         close(pfd[0]); close(pfd[1]);
         execl("./pov_rxd_sim", "pov_rxd_sim", "--port", portstr,
-              "--fake", "20", (char *)NULL);
+              "--fake", "20", "--crc", "--flip-window", "dual", (char *)NULL);
         perror("execl pov_rxd_sim");
         _exit(127);
     }
@@ -157,26 +190,38 @@ int main(void)
     int fd = connect_retry(TEST_PORT);
     if (fd < 0) { fprintf(stderr, "FAIL: cannot connect to sim daemon\n"); kill(pid, SIGKILL); return 1; }
 
-    uint8_t *raw = malloc(PVS_FRAME_RAW);
+    uint8_t *raw  = malloc(PVS_FRAME_RAW);
+    uint8_t *raw2 = malloc(PVS_FRAME_RAW);
+    uint8_t *xbuf = malloc(PVS_FRAME_RAW);
     uint8_t *scratch = malloc(compressBound(PVS_FRAME_RAW) + PVS_FRAME_RAW);
-    if (!raw || !scratch) { perror("malloc"); return 1; }
+    if (!raw || !raw2 || !xbuf || !scratch) { perror("malloc"); return 1; }
 
     int rc = 1;
 
     /* 1-3: one frame per codec, ACK-paced (normal sender behaviour) */
     gen_frame(raw, 1);
-    if (send_frame(fd, raw, 0, scratch) || recv_ack(fd)) goto out;
+    if (send_frame(fd, raw, NULL, 0, xbuf, scratch) || recv_ack(fd)) goto out;
     gen_frame(raw, 2);
-    if (send_frame(fd, raw, PVS_FLAG_RLE, scratch) || recv_ack(fd)) goto out;
+    if (send_frame(fd, raw, NULL, PVS_FLAG_RLE, xbuf, scratch) || recv_ack(fd)) goto out;
     gen_frame(raw, 3);
-    if (send_frame(fd, raw, PVS_FLAG_ZLIB, scratch) || recv_ack(fd)) goto out;
+    if (send_frame(fd, raw, NULL, PVS_FLAG_ZLIB, xbuf, scratch) || recv_ack(fd)) goto out;
 
-    /* 4-5: precompress both, then send truly back-to-back with no ACK
-     * wait -> exercises the sender-faster drop/no-flip path */
+    /* 4-6: DELTA chain vs the last ACKed frame (seed 3 is the reference).
+     * Daemon must rebuild raw = prev ^ decoded; crc check below proves it. */
+    memcpy(raw2, raw, PVS_FRAME_RAW);              /* raw2 = prev (seed 3) */
+    for (uint32_t seed = 10; seed < 13; seed++) {
+        gen_frame(raw, seed);
+        if (send_frame(fd, raw, raw2, PVS_FLAG_ZLIB | PVS_FLAG_DELTA,
+                       xbuf, scratch) || recv_ack(fd)) goto out;
+        memcpy(raw2, raw, PVS_FRAME_RAW);          /* prev <- this frame */
+    }
+
+    /* 7-8: precompress both, then send truly back-to-back with no ACK
+     * wait -> newest frame overwrites the ready buffer (drop path); both
+     * must ACK since RX is decoupled from the flip */
     {
-        uint8_t *raw2 = malloc(PVS_FRAME_RAW);
         uint8_t *scratch2 = malloc(compressBound(PVS_FRAME_RAW));
-        if (!raw2 || !scratch2) { perror("malloc"); goto out; }
+        if (!scratch2) { perror("malloc"); goto out; }
         gen_frame(raw, 4);
         gen_frame(raw2, 5);
         uLongf c1 = compressBound(PVS_FRAME_RAW), c2 = c1;
@@ -193,47 +238,87 @@ int main(void)
         sent_crc[n_sent++] = crc32(0L, raw2, PVS_FRAME_RAW);
         printf("test: sent frames %d+%d back-to-back (comp=%lu,%lu)\n",
                n_sent - 2, n_sent - 1, c1, c2);
-        free(raw2); free(scratch2);
+        free(scratch2);
         if (recv_ack(fd) || recv_ack(fd)) goto out;
     }
 
-    /* 6: one more paced frame to confirm daemon is still healthy */
+    /* 9: one more paced frame to confirm daemon is still healthy */
     gen_frame(raw, 6);
-    if (send_frame(fd, raw, PVS_FLAG_ZLIB, scratch) || recv_ack(fd)) goto out;
+    if (send_frame(fd, raw, NULL, PVS_FLAG_ZLIB, xbuf, scratch) || recv_ack(fd)) goto out;
     close(fd);
 
-    /* NAK path: reconnect, garbage magic -> expect 0x15 then close */
-    fd = connect_retry(TEST_PORT);
-    if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+    /* NAK 1: reconnect, garbage magic -> expect 0x15 then close.
+     * Also proves the DELTA reference reset: the previous connection ACKed
+     * frames, and the *next* NAK case (first-frame DELTA) must still NAK. */
     {
         pvs_hdr_t bad;
         memcpy(bad.magic, "XXXX", 4);
         bad.comp_len = 16; bad.raw_len = PVS_FRAME_RAW;
         bad.n_slices = PVS_N_SLICES; bad.flags = 0;
-        if (send_all(fd, &bad, sizeof bad)) { fprintf(stderr, "FAIL: send bad hdr\n"); goto out; }
-        uint8_t b; ssize_t n;
-        do n = recv(fd, &b, 1, 0); while (n < 0 && errno == EINTR);
-        if (n != 1 || b != PVS_NAK) { fprintf(stderr, "FAIL: expected NAK, n=%zd b=0x%02x\n", n, n == 1 ? b : 0); goto out; }
-        do n = recv(fd, &b, 1, 0); while (n < 0 && errno == EINTR);
-        if (n != 0) { fprintf(stderr, "FAIL: connection not closed after NAK\n"); goto out; }
-        printf("test: NAK + close on bad header OK\n");
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "bad magic")) goto out;
+        close(fd);
+    }
+
+    /* NAK 2: unknown flag bit (bit3) -> mask check must reject */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
+        bad.n_slices = PVS_N_SLICES; bad.flags = (1u << 3);
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "unknown flag bit")) goto out;
+        close(fd);
+    }
+
+    /* NAK 3: DELTA as first frame of a fresh connection (no reference,
+     * and reference from earlier connections must NOT survive) */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
+        bad.n_slices = PVS_N_SLICES; bad.flags = PVS_FLAG_ZLIB | PVS_FLAG_DELTA;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "first-frame DELTA")) goto out;
+        close(fd);
+    }
+
+    /* NAK 4: keyframe then reconnect then DELTA -> reference reset check */
+    {
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        gen_frame(raw, 7);
+        if (send_frame(fd, raw, NULL, PVS_FLAG_ZLIB, xbuf, scratch) || recv_ack(fd)) goto out;
+        close(fd);                                  /* reference now stale */
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
+        bad.n_slices = PVS_N_SLICES; bad.flags = PVS_FLAG_ZLIB | PVS_FLAG_DELTA;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "DELTA after reconnect")) goto out;
+        close(fd);
+        fd = -1;
     }
 
     /* stop daemon, harvest its log, verify per-frame CRCs in order */
+    usleep(100000);   /* let the flip thread drain the last ready frame */
     kill(pid, SIGINT);
     {
         FILE *lf = fdopen(pfd[0], "r");
         char line[512];
         uint32_t got_crc[MAX_FRAMES];
-        int n_got = 0, n_flipped = 0, n_dropped = 0;
+        int n_got = 0, n_flips = 0;
         while (fgets(line, sizeof line, lf)) {
             fputs(line, stdout);
             char *p = strstr(line, "crc=");
-            if (p && strstr(line, "FRAME ")) {
+            if (p && strstr(line, "FRAME "))
                 got_crc[n_got++] = (uint32_t)strtoul(p + 4, NULL, 16);
-                if (strstr(line, "flipped")) n_flipped++;
-                if (strstr(line, "DROPPED")) n_dropped++;
-            }
+            if (strstr(line, "FLIP "))
+                n_flips++;
         }
         fclose(lf);
         int status;
@@ -251,9 +336,9 @@ int main(void)
                 goto out;
             }
         }
-        if (n_flipped < 1) { fprintf(stderr, "FAIL: no frame ever flipped\n"); goto out; }
-        printf("test: %d frames, all CRCs match (%d flipped, %d dropped)\n",
-               n_got, n_flipped, n_dropped);
+        if (n_flips < 1) { fprintf(stderr, "FAIL: no frame ever flipped\n"); goto out; }
+        printf("test: %d frames, all CRCs match (delta rebuilt OK), %d flips\n",
+               n_got, n_flips);
     }
 
     printf("PASS\n");

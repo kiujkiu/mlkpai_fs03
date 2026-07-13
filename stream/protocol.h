@@ -31,6 +31,14 @@
 /* flags bits */
 #define PVS_FLAG_RLE     (1u << 0)  /* payload = zero-run RLE (see protocol.md) */
 #define PVS_FLAG_ZLIB    (1u << 1)  /* payload = zlib stream (RFC1950). CHOSEN default. */
+#define PVS_FLAG_DELTA   (1u << 2)  /* payload (after RLE/zlib decode) = XOR delta
+                                     * against the PREVIOUS successfully-ACKed raw
+                                     * frame: raw = prev_raw ^ decoded. First frame
+                                     * of a connection MUST NOT set DELTA (keyframe);
+                                     * receiver NAKs a DELTA frame with no prior
+                                     * frame. Sender policy: keyframe every N frames
+                                     * (default 26) and on (re)connect. Composes
+                                     * with ZLIB: DELTA|ZLIB = zlib(prev^cur). */
 /* flags == 0 -> payload is raw (comp_len == raw_len) */
 
 /* per-frame ACK byte, sent by receiver after decompress+verify(+commit) */
