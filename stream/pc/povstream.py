@@ -196,9 +196,13 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0):
 
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
 
-def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither):
+def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
+                        freeze_phase=False):
     """体素格 → 完整 360×0x3000 帧. render_slices < 360 时每个渲染角复制填
-    360/render_slices 个槽 (布局不变, 省渲染时间); Bayer 相位仍逐槽+逐帧变."""
+    360/render_slices 个槽 (布局不变, 省渲染时间); Bayer 相位仍逐槽+逐帧变.
+    freeze_phase=True: 相位只随 slot 不随 frame_idx (时域抖动冻结) —
+    静止区域帧间字节不变, delta 编码红利兑现; 代价是丢时域抖动的灰度平滑
+    (空间抖动纹理静止化), 见 04 设计稿 §1②/S5."""
     assert N_SLICES % render_slices == 0, '--render-slices 必须整除 360'
     dup = N_SLICES // render_slices
     d_step = 2 * math.pi / render_slices
@@ -207,7 +211,8 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither):
         img = gas.render_slice(vox, k * d_step, sub, d_step)
         for j in range(dup):
             slot = k * dup + j
-            phase = slot + frame_idx * 7        # 7 与 16 互素, 逐帧遍历相位
+            # 7 与 16 互素, 逐帧遍历相位; freeze 时只随 slot
+            phase = slot if freeze_phase else slot + frame_idx * 7
             on = gas.to_1bit(img, thresh, dither, phase)
             parts.append(pack_obs.pack_slice(on))
             parts.append(PAD)
@@ -529,7 +534,8 @@ def gen_packed_frames(args):
     for i, vox in enumerate(ANIMS[args.anim](args)):
         t0 = time.time()
         raw = render_packed_frame(vox, i, args.render_slices, args.sub,
-                                  args.thresh, not args.no_dither)
+                                  args.thresh, not args.no_dither,
+                                  freeze_phase=args.freeze_phase)
         print(f'[render] frame {i}/{args.frames} {time.time() - t0:.1f}s', flush=True)
         yield raw
 
@@ -546,7 +552,8 @@ def cmd_render(args):
         with open(path, 'wb') as f:
             f.write(raw)
     meta = {'anim': args.anim, 'frames': args.frames, 'render_slices': args.render_slices,
-            'frame_raw': FRAME_RAW, 'generated': time.strftime('%Y-%m-%d %H:%M:%S')}
+            'frame_raw': FRAME_RAW, 'freeze_phase': bool(args.freeze_phase),
+            'generated': time.strftime('%Y-%m-%d %H:%M:%S')}
     with open(os.path.join(out_dir, 'meta.json'), 'w') as f:
         json.dump(meta, f, indent=1)
     print(f'[render] {args.frames} frames -> {out_dir} ({time.time() - t0:.1f}s total)', flush=True)
@@ -844,6 +851,9 @@ def add_render_opts(ap):
     ap.add_argument('--sub', type=int, default=3)
     ap.add_argument('--thresh', type=float, default=128)
     ap.add_argument('--no-dither', action='store_true')
+    ap.add_argument('--freeze-phase', action='store_true',
+                    help='Bayer 抖动相位只随 slot 不随 frame (时域抖动冻结, '
+                         'delta 模式静止区域帧间零变化; 代价: 抖动纹理静止化)')
     # spinpulse / glbanim
     ap.add_argument('--glb', default=gas.DEFAULT_GLB)
     ap.add_argument('--samples', type=int, default=None,

@@ -23,6 +23,7 @@ pw(0x10, (360 << 16) | 0x1)          # sensor 模式
 pw(0x0C, 0x000001FF); pw(0x0C, 0xB836C001); pw(0x0C, 0xC1000003)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
+/sbin/insmod /home/uisrc/povmem.ko 2>/dev/null   # WC 映射 (无则回退 /dev/mem)
 pkill pov_rxd 2>/dev/null
 /home/uisrc/pov_rxd > /home/uisrc/pov_rxd.log 2>&1 &
 # ②USB PHY 复位 (短脉冲) + WiFi
@@ -52,6 +53,7 @@ for t in $(seq 1 30); do
     [ -n "$IF" ] && break
     sleep 1
 done
+sleep 2; IF2=$(ls /sys/class/net 2>/dev/null | grep '^wl' | head -1); [ -n "$IF2" ] && IF=$IF2
 echo "IF=[$IF]"
 [ -n "$IF" ] || { echo NO_WLAN_STATIC_ONLY; exit 0; }
 pkill wpa_supplicant 2>/dev/null; sleep 1
