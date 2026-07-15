@@ -145,6 +145,7 @@ module pov_dual_top #(
     wire        df_busy_w, df_done_w;
     wire        eng_a_busy, eng_b_busy;
     wire        oe_a_w;
+    wire        oe_a_state;
     reg         locked_ever;
     reg  [15:0] slice_max;
     reg  [15:0] pair_miss;
@@ -328,7 +329,7 @@ module pov_dual_top #(
                     default: s_axi_rdata <= {19'b0, eng_b_busy, dual_en,        // 0x00
                                              (pair_busy | df_busy_w), pov_en,
                                              at_locked, dclk_fast, overlap_en,
-                                             use_fb, auto_en, oe_a_w,
+                                             use_fb, auto_en, oe_a_state,
                                              2'b00, eng_a_busy};
                 endcase
                 s_axi_rresp  <= 2'b00;
@@ -440,6 +441,7 @@ module pov_dual_top #(
         .dclk_out      (dclk_out),
         .le_out        (le_out),
         .oe_out        (oe_a_w),
+        .oe_state      (oe_a_state),
         .sdi_out       (sdi_out),
         .icnd_sdi_out  (icnd_sdi_out),
         .icnd_dclk_out (icnd_dclk_out),
@@ -470,6 +472,7 @@ module pov_dual_top #(
         .dclk_out      (dclk_out_2),
         .le_out        (le_out_2),
         .oe_out        (oe_out_2),
+        .oe_state      (),
         .sdi_out       (sdi_out_2),
         .icnd_sdi_out  (icnd_sdi_out_2),
         .icnd_dclk_out (icnd_dclk_out_2),

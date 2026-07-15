@@ -69,6 +69,7 @@ module icnd2047_panel_core (
     output wire [15:0]  frame_count_o,
     output wire [31:0]  frame_period_o, // 0x28R: 最近一整屏 aclk 数 (期望 ~10530)
     output wire         oe_done_o,      // R0x00[11]
+    output wire         oe_state_o,     // OE fabric 镜像 (pad 是 ODDR, 不可回采)
     output wire         adv_fired_o,    // R0x00[12]
 
     // ---- pads (全走 ODDR/IOB) ----
@@ -485,6 +486,8 @@ module icnd2047_panel_core (
             .C(aclk), .CE(1'b1), .D1(sdi_r[gs]), .D2(sdi_r[gs]),
             .R(rst_hi), .S(1'b0), .Q(sdi_pad[gs]));
     end endgenerate
+
+    assign oe_state_o = oe_r;
 
     // ---------------- status ----------------
     assign busy           = busy_r | cmd_pending | (state == EG_MAN);

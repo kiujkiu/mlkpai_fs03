@@ -50,6 +50,7 @@ module panel_engine #(
     input  wire        oe_set_pulse,
     input  wire        oe_set_val,
     output wire        engine_busy,
+    output wire        oe_state,
 
     // 屏引脚
     output reg         dclk_out,
@@ -69,6 +70,7 @@ module panel_engine #(
             if (fb_we && fb_wlane == gi[3:0]) mem[fb_waddr] <= fb_wdata;
     end endgenerate
 
+    assign oe_state = oe_out;
     wire run = enable && auto_en;
     assign engine_busy = run;
 
