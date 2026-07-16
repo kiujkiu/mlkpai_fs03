@@ -137,6 +137,7 @@ module pov_dual_top #(
     reg  [31:0] slice_base_r;
     reg  [8:0]  phase_b_r;       // 0x1C, 默认 180
     reg  [7:0]  oe_window_b_r;   // 0x20, 0 = 跟随 A
+    reg  [31:0] row_cfg_r;       // 0x24 行驱时序/极性
 
     //---------- 前向声明 ----------
     wire [15:0] at_slice_idx;
@@ -189,6 +190,7 @@ module pov_dual_top #(
             slice_base_r  <= 32'h1000_0000;
             phase_b_r     <= 9'd180;     // 背靠背默认 180°
             oe_window_b_r <= 8'd0;       // 0 = 跟随屏 A
+            row_cfg_r     <= 32'h0;      // 全默认
         end else begin
             oe_set_pulse <= 1'b0;
             fb_we        <= 1'b0;
@@ -239,6 +241,7 @@ module pov_dual_top #(
                     4'd6: slice_base_r  <= s_axi_wdata;          // 0x18
                     4'd7: phase_b_r     <= s_axi_wdata[8:0];     // 0x1C PHASE_B
                     4'd8: oe_window_b_r <= s_axi_wdata[7:0];     // 0x20 BRIGHT_B
+                    4'd9: row_cfg_r     <= s_axi_wdata;          // 0x24 行驱 cfg
                     default: ;   // 0x00/04/08 手动命令归引擎黑盒 (遗留)
                 endcase
                 s_axi_bvalid <= 1'b1;
@@ -437,6 +440,7 @@ module pov_dual_top #(
         .sdi_mask      (sdi_mask),
         .oe_set_pulse  (oe_set_pulse),
         .oe_set_val    (oe_set_val),
+        .row_cfg       (row_cfg_r),
         .engine_busy   (eng_a_busy),
         .dclk_out      (dclk_out),
         .le_out        (le_out),
@@ -468,6 +472,7 @@ module pov_dual_top #(
         .sdi_mask      (sdi_mask),
         .oe_set_pulse  (oe_set_pulse),
         .oe_set_val    (oe_set_val),
+        .row_cfg       (row_cfg_r),
         .engine_busy   (eng_b_busy),
         .dclk_out      (dclk_out_2),
         .le_out        (le_out_2),

@@ -49,6 +49,7 @@ module panel_engine #(
     input  wire [8:0]  sdi_mask,
     input  wire        oe_set_pulse,
     input  wire        oe_set_val,
+    input  wire [31:0] row_cfg,
     output wire        engine_busy,
     output wire        oe_state,
 

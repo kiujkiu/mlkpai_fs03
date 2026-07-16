@@ -150,7 +150,7 @@ module row_drv_icnd1028 (
     end
 
     // 极性可翻 (0x24 cfg), datasheet 到手前不焊死
-    assign row_sdi  = sdi_i;
+    assign row_sdi  = sdi_i ^ cfg[19];   // [19]=行选数据反相 (1028 低有效选行假设)
     assign row_dclk = dclk_i ^ cfg[17];
     assign row_lck  = lck_i  ^ cfg[18];
     assign row_bk   = cfg[16];      // v0: 恒无效 (不消隐), 极性位选电平

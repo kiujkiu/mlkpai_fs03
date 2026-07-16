@@ -36,6 +36,7 @@ module panel_engine #(
     input  wire [8:0]  sdi_mask,
     input  wire        oe_set_pulse,
     input  wire        oe_set_val,
+    input  wire [31:0] row_cfg,          // 0x24 行驱时序/极性 (0=全默认)
     output wire        engine_busy,
     output wire        oe_state,        // OE fabric 镜像 (status 读回用, 别读 pad)
 
@@ -86,7 +87,7 @@ module panel_engine #(
         .row_man_type    (1'b0),
         .row_man_sdi     (1'b0),
         .row_man_reg     (4'h0),
-        .row_cfg         (32'h0),                // 0 → 全默认 (adv_high=64 拍)
+        .row_cfg         (row_cfg),
         .busy            (core_busy),
         .cmd_pending_o   (),
         .row_busy_o      (core_row_busy),
