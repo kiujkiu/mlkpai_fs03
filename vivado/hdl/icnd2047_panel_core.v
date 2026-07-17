@@ -127,6 +127,10 @@ module icnd2047_panel_core (
     wire [8:0] next_row = (shift_row == row_max) ? 9'd0 : (shift_row + 9'd1);
     wire [2:0] le_len   = (shift_row == 9'd0) ? 3'd5 : 3'd4;   // 首行5/换行4
     wire [7:0] le_start = 8'd192 - {5'd0, le_len};
+    // 行边界静默区 (0x24[30:25], 拍): LE尾→OE落 与 OE落→下行突发 各插死区,
+    // 隔离 OE/LCK 电流阶跃与 CLK 沿 (2026-07-17 行边界串扰案)。0=关=原行为
+    wire [5:0] q_gap = row_cfg[30:25];
+    reg  [5:0] qg_cnt;
 
     // bit 提取 (01 §2.1): sel=bit[4:0]; half=sel[4], bit_sel=15-sel[3:0] (词内 MSB first)
     function pr_bit;
@@ -185,6 +189,7 @@ module icnd2047_panel_core (
             state       <= EG_IDLE;
             sh_cnt      <= 8'd0;
             slow_ph     <= 1'b0;
+            qg_cnt      <= 6'd0;
             sdi_r       <= 9'd0;
             le_r        <= 1'b0;
             dclk_r      <= 1'b0;
@@ -304,8 +309,11 @@ module icnd2047_panel_core (
                         oe_r    <= 1'b1;
                         oe_done <= 1'b1;
                         oe_cnt  <= 9'd0;
+                    end else if (qg_cnt >= q_gap) begin
+                        qg_cnt <= 6'd0;
+                        state  <= EG_LOAD;          // BRAM 读 1 拍 (静默区后)
                     end else
-                        state <= EG_LOAD;           // BRAM 读 1 拍
+                        qg_cnt <= qg_cnt + 6'd1;    // OE落→突发 死区
                 end
 
                 //--------------------------------------------------------
@@ -345,8 +353,11 @@ module icnd2047_panel_core (
                                 oe_r    <= 1'b1;
                                 oe_done <= 1'b1;
                                 oe_cnt  <= 9'd0;
-                            end else
-                                state <= disp_ready ? EG_DISP : EG_LWAIT;
+                            end else begin
+                                qg_cnt <= 6'd0;
+                                state  <= (disp_ready && q_gap == 6'd0) ? EG_DISP
+                                                                        : EG_LWAIT;
+                            end
                         end else begin
                             dclk_r <= ~dclk_r;      // 进入 bit nc → 沿在其中点
                             sh_cnt <= nc;
@@ -372,8 +383,13 @@ module icnd2047_panel_core (
                         oe_r    <= 1'b1;
                         oe_done <= 1'b1;
                         oe_cnt  <= 9'd0;
-                    end else if (disp_ready)
-                        state <= EG_DISP;
+                    end else if (disp_ready) begin
+                        if (qg_cnt >= q_gap) begin  // LE尾→OE落 死区
+                            qg_cnt <= 6'd0;
+                            state  <= EG_DISP;
+                        end else
+                            qg_cnt <= qg_cnt + 6'd1;
+                    end
                 end
 
                 //--------------------------------------------------------
@@ -467,12 +483,31 @@ module icnd2047_panel_core (
     // ---------------- 输出级: ODDR (01 §1.2 接线细目) ----------------
     wire rst_hi = ~aresetn;
 
+    // 相位旋钮 (0x24: [20]=DCLK翻转 [22:21]=数据平移拍 [24:23]=LE平移拍)
+    // 治首/尾 bit 装载错位 (板2 col_shift 同款病, 2026-07-16 共阳屏实见)
+    // [30:25]=quiet_gap 行边界静默区拍数 (见 q_gap, FSM 内实现)
+    wire       ph_dclk_inv = row_cfg[20];
+    wire [1:0] ph_data_dly = row_cfg[22:21];
+    wire [1:0] ph_le_dly   = row_cfg[24:23];
+    reg  [8:0] sdi_p1, sdi_p2, sdi_p3;
+    reg        le_p1, le_p2, le_p3;
+    always @(posedge aclk) begin
+        sdi_p1 <= sdi_r;  sdi_p2 <= sdi_p1;  sdi_p3 <= sdi_p2;
+        le_p1  <= le_r;   le_p2  <= le_p1;   le_p3  <= le_p2;
+    end
+    wire [8:0] sdi_o = (ph_data_dly == 2'd0) ? sdi_r :
+                       (ph_data_dly == 2'd1) ? sdi_p1 :
+                       (ph_data_dly == 2'd2) ? sdi_p2 : sdi_p3;
+    wire       le_o  = (ph_le_dly == 2'd0) ? le_r :
+                       (ph_le_dly == 2'd1) ? le_p1 :
+                       (ph_le_dly == 2'd2) ? le_p2 : le_p3;
+
     ODDR #(.DDR_CLK_EDGE("SAME_EDGE"), .INIT(1'b0), .SRTYPE("SYNC")) u_oddr_dclk (
-        .C(aclk), .CE(1'b1), .D1(dclk_d), .D2(dclk_r),
+        .C(aclk), .CE(1'b1), .D1(dclk_d ^ ph_dclk_inv), .D2(dclk_r ^ ph_dclk_inv),
         .R(rst_hi), .S(1'b0), .Q(dclk_pad));
 
     ODDR #(.DDR_CLK_EDGE("SAME_EDGE"), .INIT(1'b0), .SRTYPE("SYNC")) u_oddr_le (
-        .C(aclk), .CE(1'b1), .D1(le_r), .D2(le_r),
+        .C(aclk), .CE(1'b1), .D1(le_o), .D2(le_o),
         .R(rst_hi), .S(1'b0), .Q(le_pad));
 
     // OE 复位/GSR 必须=1 (消隐) → INIT=1 + S 复位
@@ -483,7 +518,7 @@ module icnd2047_panel_core (
     genvar gs;
     generate for (gs = 0; gs < 9; gs = gs + 1) begin: g_oddr_sdi
         ODDR #(.DDR_CLK_EDGE("SAME_EDGE"), .INIT(1'b0), .SRTYPE("SYNC")) u_oddr_sdi (
-            .C(aclk), .CE(1'b1), .D1(sdi_r[gs]), .D2(sdi_r[gs]),
+            .C(aclk), .CE(1'b1), .D1(sdi_o[gs]), .D2(sdi_o[gs]),
             .R(rst_hi), .S(1'b0), .Q(sdi_pad[gs]));
     end endgenerate
 

@@ -41,3 +41,14 @@ set_property -dict {PACKAGE_PIN Y4   IOSTANDARD LVCMOS33} [get_ports panel_row_s
 # ---- 暂未用 ----
 # 屏1 SPI Flash: CS=AB9 MOSI=AA9 CLK=AA8 MISO=AA7 / 屏2 SPI: CS=AB1 MOSI=U6 CLK=U5 MISO=R6
 # 光电 SPIN_SYNC = W6 (接口板 P5, CEP_11P)
+
+# ---- SI 整形 (2026-07-16 LA 实测 CLK 2-4ns 振铃假沿, 边界像素错乱根因) ----
+# 全部屏输出: 慢摆率 + 8mA — 钝化边沿抑制反射双击
+set_property SLEW SLOW [get_ports panel_*]
+set_property DRIVE 8    [get_ports panel_*]
+
+# ---- 分层驱动 (2026-07-17 行边界串扰案: J12 pin20/21/22 = OE/LE/DCLK 相邻) ----
+# CLK = 受害线, 强驱动压住耦合噪声; LE/OE/行驱 = 攻击线, 弱驱动减 dV/dt
+set_property DRIVE 16 [get_ports {panel_dclk panel_dclk_2}]
+set_property DRIVE 4  [get_ports {panel_lat panel_lat_2 panel_oe panel_oe_2}]
+set_property DRIVE 4  [get_ports panel_row_*]

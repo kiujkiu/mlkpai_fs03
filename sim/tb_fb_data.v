@@ -86,8 +86,8 @@ module tb_fb_data;
 
     // 采样统计: 一段窗口内 sdi_a[0] 高电平占比 + dclk 沿数
     integer hi_cnt, tot_cnt, dclk_edges;
-    reg dclk_d;
-    always @(posedge clk) dclk_d <= dclk_a;
+    reg dclk_d, le_d;
+    always @(posedge clk) begin dclk_d <= dclk_a; le_d <= le_a; end
 
     integer i, lane;
     initial begin
@@ -102,7 +102,7 @@ module tb_fb_data;
 
         axi_write(16'h0010, (360 << 16));            // pov off
         axi_write(16'h000C, 32'h000001FF);           // sdi_mask
-        axi_write(16'h000C, 32'h98023001);           // rows=2, oe=48, 双沿
+        axi_write(16'h000C, 32'h98020801);           // rows=2, oe=8 (板上闪屏工况)
         axi_write(16'h000C, 32'hC1000003);           // auto_en + use_fb
 
         // 跑 4 行时间 (~200 拍/行), 统计 sdi_a[0]
@@ -112,6 +112,7 @@ module tb_fb_data;
             if (sdi_a[0]) hi_cnt = hi_cnt + 1;
             tot_cnt = tot_cnt + 1;
             if (dclk_a != dclk_d) dclk_edges = dclk_edges + 1;
+            if (le_a && !le_d) $display("LE_RISE at t=%0d (row edge)", tot_cnt);
             if (tot_cnt > 300 && tot_cnt < 800 && tot_cnt % 40 == 0)
                 $display("t=%0d eg=%0d rdst=%0d div=%0d rbusy=%b rgo=%b oedone=%b advf=%b",
                          tot_cnt, dut.u_eng_a.u_core.eg_state_o,
