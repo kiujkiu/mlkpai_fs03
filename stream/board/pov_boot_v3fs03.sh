@@ -19,7 +19,7 @@ except Exception as e:
 ba.close()
 bb = mmap.mmap(f, 0x438000, offset=0x10500000); bb[:] = b'\0'*0x438000; bb.close()
 pw(0x18, 0x10000000)
-pw(0x0C, 0x000001FF); pw(0x0C, 0x98363001); pw(0x0C, 0xC1000003)  # fast 25M 双沿/54行/oe48
+pw(0x0C, 0x000001FF); pw(0x0C, 0x9836C001); pw(0x0C, 0xC1000003)  # fast 25M 双沿/54行/oe192满亮(POV稀疏安全,全屏实心禁)
 pw(0x10, (360 << 16) | 0x5)          # sensor+dual 光电角度 (2026-07-17 固化; fake调试: pov6_fake.py dual 0.5)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
