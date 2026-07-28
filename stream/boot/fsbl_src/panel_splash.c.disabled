@@ -1,0 +1,67 @@
+/******************************************************************************
+ * panel_splash.c — FSBL 开机画面 (2026-07-28)
+ *
+ * 由 FsblHookAfterBitstreamDload() 调用: bitstream 刚下载完、PL 刚活过来那一刻,
+ * 把一张静态图灌进 panel 引擎的 fb (PL 内 BRAM) 并启动 auto 扫描。
+ *
+ * 为什么可行: **引擎是自走的** —— fb 灌好 + auto_en/use_fb 一置位, 它就自己一直
+ * 扫下去, 完全不依赖 CPU。所以画面会从 FSBL 一直撑过 u-boot + 内核启动,
+ * 直到 pov_boot.sh 用 POV 切片接管 (约 t=11s)。上电到出画面 ≈ 1-2s。
+ *
+ * 只用 PL BRAM, **不碰 DDR** → 不依赖 DDR 初始化, 不受 mem=256M 预留影响。
+ *
+ * 寄存器语义见 vivado/hdl/pov_dual_top.v 头部注释; 写入序列与
+ * tools/pov6_debug/pov6_chess.py 完全一致 (那条路径板上验证过)。
+ *****************************************************************************/
+#include "xil_io.h"
+#include "xstatus.h"
+#include "splash_fb.h"
+
+#define PANEL_BASE   0xE0000000u  /* 占位, 由 panel_splash.h 覆盖 */
+#undef  PANEL_BASE
+#define PANEL_BASE   0x40010000u
+
+#define REG_CFG      0x0Cu        /* [31:30] subcmd: 00=sdi_mask 10=cfg 11=auto/use_fb */
+#define REG_POVCTRL  0x10u        /* [0]=pov_en [2]=dual_en [3]=fb_sel_b [31:16]=n_slices */
+#define FB_WINDOW    0x8000u      /* awaddr[15]=1 → fb 写窗 */
+
+#define N_SLICES     360u
+#define CTRL_BASE    ((N_SLICES << 16) | 0x4u)   /* pov_en=0, dual_en=1 (A/B 都跑) */
+#define FB_SEL_B     0x8u
+
+/* ⚠ oe_window 单位=沿, 引擎内箝位 [2,187]。
+ * splash 亮像素多 (~60% 全屏), 双屏并联时电流不小 —— 接口板 TPS54560 总闸只有 5A,
+ * 设计文档算过双屏全白 25% 占空已达 4.4-4.9A。故 splash 取 48 沿 (25% 占空) 且不再往上调。
+ * 48 沿是板上实测"看得清"的档位; 8 沿(4%) 会暗到看不见, 见记忆 feedback_oe_window_too_low_invisible。 */
+#define SPLASH_OE    48u
+#define CFG_WORD     (0x98360001u | (SPLASH_OE << 8))
+
+static void PanelWr(u32 off, u32 val) { Xil_Out32(PANEL_BASE + off, val); }
+
+/* fb 布局: lane 0..8 × row 0..53 × word 0..5 = 2916 word
+ * 地址 = FB_WINDOW | lane<<11 | row*0x20 | word*4 ; 数组下标 = lane*324 + row*6 + word */
+static void PanelFbLoad(u32 sel_b)
+{
+    u32 lane, row, wd;
+    PanelWr(REG_POVCTRL, CTRL_BASE | (sel_b ? FB_SEL_B : 0u));
+    for (lane = 0; lane < 9u; lane++) {
+        for (row = 0; row < 54u; row++) {
+            for (wd = 0; wd < 6u; wd++) {
+                PanelWr(FB_WINDOW | (lane << 11) | (row * 0x20u) | (wd * 4u),
+                        splash_fb[lane * 324u + row * 6u + wd]);
+            }
+        }
+    }
+}
+
+u32 PanelSplashShow(void)
+{
+    PanelWr(REG_POVCTRL, CTRL_BASE);      /* POV 关, dual_en 开 */
+    PanelWr(REG_CFG, 0x000001FFu);        /* sdi_mask 九线全开 */
+    PanelWr(REG_CFG, CFG_WORD);           /* 54 行 / oe / 双沿 50M */
+    PanelFbLoad(0u);                      /* 灌屏 A */
+    PanelFbLoad(1u);                      /* 灌屏 B */
+    PanelWr(REG_POVCTRL, CTRL_BASE);      /* fb_sel 回 A */
+    PanelWr(REG_CFG, 0xC1000003u);        /* auto_en + use_fb → 引擎自走 */
+    return XST_SUCCESS;
+}
