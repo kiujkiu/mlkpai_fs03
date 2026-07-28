@@ -23,11 +23,11 @@ def fb_fill(lanes_on, sel_b):
         for i in range(512):
             pw(base | (i << 2), word)
 
-cfg = 0x98360801   # oe=8沿: 共阳屏全屏实心电流红线 | (0x20000000 if slow else 0)
-pw(0x10,(360<<16)|0x4)   # dual_en 常开 (屏可能在 P3=B 引擎)
+cfg = 0x98360801 | (0x20000000 if slow else 0)
+pw(0x10,(360<<16)|0x4)   # POV 关 (auto 静态)
 pw(0x0C, 0x000001FF)      # sdi_mask
 pw(0x0C, cfg)             # 54 行 / oe 48 沿 / 双沿或slow
-COLORS = [('RED', {0,3,6}), ('GREEN', {1,4,7}), ('BLUE', {2,5,8})]
+COLORS = [('RED',{0,3,6}),('GREEN',{1,4,7}),('BLUE',{2,5,8}),('YELLOW',{0,3,6,1,4,7}),('MAGENTA',{0,3,6,2,5,8}),('CYAN',{1,4,7,2,5,8}),('WHITE',set(range(9)))]
 print('cfg=0x%08X %s' % (cfg, 'SLOW-25M' if slow else 'FAST-50M'), flush=True)
 
 for r in range(rounds):

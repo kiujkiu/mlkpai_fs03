@@ -10,3 +10,7 @@ cam/frame_*.jpg
 cam/test*.jpg
 *.jou
 *.xsa
+.claude/
+tools/__pycache__/
+vivado/_*.tcl
+sim_diag/

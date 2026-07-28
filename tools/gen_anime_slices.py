@@ -3,10 +3,20 @@
 """
 gen_anime_slices.py — anime GLB/点云 → 360 子午面切片 → FS03 DDR 镜像 (2026-07-08).
 
-几何约定 (照搬 zynq_pov/tools/_gen_anime_slices.py 的 multivox 式带符号半径):
-  转轴 = 模型竖直中轴 = 屏 X 中心 (X=79.5, 轴在屏中间不是边缘)。
-  X = 带符号半径 d = X-79.5 ∈ [-79.5,+79.5]; slice i (θ_i=i°) 的 X>79.5 半边
-  显示方位角 θ_i 半平面, X<79.5 半边显示 θ_i+180°; Y 0..179 = 高 (上→下)。
+几何约定 (multivox 式带符号半径 + 2026-07-27 新增偏移轴支持):
+  u = X-79.5 ∈ [-79.5,+79.5] 沿屏宽; Y 0..179 = 高 (上→下)。
+  --gap-mm 0 (穿心, 旧行为): 转轴在屏 X 中心, u = 带符号半径, slice i (θ_i=i°)
+    的 u>0 半边显示方位角 θ_i 半平面, u<0 半边显示 θ_i+180°。
+  --gap-mm D>0 (正反双屏有间距, 屏不再过圆心): 每屏面到轴垂距 D/2, 屏面是
+    与转轴平行的**偏移平面**而非子午面。世界点 = u·û(θ) + (D/2)·n̂(θ),
+    û=(cosθ,sinθ), n̂=(-sinθ,cosθ)。等价 R=√(u²+(D/2)²), 方位=θ+atan2(D/2,u)。
+    ⚠ 半径 < D/2 的圆柱是**中心盲区**, 几何固有扫不到; 但轴心是模型内部,
+      D=13.8mm 时盲区仅占截面积 0.85% (占直径 9.2%), 外观基本无损。
+    ⚠ 此时 360 片**各不相同** (穿心时 i 与 i+180 互为镜像, 是 2× 冗余存法)。
+    ✅ 两屏关于轴对称 ⇒ 屏B@θ ≡ 屏A@(θ+180), PHASE_B=180 与单份 DDR 数据不变。
+  🔴 --mirror-u 默认 **ON** (2026-07-27 上板实测): 屏 X 轴物理方向与 û(θ) 相反,
+     每片须对屏中心轴做轴对称。穿心几何下 mirror(slice i)==slice i+180, 手性错误
+     等价于相位转 180° 会被光电标定悄悄吸收掉 —— 有间距后才第一次变成肉眼可见的镜像。
   厚度 = 逐像素最近邻体素采样 (~1 voxel), 可选 --sub N 子角度 max 混合保证相邻
   片覆盖连续。全像素统一处理, 无按径向距离变化的补偿 (Voxon P3 专利红线)。
 
@@ -39,6 +49,7 @@ DEFAULT_GLB = os.path.join(ZYNQ_POV_HOST, 'anime_62459.glb')
 GR = W      # 体素格 x/z 尺寸 (半径预算 79)
 GH = H      # 体素格 y 尺寸 (高度预算 178)
 R_BUDGET = W // 2 - 1.0    # 79
+PITCH_MM = 0.9375          # P0.9375 COB 屏点间距 (体素单位 = 1 像素 = 0.9375mm)
 H_BUDGET = H // 2 - 1.0    # 89
 
 BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
@@ -156,16 +167,34 @@ def voxelize(xyz, col, z_stretch):
     return voxel_grid(normalize_points(xyz, z_stretch), col)
 
 
-def render_slice(vox, theta, sub, d_step):
-    """角度 theta 的观察者视角 float 图 (H,W,3)。sub 个子角度 max 混合。"""
-    D = np.arange(W, dtype=np.float32) - (W - 1) / 2.0
+def render_slice(vox, theta, sub, d_step, axis_off=0.0, mirror_u=False):
+    """角度 theta 的观察者视角 float 图 (H,W,3)。sub 个子角度 max 混合。
+
+    axis_off = 屏面到转轴的垂距 (体素单位 = 屏像素)。
+      0     → 屏面穿心, **逐字节退化成旧行为** (过原点射线, slice 编号语义不变)
+      >0    → 正反双屏有间距: 屏面是与转轴平行、垂距 axis_off 的**偏移平面**,
+              不再是子午面。沿用旧约定 u 走 û(θ)=(cosθ,sinθ), 偏移走法向
+              n̂(θ)=(-sinθ,cosθ): 世界点 = u·û(θ) + axis_off·n̂(θ)。
+              等价极坐标: R=√(u²+axis_off²), 方位 = θ + atan2(axis_off, u)
+              —— 一列像素不再共面, 近轴处方位偏移极大 (u=0 处直接偏 90°)。
+    ⚠ 半径 < axis_off 的圆柱永远扫不到 (中心盲区), 属几何固有, 软件补不回来。
+    屏 B 关于转轴对称 (垂距 -axis_off) ⇒ 屏B@θ ≡ 屏A@(θ+180), 故 PHASE_B=180
+      仍严格成立, DDR 只需一份 360 片 (但此时 360 片各不相同, 不再是 2× 冗余)。
+    """
+    D = np.arange(W, dtype=np.float32) - (W - 1) / 2.0    # u: 沿屏宽, ±79.5
+    if mirror_u:
+        D = -D          # 屏 X 轴物理方向与 û(θ) 相反 → 每片对中心轴做轴对称
     gy = (H - 1) - np.arange(H)          # 屏 Y 上→下, 体素 y 下→上
     img = np.zeros((H, W, 3), np.float32)
     offs = [0.0] if sub <= 1 else [(k / sub - (sub - 1) / (2.0 * sub)) * d_step for k in range(sub)]
     for off in offs:
         c, s = math.cos(theta + off), math.sin(theta + off)
-        wx = np.clip(np.rint(D * c).astype(np.int32) + GR // 2, 0, GR - 1)
-        wz = np.clip(np.rint(D * s).astype(np.int32) + GR // 2, 0, GR - 1)
+        # 偏移平面: u 沿 û=(c,s) (旧约定不动), 垂距沿法向 n̂=(-s,c)
+        # axis_off=0 时化简为 (D*c, D*s) = 旧代码, 逐字节一致
+        wxf = D * c - axis_off * s
+        wzf = D * s + axis_off * c
+        wx = np.clip(np.rint(wxf).astype(np.int32) + GR // 2, 0, GR - 1)
+        wz = np.clip(np.rint(wzf).astype(np.int32) + GR // 2, 0, GR - 1)
         np.maximum(img, vox[wx[None, :], gy[:, None], wz[None, :]], out=img)
     return img
 
@@ -216,6 +245,10 @@ def main():
     ap.add_argument('--thresh', type=float, default=128, help='1-bit 亮度阈值 (0..255)')
     ap.add_argument('--no-dither', action='store_true', help='关 Bayer 有序抖动')
     ap.add_argument('--sub', type=int, default=3, help='子角度采样数 (厚度连续性)')
+    ap.add_argument('--gap-mm', type=float, default=13.8,
+                    help='正反双屏两屏面间距 mm (每屏到轴垂距 = 一半); 0 = 穿心旧行为')
+    ap.add_argument('--no-mirror-u', dest='mirror_u', action='store_false', default=True,
+                    help='关掉中心轴镜像。默认开: 本机屏 X 轴物理方向与 û(θ) 相反, 2026-07-27 上板实测确认')
     ap.add_argument('--samples', type=int, default=1800000)
     ap.add_argument('--z-stretch', type=float, default=1.0,
                     help='薄模型 z 方向增肥 (anime_62459 bbox 近立方, 1.5 反而缩小整体, 默认关)')
@@ -236,11 +269,23 @@ def main():
     col = color_adjust(col, args.brighten, args.gamma, args.saturation)
     vox = voxelize(xyz, col, args.z_stretch)
 
+    axis_off = (args.gap_mm / 2.0) / PITCH_MM      # mm → 体素(像素)单位
+    if axis_off > 0:
+        r_out = math.hypot(R_BUDGET + 0.5, axis_off)
+        print(f'[geom] 双屏间距 {args.gap_mm}mm → 每屏到轴垂距 '
+              f'{args.gap_mm/2:.2f}mm = {axis_off:.2f}px (偏移平面, 非子午面)', flush=True)
+        print(f'[geom] 中心盲区 直径 {args.gap_mm:.1f}mm = {2*axis_off:.1f}px, '
+              f'占截面积 {100*(axis_off/r_out)**2:.2f}% | 有效外径 {r_out:.2f}px | '
+              f'整屏跨方位 {2*math.degrees(math.atan2(R_BUDGET+0.5, axis_off)):.1f}°', flush=True)
+    else:
+        print('[geom] gap=0 → 穿心子午面 (旧行为)', flush=True)
+    print('[geom] mirror_u=%s (中心轴镜像; 默认 ON, 本机实测)'
+          % ('ON' if args.mirror_u else 'OFF'), flush=True)
     d_step = 2 * math.pi / args.slices
     bufs = []
     lit_total = 0
     for i in range(args.slices):
-        img = render_slice(vox, i * d_step, args.sub, d_step)
+        img = render_slice(vox, i * d_step, args.sub, d_step, axis_off, args.mirror_u)
         on = to_1bit(img, args.thresh, not args.no_dither, i)
         lit_total += int(on.any(axis=2).sum())
         buf = pack_obs.pack_slice(on)
