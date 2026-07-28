@@ -197,18 +197,22 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0):
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
 
 def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
-                        freeze_phase=False):
+                        freeze_phase=False, axis_off=0.0, mirror_u=True):
     """体素格 → 完整 360×0x3000 帧. render_slices < 360 时每个渲染角复制填
     360/render_slices 个槽 (布局不变, 省渲染时间); Bayer 相位仍逐槽+逐帧变.
     freeze_phase=True: 相位只随 slot 不随 frame_idx (时域抖动冻结) —
     静止区域帧间字节不变, delta 编码红利兑现; 代价是丢时域抖动的灰度平滑
-    (空间抖动纹理静止化), 见 04 设计稿 §1②/S5."""
+    (空间抖动纹理静止化), 见 04 设计稿 §1②/S5。
+
+    axis_off / mirror_u: 2026-07-28 双屏几何 — 屏面不过转轴 (间距 13.8mm →
+    垂距 7.36 px) + 全局中心轴镜像。必须与 gen_anime_slices.py 的默认一致,
+    否则渲出来的帧跟板上机械结构对不上 (07-09 那批 frames_* 就是旧几何)。"""
     assert N_SLICES % render_slices == 0, '--render-slices 必须整除 360'
     dup = N_SLICES // render_slices
     d_step = 2 * math.pi / render_slices
     parts = []
     for k in range(render_slices):
-        img = gas.render_slice(vox, k * d_step, sub, d_step)
+        img = gas.render_slice(vox, k * d_step, sub, d_step, axis_off, mirror_u)
         for j in range(dup):
             slot = k * dup + j
             # 7 与 16 互素, 逐帧遍历相位; freeze 时只随 slot
@@ -531,11 +535,16 @@ ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
 
 def gen_packed_frames(args):
     """动画名 → 逐帧 4,423,680B packed bytes."""
+    _off = (args.gap_mm / 2.0) / gas.PITCH_MM
+    print('[geom] gap=%.1fmm → 每屏到轴垂距 %.2fpx (偏移平面) | mirror_u=%s'
+          % (args.gap_mm, _off, 'ON' if args.mirror_u else 'OFF'), flush=True)
     for i, vox in enumerate(ANIMS[args.anim](args)):
         t0 = time.time()
         raw = render_packed_frame(vox, i, args.render_slices, args.sub,
                                   args.thresh, not args.no_dither,
-                                  freeze_phase=args.freeze_phase)
+                                  freeze_phase=args.freeze_phase,
+                                  axis_off=(args.gap_mm / 2.0) / gas.PITCH_MM,
+                                  mirror_u=args.mirror_u)
         print(f'[render] frame {i}/{args.frames} {time.time() - t0:.1f}s', flush=True)
         yield raw
 
@@ -867,6 +876,10 @@ def add_render_opts(ap):
                     help='spin: 点云洋葱状向内复制层数 (壳太薄时加厚)')
     ap.add_argument('--shell-gap', type=float, default=1.3,
                     help='spin: 壳层间距 (voxel)')
+    ap.add_argument('--gap-mm', type=float, default=13.8,
+                    help='双屏间距 mm (每屏到轴垂距=一半); 0=穿心旧几何')
+    ap.add_argument('--no-mirror-u', dest='mirror_u', action='store_false', default=True,
+                    help='关全局中心轴镜像 (默认开, 2026-07-28 上板实测)')
     ap.add_argument('--robust-fit', action='store_true',
                     help='glbanim: [2,98] 分位 bbox 归一, 抗技能位移/特效骨骼压小人物')
     ap.add_argument('--x-offset', type=float, default=0.0,

@@ -22,13 +22,14 @@
 //         新 [2]=dual_en (0=纯单屏, B 引擎静默消隐, 行为=v5)
 //         新 [3]=fb_sel_b (AXI fb 窗 awaddr[15]=1 的写落 fb_B, pov_en=0 调试直灌;
 //              置位时 B 引擎也使能 — 02 §7 阶段1 "dual_en=0 直灌 fb_B + auto 扫" 用)
-//         新 [4]=mirror_b (屏 B 写 fb 时做左右镜像, 见下方 MIRROR 段; 复位=0 保持旧行为)
+//         新 [4]=mirror_b / [5]=mirror_a (各屏写 fb 时做左右镜像, 见下方 MIRROR 段;
+//              复位=0 保持旧行为。两位都置 1 = 全局镜像, 可直接复用未加镜像渲染的旧内容)
 //   W 0x14 fake_period / W 0x18 slice_base (v5 原样; 翻页原子性由 pair 快照兜底)
 //   W 0x1C PHASE_B: [8:0] 屏 B slice 偏移, 复位默认 180 (要求 < n_slices)
 //   W 0x20 BRIGHT_B: [7:0] oe_window_B, 0=跟随屏 A oe_window (复位默认 0)
 //   R 0x00 status: v5 原位 [0]=engineA_busy [3]=oe_A [4]=auto_en [5]=use_fb
 //         [6]=overlap_en [7]=dclk_fast [8]=locked [9]=pov_en [10]=fetch/pair busy
-//         + 新 [11]=dual_en [12]=engine_B_busy [13]=mirror_b ([1]/[2] cmd_pending/icnd_busy
+//         + 新 [11]=dual_en [12]=engine_B_busy [13]=mirror_b [14]=mirror_a ([1]/[2] cmd_pending/icnd_busy
 //         归引擎黑盒, 恒 0; 02 §3 表把 [11]/[12] 写在 "0x10 R" 是地址笔误 —
 //         0x10 读保持 v5 {locked,idx} 布局不破坏老脚本, 状态位落 0x00)
 //   R 0x10 {locked,15'b0,slice_idx} / R 0x14 rev_period /
@@ -134,6 +135,7 @@ module pov_dual_top #(
     reg         dual_en;         // 0x10[2]
     reg         fb_sel_b;        // 0x10[3]
     reg         mirror_b;        // 0x10[4] 屏 B 左右镜像 (2026-07-28)
+    reg         mirror_a;        // 0x10[5] 屏 A 左右镜像 (2026-07-28)
     reg  [15:0] n_slices_r;
     reg  [31:0] fake_period_r;
     reg  [31:0] slice_base_r;
@@ -188,6 +190,7 @@ module pov_dual_top #(
             dual_en       <= 1'b0;       // 复位 = 纯单屏 (v5 行为)
             fb_sel_b      <= 1'b0;
             mirror_b      <= 1'b0;   // 复位关, 保持旧行为
+            mirror_a      <= 1'b0;
             n_slices_r    <= 16'd360;
             fake_period_r <= 32'd6944;
             slice_base_r  <= 32'h1000_0000;
@@ -238,6 +241,7 @@ module pov_dual_top #(
                         dual_en   <= s_axi_wdata[2];
                         fb_sel_b  <= s_axi_wdata[3];
                         mirror_b  <= s_axi_wdata[4];
+                        mirror_a  <= s_axi_wdata[5];
                         if (s_axi_wdata[31:16] != 16'd0)
                             n_slices_r <= s_axi_wdata[31:16];
                     end
@@ -333,7 +337,7 @@ module pov_dual_top #(
                     4'd6:    s_axi_rdata <= {locked_ever, 15'b0, slice_max};    // 0x18
                     4'd7:    s_axi_rdata <= {at_locked, 6'b0,                   // 0x1C
                                              idx_b_live[8:0], pair_miss};
-                    default: s_axi_rdata <= {18'b0, mirror_b, eng_b_busy, dual_en,  // 0x00
+                    default: s_axi_rdata <= {17'b0, mirror_a, mirror_b, eng_b_busy, dual_en,  // 0x00
                                              (pair_busy | df_busy_w), pov_en,
                                              at_locked, dclk_fast, overlap_en,
                                              use_fb, auto_en, oe_a_state,
@@ -455,6 +459,8 @@ module pov_dual_top #(
     wire [3:0] mb_lane2 = {2'b0, mb_grp2} + {1'b0, mb_grp2, 1'b0} + {2'b0, mb_col}; // grp2*3+col
     wire [3:0] fbB_lane = mirror_b ? mb_lane2            : fbw_lane;
     wire [8:0] fbB_addr = mirror_b ? {mb_row2, mb_word}  : fbw_addr;
+    wire [3:0] fbA_lane = mirror_a ? mb_lane2            : fbw_lane;
+    wire [8:0] fbA_addr = mirror_a ? {mb_row2, mb_word}  : fbw_addr;
 
     //---------- 双引擎 (黑盒; xsim 用 panel_engine_stub.v) ----------
     wire [7:0] oe_window_b_eff = (oe_window_b_r == 8'd0) ? oe_window
@@ -467,8 +473,8 @@ module pov_dual_top #(
         .rst_n         (s_axi_aresetn),
         .enable        (1'b1),
         .fb_we         (fbA_we),
-        .fb_wlane      (fbw_lane),
-        .fb_waddr      (fbw_addr),
+        .fb_wlane      (fbA_lane),
+        .fb_waddr      (fbA_addr),
         .fb_wdata      (fbw_data),
         .auto_en       (auto_en),
         .use_fb        (use_fb),
