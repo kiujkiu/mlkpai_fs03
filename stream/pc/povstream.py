@@ -441,6 +441,7 @@ def glbanim_frames(args):
             col = pure_rgb_snap(col, args.pure_dom)
         p = normalize_common(xyz, cmin, cmax, args.z_stretch) * args.scale
         p[:, 0] += args.x_offset
+        p[:, 1] += args.y_offset      # 竖直平移 (voxel); 正值向上
         yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
@@ -876,6 +877,9 @@ def add_render_opts(ap):
                     help='spin: 点云洋葱状向内复制层数 (壳太薄时加厚)')
     ap.add_argument('--shell-gap', type=float, default=1.3,
                     help='spin: 壳层间距 (voxel)')
+    ap.add_argument('--y-offset', type=float, default=0.0,
+                    help='glbanim: 归一化后 y 平移 (voxel, 正值向上)。整段动画的并集 bbox '
+                         '常让单帧偏离体积中心, 用它校正; 先渲 1 帧量包络再定值')
     ap.add_argument('--gap-mm', type=float, default=13.8,
                     help='双屏间距 mm (每屏到轴垂距=一半); 0=穿心旧几何')
     ap.add_argument('--no-mirror-u', dest='mirror_u', action='store_false', default=True,
