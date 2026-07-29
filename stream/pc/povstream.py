@@ -434,12 +434,49 @@ def glbanim_frames(args):
         print(f'[glbanim] robust bbox {cmin.round(2)}..{cmax.round(2)}', flush=True)
     else:
         cmin, cmax = smp.bbox_over(times)
-    for t in times:
+    # ---- 逐帧自适应缩放 (--fit-frames, 2026-07-28) ----
+    # 并集 bbox 让单帧又小又偏: 同一 Robot 静态渲高 140 / 动画渲仅 86 (缩 39%)。
+    # 逐帧各自归一能充满体积, 但会带来帧间缩放/平移抖动 —— 故对逐帧的
+    # scale 与 center 序列做**循环滑动平均**平滑 (动画首尾相接, 用 wrap 卷积),
+    # 既吃满体积又不抖。--fit-smooth 0 = 纯逐帧 (最满但可能抖)。
+    per = None
+    if args.fit_frames:
+        sc_l, cen_l = [], []
+        for t in times:
+            xyz, _ = smp.points_at(t)
+            lo = np.percentile(xyz, args.fit_pct, axis=0)
+            hi = np.percentile(xyz, 100.0 - args.fit_pct, axis=0)
+            cen = (lo + hi) / 2.0
+            h = np.maximum((hi - lo) / 2.0, 1e-6)
+            sc_l.append(min(gas.R_BUDGET / h[0], gas.H_BUDGET / h[1],
+                            gas.R_BUDGET / max(h[2] * args.z_stretch, 1e-6)))
+            cen_l.append(cen)
+        sc_a = np.asarray(sc_l, np.float32)
+        cen_a = np.asarray(cen_l, np.float32)
+        w = int(args.fit_smooth)
+        if w > 1:
+            k = np.ones(w, np.float32) / w
+            pad = w // 2 + 1
+            def _wrap(v):                     # 循环卷积 (动画首尾相接)
+                e = np.concatenate([v[-pad:], v, v[:pad]])
+                return np.convolve(e, k, 'same')[pad:pad + len(v)]
+            sc_a = _wrap(sc_a)
+            cen_a = np.stack([_wrap(cen_a[:, i]) for i in range(3)], axis=1)
+        per = (sc_a, cen_a)
+        print('[glbanim] fit-frames: scale %.1f..%.1f (均 %.1f), 平滑窗 %d, 分位 %.1f%%'
+              % (sc_a.min(), sc_a.max(), sc_a.mean(), w, args.fit_pct), flush=True)
+
+    for fi, t in enumerate(times):
         xyz, col = smp.points_at(t)
         col = gas.color_adjust(col, args.brighten, args.gamma, args.saturation)
         if args.pure_rgb:
             col = pure_rgb_snap(col, args.pure_dom)
-        p = normalize_common(xyz, cmin, cmax, args.z_stretch) * args.scale
+        if per is not None:
+            q = xyz.astype(np.float32) - per[1][fi]
+            q[:, 2] *= args.z_stretch
+            p = q * per[0][fi] * args.scale
+        else:
+            p = normalize_common(xyz, cmin, cmax, args.z_stretch) * args.scale
         p[:, 0] += args.x_offset
         p[:, 1] += args.y_offset      # 竖直平移 (voxel); 正值向上
         yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
@@ -877,6 +914,13 @@ def add_render_opts(ap):
                     help='spin: 点云洋葱状向内复制层数 (壳太薄时加厚)')
     ap.add_argument('--shell-gap', type=float, default=1.3,
                     help='spin: 壳层间距 (voxel)')
+    ap.add_argument('--fit-frames', action='store_true',
+                    help='glbanim: 逐帧自适应缩放(吃满体积), 配 --fit-smooth 平滑防抖; '
+                         '不加则用整段并集 bbox (单帧偏小)')
+    ap.add_argument('--fit-smooth', type=int, default=9,
+                    help='--fit-frames 的循环滑动平均窗口(帧); 0/1=不平滑')
+    ap.add_argument('--fit-pct', type=float, default=1.0,
+                    help='--fit-frames 的分位裁剪 %% (剔除离群点, 默认 1 → 用 [1,99])')
     ap.add_argument('--y-offset', type=float, default=0.0,
                     help='glbanim: 归一化后 y 平移 (voxel, 正值向上)。整段动画的并集 bbox '
                          '常让单帧偏离体积中心, 用它校正; 先渲 1 帧量包络再定值')
