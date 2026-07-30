@@ -96,6 +96,8 @@ def handle(conn, args, ref_md5=None):
         if args.save_png:
             os.makedirs(args.save_png, exist_ok=True)
             save_slice0_png(raw, os.path.join(args.save_png, f'frame_{n:04d}_slice0.png'))
+        if getattr(args, 'dec_ms', 0) > 0:
+            time.sleep(args.dec_ms / 1000.0)   # 模拟板端解码耗时
         conn.sendall(bytes([ACK]))
         prev_raw = raw                              # 参考帧 = 上一 ACK 的 raw
         n += 1
@@ -123,6 +125,9 @@ def main():
     ap.add_argument('--host', default='0.0.0.0')
     ap.add_argument('--port', type=int, default=9500)
     ap.add_argument('--once', action='store_true', help='收完一条连接就退出')
+    ap.add_argument('--dec-ms', type=float, default=0.0,
+                    help='模拟板端解码耗时(ms), ACK 前 sleep。用于验证发送窗口:\n'
+                         '不模拟延时就看不出传输与解码是否重叠')
     ap.add_argument('--save-png', default=None, metavar='DIR',
                     help='每帧 unpack slice 0 存 PNG 到 DIR')
     ap.add_argument('--md5', default=None, metavar='DIR',

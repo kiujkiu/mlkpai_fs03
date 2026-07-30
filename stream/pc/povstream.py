@@ -629,7 +629,7 @@ class Streamer:
     stop: threading.Event, 置位后尽快退出 (sleep/重连等待均可打断).
     """
 
-    def __init__(self, host, port=DEFAULT_PORT, fps=10.0, loop=False,
+    def __init__(self, host, port=DEFAULT_PORT, fps=10.0, loop=False, window=1,
                  codec='zlib', zlevel=6, reconnect=False, retry_interval=5.0,
                  ack_timeout=30.0, delta=False, keyint=DEFAULT_KEYINT,
                  link_mbps=DEFAULT_LINK_MBPS, stats_interval=5.0,
@@ -644,11 +644,13 @@ class Streamer:
         self.link_mbps = link_mbps
         self.stats_interval = stats_interval
         self.max_frames = max_frames    # >0: ACK 满 N 帧自动停 (测试用)
+        self.window = max(int(window), 1)   # 发送窗口: 1=stop-and-wait
+        self._inflight = collections.deque()  # 已发未 ACK 的 (is_delta, wire)
         self.on_frame = on_frame or (lambda st: None)
         self.on_status = on_status or (lambda ev, detail: None)
         self.on_stats = on_stats or (lambda line: print(line, flush=True))
         self.stop = stop if stop is not None else threading.Event()
-        self.frames = 0                 # 已 ACK 帧数
+        self.frames = 0                 # 已发送帧数 (window=1 时 == 已 ACK 帧数)
         self.sent_raw = 0
         self.sent_wire = 0
         self.last_wire = 0              # 最近一帧线上字节 (含 16B 头)
@@ -708,16 +710,32 @@ class Streamer:
             hdr = HDR.pack(MAGIC, len(payload), FRAME_RAW, N_SLICES, flags)
             try:
                 sock.sendall(hdr + payload)
-                ack = sock.recv(1)
+                # ---- 发送窗口 (--window N, 2026-07-30) ----
+                # window=1 = 原 stop-and-wait: 发完立即等 ACK, 传输与板端解码完全串行,
+                #   周期 = 传输 + 解码 (实测 40+64ms → ~9.6 fps)。
+                # window>1: 允许 N 帧在途, 窗口满才回收一个 ACK ⇒ 传输与解码重叠,
+                #   周期 → max(传输, 解码) (预期 64ms → ~15.6 fps)。
+                # 协议零改动 (04 §4.4 已论证板端 recv 缓冲天然吸收)。
+                #
+                # ⚠ 关键: _prev_raw / _since_key 必须在**发送时**更新而非 ACK 时 ——
+                # TCP 有序, 板端必按序处理, 故下一帧的 delta 参考帧一定有效。
+                # 代价是 NAK 时参考帧失配, 但 NAK 路径本就走"断开重连 + 强制关键帧"。
+                self._since_key = self._since_key + 1 if is_delta else 0
+                if raw is not None:
+                    self._prev_raw = raw
+                self._inflight.append((is_delta, len(hdr) + len(payload)))
+                ack = None
+                if len(self._inflight) >= self.window:
+                    ack = sock.recv(1)
+                else:
+                    return sock          # 窗口未满: 不等 ACK, 直接发下一帧
                 if ack == bytes([ACK]):
-                    self._since_key = self._since_key + 1 if is_delta else 0
-                    if raw is not None:
-                        self._prev_raw = raw
-                    self.last_wire = len(hdr) + len(payload)
+                    d_flag, wire = self._inflight.popleft()
+                    self.last_wire = wire
                     self.last_raw_len = FRAME_RAW
-                    if is_delta:
+                    if d_flag:
                         self.delta_frames += 1
-                    self._stat_frame(is_delta, self.last_wire)
+                    self._stat_frame(d_flag, wire)
                     return sock
                 if ack == bytes([NAK]):
                     if is_delta:         # 板端丢参考帧 → 降级重发 keyframe (§2.3)
@@ -734,12 +752,30 @@ class Streamer:
                 except OSError:
                     pass
                 sock = None
+                self._inflight.clear()      # 重连: 在途帧全部作废
                 if not self.reconnect:
                     raise StreamerError(f'frame {self.frames}: {e}')
                 self.reconnects += 1
                 self.on_status('lost', f'{e}; reconnect in {self.retry_interval}s')
                 self.stop.wait(self.retry_interval)
         return None
+
+    def _drain_inflight(self, sock):
+        """收尾: 把发送窗口里剩余的在途帧 ACK 收完 (window>1 才会有).
+
+        不排空的话最后 window-1 帧不进统计, 且板端 ACK 无人接收。
+        任何异常都忽略 —— 走到这里流已经结束, 收不到就算了。"""
+        if sock is None:
+            return
+        try:
+            while self._inflight:
+                if sock.recv(1) != bytes([ACK]):
+                    break
+                d_flag, wire = self._inflight.popleft()
+                self._stat_frame(d_flag, wire)
+        except OSError:
+            pass
+        self._inflight.clear()
 
     # -- 内部: 5s 滑窗统计 (页率 / 码率 / 链路占用 / delta 命中压缩比) --
     def _stat_frame(self, is_delta, wire):
@@ -797,6 +833,9 @@ class Streamer:
                 if not self.loop:
                     break
         finally:
+            # ⚠ 顺序: 必须先排空在途 ACK 再关 socket。反了的话 sock 已关,
+            # 排空必失败, 且对端正在写 ACK 会撞 ConnectionAbortedError。
+            self._drain_inflight(sock)
             if sock is not None:
                 sock.close()
             self.on_status('done', f'{self.frames} frames')
@@ -849,6 +888,7 @@ def cmd_stream(args):
                   f'({FRAME_RAW / max(st.last_wire - HDR.size, 1):.1f}x)', flush=True)
 
     s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop,
+                 window=args.window,
                  codec=args.codec, zlevel=args.zlevel, reconnect=args.reconnect,
                  delta=args.delta, keyint=args.keyint, link_mbps=args.link_mbps,
                  max_frames=args.max_frames,
@@ -914,6 +954,9 @@ def add_render_opts(ap):
                     help='spin: 点云洋葱状向内复制层数 (壳太薄时加厚)')
     ap.add_argument('--shell-gap', type=float, default=1.3,
                     help='spin: 壳层间距 (voxel)')
+    ap.add_argument('--window', type=int, default=1,
+                    help='发送窗口: 允许 N 帧在途不等 ACK。1=stop-and-wait(原行为); '
+                         '2 起传输与板端解码重叠, 周期从 传输+解码 降到 max(传输,解码)')
     ap.add_argument('--fit-frames', action='store_true',
                     help='glbanim: 逐帧自适应缩放(吃满体积), 配 --fit-smooth 平滑防抖; '
                          '不加则用整段并集 bbox (单帧偏小)')
