@@ -25,6 +25,8 @@ gen_anime_slices.py — anime GLB/点云 → 360 子午面切片 → FS03 DDR �
 
 打包: pack_obs.py (= gen_chess_obs 实测映射)。slice i @ 偏移 i*0x3000,
   11664B 数据 + padding 0, 默认 360 slices = 4,423,680B。
+  --dual-face: 输出 [面A 全部片][面B 全部片] (720 片 = 8,847,360B, 两个 DDR 基址);
+  --fold-a:    面A 只出前半圈 (穿心面专用, 后半圈由 PL 镜像补齐)。
 
 用法 (Windows python, 需 pygltflib):
   python gen_anime_slices.py [--glb PATH] [--slices 360] [--thresh 128]
@@ -54,6 +56,93 @@ H_BUDGET = H // 2 - 1.0    # 89
 
 BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                    [3, 11, 1, 9], [15, 7, 13, 5]], np.float32)
+
+# ---- 屏面几何: v3 对称 vs v3.1 偏心 (2026-07-31) ----
+# v3   (对称): 屏模组居中, 两 LED 面在 X=±gap/2 → 两面到轴垂距相同。
+#              此时 屏B@θ ≡ 屏A@(θ+180) 严格成立 ⇒ 单份 360 片 + PHASE_B=180 喂两面。
+# v3.1 (偏心): 模组整体 +6.7mm, 两 LED 面落在 X=0 与 X=+13.4 →
+#              **A 面穿心 (垂距 0), B 面垂距 13.4, 两面不再关于轴对称**。
+#              ⇒ 上面那个等价关系作废: A@(θ+180) 垂距仍是 0, 给不出 B 需要的 13.4 平面。
+#              两面要各自一份切片数据 (RTL 需 slice_base_B), 或只驱动 A 面。
+# 反过来 A 面穿心带来一个红利: 垂距 0 时 slice_i ≡ mirror(slice_{i+180}),
+#              360 片里只有 180 片是独立的 → 存储/链路/解压都可减半 (需 RTL 支持)。
+V31_OFF_A_MM = 0.0          # 贴轴那面 (消掉中心盲柱)
+V31_OFF_B_MM = 13.4         # 另一面 (盲柱 Φ26.8)
+
+
+def resolve_axis_off(face_off_mm, gap_mm):
+    """→ (axis_off 体素px, 说明串)。
+
+    face_off_mm 非 None: v3.1 逐面模型, 直接给该面到转轴的垂距 (mm)。
+    否则回退 --gap-mm 的 v3 对称模型 (每面垂距 = gap/2), 保持老命令行逐字节等价。"""
+    if face_off_mm is not None:
+        return face_off_mm / PITCH_MM, f'逐面垂距 {face_off_mm:.2f}mm (v3.1 偏心屏)'
+    return gap_mm / 2.0 / PITCH_MM, f'对称双屏 gap={gap_mm:.1f}mm → 每面 {gap_mm/2:.2f}mm (v3)'
+
+
+def print_geom(axis_off, mirror_u, how):
+    """打印该面的几何账 (盲区/有效外径/跨方位角)。"""
+    print(f'[geom] {how}', flush=True)
+    if axis_off > 0:
+        r_out = math.hypot(R_BUDGET + 0.5, axis_off)
+        print(f'[geom] 垂距 {axis_off:.2f}px (偏移平面, 非子午面) | '
+              f'中心盲柱 Φ{2*axis_off*PITCH_MM:.1f}mm = {2*axis_off:.1f}px, '
+              f'占截面积 {100*(axis_off/r_out)**2:.2f}% | 有效外径 {r_out:.2f}px | '
+              f'整屏跨方位 {2*math.degrees(math.atan2(R_BUDGET+0.5, axis_off)):.1f}°', flush=True)
+    else:
+        print('[geom] 垂距 0 → **穿心子午面**, 无中心盲区; 整屏跨方位 180.0°', flush=True)
+        print('[geom] ★ 穿心 ⇒ slice_i ≡ mirror(slice_{i+180}), 360 片里仅 180 片独立 '
+              '(存储/链路/解压可减半, 需 RTL 支持 idx≥180 → 取 idx-180 + 镜像)', flush=True)
+    print('[geom] mirror_u=%s (中心轴镜像; 默认 ON, 本机实测)'
+          % ('ON' if mirror_u else 'OFF'), flush=True)
+
+
+def check_meridian_mirror(vox, axis_off, sub, d_step, mirror_u, n_slices, probes=6):
+    """穿心自检: axis_off==0 时 slice_i 与 slice_{i+180} 必须互为左右镜像。
+    这是「180 片独立」结论的前提, 也能反过来验证 axis_off 真的为 0。
+    偏移几何下该恒等式必然不成立 —— 故仅在 axis_off==0 时调用。"""
+    half = n_slices // 2
+    bad = []
+    for k in range(probes):
+        i = k * n_slices // probes
+        a = render_slice(vox, i * d_step, sub, d_step, axis_off, mirror_u)
+        b = render_slice(vox, (i + half) * d_step, sub, d_step, axis_off, mirror_u)
+        if not np.array_equal(a, b[:, ::-1, :]):
+            bad.append(i)
+    if bad:
+        print(f'[geom] ⚠ 穿心镜像自检 FAIL @slice {bad} — 垂距不是 0 或 u 轴约定变了, '
+              f'不能按 180 片存', flush=True)
+    else:
+        print(f'[geom] ✅ 穿心镜像自检通过 ({probes}/{probes} 对), 180 片独立成立', flush=True)
+    return not bad
+
+
+def plan_faces(face_off_mm, gap_mm, n_slices, dual_face=False, fold_a=False):
+    """CLI → [(面名, axis_off_px, 本面片数, 说明串)]。
+
+    dual_face: v3.1 两面各渲一份, 输出 = [面A 全部片][面B 全部片] (帧长翻倍)。
+    fold_a:    面A 只出前半圈 (θ=0..179°), 靠穿心镜像恒等式补后半圈 —— 仅
+               垂距 0 合法, 调用方必须先跑 check_meridian_mirror 门禁。
+    都不给 = 老的单面路径, 逐字节不变。"""
+    if dual_face:
+        if face_off_mm is not None:
+            sys.exit(f'--dual-face 自带两面垂距 ({V31_OFF_A_MM}/{V31_OFF_B_MM}mm), '
+                     f'与 --face-off-mm 互斥')
+        faces = [('A',) + resolve_axis_off(V31_OFF_A_MM, gap_mm),
+                 ('B',) + resolve_axis_off(V31_OFF_B_MM, gap_mm)]
+    else:
+        faces = [('A',) + resolve_axis_off(face_off_mm, gap_mm)]
+    out = [(nm, off, n_slices, how) for nm, off, how in faces]
+    if fold_a:
+        nm, off, _n, how = out[0]
+        if off != 0.0:
+            sys.exit(f'--fold-a 只对穿心面合法 (垂距须为 0), 当前面A 垂距 {off:.3f}px '
+                     f'[{how}] — 偏移面上 slice_i 与 slice_{{i+180}} 不互为镜像')
+        if n_slices % 2:
+            sys.exit(f'--fold-a 需要 --slices 为偶数 (当前 {n_slices})')
+        out[0] = (nm, off, n_slices // 2, how)
+    return out
+
 
 DIGITS = {  # 3x5 位图字体 (借 gen_chess_obs)
     '0': ['111', '101', '101', '101', '111'], '1': ['010', '110', '010', '010', '111'],
@@ -178,8 +267,12 @@ def render_slice(vox, theta, sub, d_step, axis_off=0.0, mirror_u=False):
               等价极坐标: R=√(u²+axis_off²), 方位 = θ + atan2(axis_off, u)
               —— 一列像素不再共面, 近轴处方位偏移极大 (u=0 处直接偏 90°)。
     ⚠ 半径 < axis_off 的圆柱永远扫不到 (中心盲区), 属几何固有, 软件补不回来。
-    屏 B 关于转轴对称 (垂距 -axis_off) ⇒ 屏B@θ ≡ 屏A@(θ+180), 故 PHASE_B=180
-      仍严格成立, DDR 只需一份 360 片 (但此时 360 片各不相同, 不再是 2× 冗余)。
+
+    ⚠ 2026-07-31 起本函数只描述**单个面**, 不再隐含两面关系:
+      · v3 对称装 (两面 ∓d/2): 屏B@θ ≡ 屏A@(θ+180) ⇒ PHASE_B=180 + 单份数据成立。
+      · v3.1 偏心装 (两面 0 / +13.4): 该等价**不成立** —— A@(θ+180) 垂距还是 0,
+        永远给不出 B 要的 13.4 平面。两面须各渲一份 (RTL 需 slice_base_B),
+        或只驱动贴轴的 A 面。选面用 resolve_axis_off()/--face-off-mm。
     """
     D = np.arange(W, dtype=np.float32) - (W - 1) / 2.0    # u: 沿屏宽, ±79.5
     if mirror_u:
@@ -219,8 +312,11 @@ def draw_num(px, x0, y0, text, fg):
         x0 += 4
 
 
-def make_preview(slice_bufs, n_slices, path, scale=4, count=12, cols=4):
-    """从打包字节 unpack 回观察者视角 (验证的是 bin 本身), 4x 拼图。"""
+def make_preview(slice_bufs, n_slices, path, scale=4, count=12, cols=4, deg_span=None):
+    """从打包字节 unpack 回观察者视角 (验证的是 bin 本身), 4x 拼图。
+
+    deg_span: 角度标注的整圈片数 (默认 = n_slices)。折叠面只有半圈数据,
+    传整圈片数才能标出正确的度数 (0..179 而不是 0..359)。"""
     rows = (count + cols - 1) // cols
     pad = 2
     tile_w, tile_h = W * scale + pad, H * scale + pad
@@ -230,7 +326,7 @@ def make_preview(slice_bufs, n_slices, path, scale=4, count=12, cols=4):
         img = pack_obs.unpack_slice(slice_bufs[i]).astype(np.uint8) * 255
         tile = Image.fromarray(img).resize((W * scale, H * scale), Image.NEAREST)
         px = tile.load()
-        deg = i * 360 // n_slices
+        deg = i * 360 // (deg_span or n_slices)
         draw_num(px, 3, 3, str(deg), (255, 255, 0))
         canvas.paste(tile, (pad + (k % cols) * tile_w, pad + (k // cols) * tile_h))
     canvas.save(path)
@@ -246,7 +342,20 @@ def main():
     ap.add_argument('--no-dither', action='store_true', help='关 Bayer 有序抖动')
     ap.add_argument('--sub', type=int, default=3, help='子角度采样数 (厚度连续性)')
     ap.add_argument('--gap-mm', type=float, default=13.8,
-                    help='正反双屏两屏面间距 mm (每屏到轴垂距 = 一半); 0 = 穿心旧行为')
+                    help='[v3 对称装] 正反双屏两屏面间距 mm (每屏到轴垂距 = 一半); 0 = 穿心旧行为')
+    ap.add_argument('--face-off-mm', type=float, default=None, metavar='MM',
+                    help=f'[v3.1 偏心装] 本面到转轴的垂距 mm, 给了就覆盖 --gap-mm。'
+                         f'A 面(贴轴)={V31_OFF_A_MM} / B 面={V31_OFF_B_MM}。'
+                         f'两面不对称 → 各渲一份, 别再指望 PHASE_B=180 共用')
+    ap.add_argument('--dual-face', action='store_true',
+                    help=f'[v3.1 偏心装] 两面各渲一份并拼接 [面A 全部片][面B 全部片]: '
+                         f'A={V31_OFF_A_MM}mm(穿心) / B={V31_OFF_B_MM}mm, 输出翻倍到 '
+                         f'720 片 = 8,847,360B (板端两个 DDR 基址)')
+    ap.add_argument('--fold-a', action='store_true',
+                    help='[v3.1 偏心装] 面A 只出 180 片 (θ=0..179°), 后半圈由 PL 取 '
+                         'idx-180 + 镜像置换补齐。仅垂距 0 合法 (先跑穿心镜像自检, '
+                         '不过就退出)。⚠ 代价: 抖动相位随数据复制, 每转独立 Bayer '
+                         '相位 360→180 种, 时域抖动平滑减半')
     ap.add_argument('--no-mirror-u', dest='mirror_u', action='store_false', default=True,
                     help='关掉中心轴镜像。默认开: 本机屏 X 轴物理方向与 û(θ) 相反, 2026-07-27 上板实测确认')
     ap.add_argument('--samples', type=int, default=1800000)
@@ -269,36 +378,47 @@ def main():
     col = color_adjust(col, args.brighten, args.gamma, args.saturation)
     vox = voxelize(xyz, col, args.z_stretch)
 
-    axis_off = (args.gap_mm / 2.0) / PITCH_MM      # mm → 体素(像素)单位
-    if axis_off > 0:
-        r_out = math.hypot(R_BUDGET + 0.5, axis_off)
-        print(f'[geom] 双屏间距 {args.gap_mm}mm → 每屏到轴垂距 '
-              f'{args.gap_mm/2:.2f}mm = {axis_off:.2f}px (偏移平面, 非子午面)', flush=True)
-        print(f'[geom] 中心盲区 直径 {args.gap_mm:.1f}mm = {2*axis_off:.1f}px, '
-              f'占截面积 {100*(axis_off/r_out)**2:.2f}% | 有效外径 {r_out:.2f}px | '
-              f'整屏跨方位 {2*math.degrees(math.atan2(R_BUDGET+0.5, axis_off)):.1f}°', flush=True)
-    else:
-        print('[geom] gap=0 → 穿心子午面 (旧行为)', flush=True)
-    print('[geom] mirror_u=%s (中心轴镜像; 默认 ON, 本机实测)'
-          % ('ON' if args.mirror_u else 'OFF'), flush=True)
+    # mm → 体素(像素)单位; 默认 (无 --dual-face/--fold-a) = 单面老路径
+    faces = plan_faces(args.face_off_mm, args.gap_mm, args.slices,
+                       args.dual_face, args.fold_a)
     d_step = 2 * math.pi / args.slices
+    if args.fold_a:
+        # 折叠代价 (2026-07-31): 板端拿 slot i 的数据镜像出 slot i+180, Bayer
+        # 抖动相位跟着一起复制 ⇒ 每转独立相位 360→180 种, 时域抖动平滑减半。
+        # 故折叠输出与完整半圈+半圈**不会**逐字节相同 (关抖动时才相等), 这是
+        # 固有代价不是 bug。几何正确性由下面的穿心镜像自检保证。
+        print('[fold-a] ⚠ 抖动相位随数据复制: 每转独立 Bayer 相位 360→180 种, '
+              '时域抖动平滑打对折 (几何完全正确)', flush=True)
     bufs = []
     lit_total = 0
-    for i in range(args.slices):
-        img = render_slice(vox, i * d_step, args.sub, d_step, axis_off, args.mirror_u)
-        on = to_1bit(img, args.thresh, not args.no_dither, i)
-        lit_total += int(on.any(axis=2).sum())
-        buf = pack_obs.pack_slice(on)
-        bufs.append(buf + b'\0' * (SLICE_STRIDE - SLICE_DATA))
-        if i % 45 == 0:
-            print(f'  slice {i}: {int(on.any(axis=2).sum())} lit px', flush=True)
+    for name, axis_off, n_out, how in faces:
+        tag = f'面{name}: ' if len(faces) > 1 else ''
+        note = f' [折叠: 只渲 {n_out} 片 θ=0..179°]' if n_out != args.slices else ''
+        print_geom(axis_off, args.mirror_u, tag + how + note)
+        if axis_off == 0.0:
+            ok = check_meridian_mirror(vox, axis_off, args.sub, d_step,
+                                       args.mirror_u, args.slices)
+            if args.fold_a and name == 'A' and not ok:
+                sys.exit('[fold-a] 穿心镜像自检未通过 → 拒绝按 180 片折叠输出')
+        for i in range(n_out):
+            img = render_slice(vox, i * d_step, args.sub, d_step, axis_off, args.mirror_u)
+            on = to_1bit(img, args.thresh, not args.no_dither, i)
+            lit_total += int(on.any(axis=2).sum())
+            buf = pack_obs.pack_slice(on)
+            bufs.append(buf + b'\0' * (SLICE_STRIDE - SLICE_DATA))
+            if i % 45 == 0:
+                print(f'  slice {i}: {int(on.any(axis=2).sum())} lit px', flush=True)
 
+    n_total = len(bufs)
     blob = b''.join(bufs)
     with open(args.out, 'wb') as f:
         f.write(blob)
     print(f'[out] {args.out}: {len(blob)} bytes '
-          f'({args.slices} x 0x{SLICE_STRIDE:X}, avg {lit_total // args.slices} lit px/slice)', flush=True)
-    make_preview(bufs, args.slices, args.preview)
+          f'({n_total} x 0x{SLICE_STRIDE:X}, avg {lit_total // n_total} lit px/slice)', flush=True)
+    if len(faces) > 1:
+        print('[out] 载荷排布 = ' + ' + '.join(f'[面{f[0]} {f[2]} 片]' for f in faces)
+              + ' (板端两个 DDR 基址: slice_base 0x18 / slice_base_b 0x28)', flush=True)
+    make_preview(bufs[:faces[0][2]], faces[0][2], args.preview, deg_span=args.slices)
 
 
 if __name__ == '__main__':

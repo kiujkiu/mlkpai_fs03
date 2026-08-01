@@ -27,7 +27,10 @@
 
 #include "../protocol.h"
 
-#define BANK_OFF   0x00500000u   /* 测 bank B, 别踩显示中的 bank A */
+/* 测 bank B, 别踩显示中的 bank A。v3.1 起 bank 间距 = 16 MB (老的 5 MB
+ * 值 0x00500000 现在落在 bank A 自己的 0..0x870000 有效区里 = 会把正在显示
+ * 的帧写花)。地址表见 pov_rxd.c 文件头。 */
+#define BANK_OFF   0x01000000u   /* = BANK_STRIDE, bank B @ 0x11000000 */
 #define MAX_LOOPS  99
 
 static double now_ms(void)

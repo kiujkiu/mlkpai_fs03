@@ -59,7 +59,10 @@ def handle(conn, args, ref_md5=None):
         if hdr is None:
             break                                   # 对端关连接 = 流结束
         magic, comp_len, raw_len, n_slices, flags = HDR.unpack(hdr)
-        if magic != MAGIC or raw_len != FRAME_RAW or n_slices != N_SLICES:
+        # 2026-07-31: 帧长不再是常量 (v3.1 偏心屏可能是 180/360/540/720 片),
+        # 跟板端 pov_rxd 一样按 n_slices 校验, 不再硬比 FRAME_RAW/N_SLICES。
+        if (magic != MAGIC or not (1 <= n_slices <= 720)
+                or raw_len != n_slices * 0x3000):
             print(f'[fake_board] BAD HDR magic={magic!r} raw_len={raw_len} '
                   f'n_slices={n_slices}', flush=True)
             conn.sendall(bytes([NAK]))

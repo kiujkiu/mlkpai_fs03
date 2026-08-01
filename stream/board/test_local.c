@@ -261,12 +261,15 @@ int main(void)
         close(fd);
     }
 
-    /* NAK 2: unknown flag bit (bit3) -> mask check must reject */
+    /* NAK 2: unknown flag bit (bit7) -> mask check must reject.
+     * 注意别用 bit3/bit4: v3.1 起它们是 PVS_FLAG_DUAL_FACE / PVS_FLAG_FOLD_A,
+     * 已进 PVS_FLAGS_KNOWN。用它们这个用例照样 NAK (被 dual-face 的
+     * n_slices 一致性检查拦下), 但测的就不是「未知 flag 位」了。 */
     {
         pvs_hdr_t bad;
         memcpy(bad.magic, PVS_MAGIC, 4);
         bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
-        bad.n_slices = PVS_N_SLICES; bad.flags = (1u << 3);
+        bad.n_slices = PVS_N_SLICES; bad.flags = (1u << 7);
         fd = connect_retry(TEST_PORT);
         if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
         if (expect_nak_close(fd, &bad, "unknown flag bit")) goto out;

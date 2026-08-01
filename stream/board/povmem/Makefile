@@ -10,7 +10,9 @@
 #        make KDIR=~/mlkpai-kernel/linux-xlnx ARCH=arm \
 #             CROSS_COMPILE=arm-linux-gnueabihf-
 #
-# 装载: insmod povmem.ko            (默认 base=0x10000000 size=0x1000000)
+# 装载: insmod povmem.ko            (默认 base=0x10000000 size=0x1900000,
+#       即覆盖 bank A 起 .. bank B 末的 0x1870000 帧窗 + 余量; 小于它
+#       pov_rxd 会回落到慢的 /dev/mem 映射)
 # 验证: ls -l /dev/povmem && dmesg | tail -1
 
 obj-m := povmem.o

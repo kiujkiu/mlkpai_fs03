@@ -19,10 +19,16 @@ RX/flip 双线程 (ACK 与翻页解耦), DELTA 重建, WC 映射 (povmem.ko), �
 
 - Linux boots with `mem=256M` → phys `0x10000000..0x1FFFFFFF` is invisible
   to the kernel and reserved for frames (boot setup is handled elsewhere).
-- DDR double buffer: bank A @ `0x10000000`, bank B @ `0x10500000`, each
-  `360 × 0x3000 = 4,423,680` B. 另有 3 个 cached malloc staging 缓冲
-  (写入/就绪/拷贝) 在 RX 线程和 flip 线程之间轮转。
-- On start the daemon writes bank A to `slice_base` (0x18). It does NOT
+- DDR double buffer (v3.1, 权威表见 `pov_rxd.c` 文件头): bank A @
+  `0x10000000`, bank B @ `0x11000000` (`BANK_STRIDE` = 16 MB), each using
+  `0..0x870000` (`720 × 0x3000` = 8,847,360 B = 双面帧最大尺寸); bank C @
+  `0x12000000` 为三缓冲预留但当前不映射。整窗 mmap 长度
+  `FRAME_MAP_LEN = 0x1870000` (24.4 MB) —— 所以 `povmem.ko` 必须
+  `size >= 0x1870000` (模块默认已是 `0x1900000`)。另有 3 个 cached malloc
+  staging 缓冲 (写入/就绪/拷贝) 在 RX 线程和 flip 线程之间轮转。
+- On start the daemon writes bank A to `slice_base` (0x18) and 0 to
+  `slice_base_b` (0x28, 面B 基址; 0 = PL 两面都用 0x18). Dual-face frames
+  set 0x28 = bank + nA×0x3000. It does NOT
   touch `POV_CTRL` (0x10) — the JTAG side owns mode config — unless you
   pass `--fake`.
 - Frame-region mapping: `/dev/povmem` (povmem.ko, **write-combine**,
@@ -88,7 +94,7 @@ ssh root@<board> /home/uisrc/bench_s0            # 10 loops, median, ms
 Prints one number per line: `so_memcpy_ms` (4.4 MB → /dev/mem SO map),
 `wc_memcpy_ms` (→ /dev/povmem, `skip` if module not loaded), `inflate_ms`
 (typical ~130 KB frame → 4.4 MB), `crc32_ms`, `xor_ms`. It writes to bank
-B (`base+0x500000`); don't run it while streaming. `--loops N --base ADDR`
+B (`base+0x1000000`); don't run it while streaming. `--loops N --base ADDR`
 supported. `bench_s0_x86` runs the three CPU-only items locally.
 
 ## Deploy to the board
@@ -100,7 +106,8 @@ serial console). Users: `uisrc` / `root`.
 scp stream/board/pov_rxd uisrc@10.168.168.189:/home/uisrc/
 # optional (WC copy speedup), once povmem.ko is built for 6.6.0-xilinx:
 scp stream/board/povmem/povmem.ko root@10.168.168.189:/root/
-ssh root@10.168.168.189 insmod /root/povmem.ko
+# 窗口必须 >= 0x1870000, 否则 pov_rxd 的 mmap 失败并静默回落到慢的 /dev/mem
+ssh root@10.168.168.189 insmod /root/povmem.ko base=0x10000000 size=0x1900000
 ```
 
 ## Run (no systemd, just nohup)

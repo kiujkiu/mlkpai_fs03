@@ -24,22 +24,62 @@
 //              置位时 B 引擎也使能 — 02 §7 阶段1 "dual_en=0 直灌 fb_B + auto 扫" 用)
 //         新 [4]=mirror_b / [5]=mirror_a (各屏写 fb 时做左右镜像, 见下方 MIRROR 段;
 //              复位=0 保持旧行为。两位都置 1 = 全局镜像, 可直接复用未加镜像渲染的旧内容)
+//         新 [6]=fold_a_en (面 A 半圈折叠, 机械 v3.1; 复位=0 保持旧行为, 见下方 FOLD 段)
 //   W 0x14 fake_period / W 0x18 slice_base (v5 原样; 翻页原子性由 pair 快照兜底)
 //   W 0x1C PHASE_B: [8:0] 屏 B slice 偏移, 复位默认 180 (要求 < n_slices)
+//         ⚠ 机械 v3.1 (两面各一份独立切片数据, 见下方 "机械 v3.1" 段) 下软件应把
+//           本寄存器写 0: 屏 B 有自己那份数据 (0x28), 该取的是同一个 idx 而非 idx+180。
+//           复位默认仍是 180 — 那是老的"共用一份对称数据"路径, 不改以保回归。
 //   W 0x20 BRIGHT_B: [7:0] oe_window_B, 0=跟随屏 A oe_window (复位默认 0)
+//   W 0x24 ROW_CFG: [31:0] 行驱时序/极性 (透传两引擎)
+//   W 0x28 SLICE_BASE_B: [31:0] 屏 B 独立切片数据基址 (机械 v3.1 新增)
+//         = 0 (复位默认) → 屏 B 回落用 0x18 的 slice_base, 即老的"两面共用一份数据"
+//           行为, 逐位不变; 老软件不写 0x28 完全不受影响。
+//         != 0 → 屏 B 的 fetch 用这份基址, 与屏 A 的 0x18 各走各的。
+//           快照与 0x18 严格同拍 (见 pair 级翻页原子性), 两面保证同帧, 不会撕裂。
 //   R 0x00 status: v5 原位 [0]=engineA_busy [3]=oe_A [4]=auto_en [5]=use_fb
 //         [6]=overlap_en [7]=dclk_fast [8]=locked [9]=pov_en [10]=fetch/pair busy
 //         + 新 [11]=dual_en [12]=engine_B_busy [13]=mirror_b [14]=mirror_a ([1]/[2] cmd_pending/icnd_busy
 //         归引擎黑盒, 恒 0; 02 §3 表把 [11]/[12] 写在 "0x10 R" 是地址笔误 —
 //         0x10 读保持 v5 {locked,idx} 布局不破坏老脚本, 状态位落 0x00)
+//         + 新 [15]=fold_a_en (回读 0x10[6], 供软件确认写进去了)
+//         + 新 [16]=base_b_act (slice_base_b != 0, 即屏 B 走独立数据; 供软件确认 0x28 生效)
+//         [15]/[16] 复位默认都是 0 → 复位态回读值与改动前逐位一致。
 //   R 0x10 {locked,15'b0,slice_idx} / R 0x14 rev_period /
 //   R 0x18 {locked_ever,15'b0,slice_max}  (v5 原样)
+//   R 0x24 POV_CTRL 影子: 最近一次写进 0x10 的控制字, 位序与写口**逐位对齐**
+//         ([0]=pov_en [1]=fake_en [2]=dual_en [3]=fb_sel_b [4]=mirror_b
+//          [5]=mirror_a [6]=fold_a_en [15:7]=0 [31:16]=n_slices)
+//         为什么要有它: 0x10 是**只写**的 (读 0x10 是 v5 的 {locked,slice_idx},
+//         老脚本依赖, 不能动)。板端守护进程要按帧开关 0x10[6] fold_a_en, 若从自
+//         己维护的陈旧影子做 read-modify-write, 会误伤 pov_en/fake_en — 尤其当
+//         JTAG 调试脚本也在并发写 0x10 时。有了 0x24 读口, 任何软件都能
+//         "读 0x24 → 改位 → 写 0x10" 安全 RMW, 不必维护影子也不怕抢写。
+//         (写 0x24 仍是 row_cfg_r, 读写不同义, 有意为之: 读口地址已经很紧张;
+//          R 0x28 特意留空不占 — 规划给 panel_engine_2047 的 frame_period_o)
 //   R 0x1C {locked, 6'b0, idx_B[8:0], pair_miss[15:0]} — idx_B 实时算 (核相位),
 //         pair_miss = pair_busy 期间 slice_idx 变化 (整对丢弃) 的饱和计数
 //
 // pair 级翻页原子性 (02 §2.2): idx 变化那拍把 slice_base_r 快照进 base_lat,
 //   A/B 两次 fetch 都用 base_lat → pov_rxd 写 0x18 的时机完全不用管;
 //   pair 期间新 idx 整对丢弃 (丢帧跳最新, v5 同语义), 绝不只丢 B 不丢 A.
+//   机械 v3.1 起 slice_base_b_r 在**同一拍**快照进 base_lat_b (同一个 if 分支,
+//   同一个 always, 同一个时钟沿) → 两面数据必然来自同一帧, 不会一面新一面旧。
+//
+// 机械 v3.1 偏心改版 (两面不再对称) —— 本文件相关的两处改动:
+//   背景: 屏整体偏心 6.7mm 后, 两屏面到转轴的垂距变成 0mm(面 A, 穿心) 和
+//   13.4mm(面 B)。原来两屏关于转轴对称, "屏B@θ ≡ 屏A@(θ+180)" 严格成立, 于是
+//   两个引擎共用同一个 slice_base, 屏 B 只把 slice 索引 +PHASE_B(180) 即可。
+//   偏心后该等价关系作废 ⇒ 两面必须各用一份独立的切片数据。
+//   (a) 0x28 slice_base_b: 屏 B 的独立数据基址 (=0 回落老行为)。配套软件应把
+//       0x1C PHASE_B 写 0 — 屏 B 自己那份数据里, idx 就是 idx。
+//   (b) 0x10[6] fold_a_en: 面 A 穿心 ⇒ slice_i ≡ mirror(slice_{i+180}), 所以面 A
+//       只需在 DDR 里存前半圈 (n_slices/2 片), 后半圈由 PL 取 idx-n_slices/2 再做
+//       镜像置换补齐。见下方 FOLD 段。
+//       省的是**面 A 的 DDR 占用**(半圈) 和上位机的渲染量, **不是**读带宽 —
+//       每个 slice_idx 照样整帧 fetch 一次 (TOTAL_WORDS 不变), 只是后半圈重复读
+//       前半圈那块地址 (反而更 cache/row-buffer 友好)。带宽账仍按 02 §1.1 算。
+//   两个新特性复位默认都是"关", 不写新寄存器的老软件行为逐位不变。
 //
 // 向后兼容: dual_en=0 (复位默认) 时 pair FSM 只发 A, B 引擎 enable=0 消隐,
 //   寄存器 0x0C-0x18 语义 = v5 → 行为回归单屏.
@@ -136,12 +176,14 @@ module pov_dual_top #(
     reg         fb_sel_b;        // 0x10[3]
     reg         mirror_b;        // 0x10[4] 屏 B 左右镜像 (2026-07-28)
     reg         mirror_a;        // 0x10[5] 屏 A 左右镜像 (2026-07-28)
+    reg         fold_a_en;       // 0x10[6] 面 A 半圈折叠 (机械 v3.1)
     reg  [15:0] n_slices_r;
     reg  [31:0] fake_period_r;
     reg  [31:0] slice_base_r;
     reg  [8:0]  phase_b_r;       // 0x1C, 默认 180
     reg  [7:0]  oe_window_b_r;   // 0x20, 0 = 跟随 A
     reg  [31:0] row_cfg_r;       // 0x24 行驱时序/极性
+    reg  [31:0] slice_base_b_r;  // 0x28 屏 B 独立数据基址, 0 = 回落 slice_base_r
 
     //---------- 前向声明 ----------
     wire [15:0] at_slice_idx;
@@ -161,6 +203,18 @@ module pov_dual_top #(
     wire [16:0] nsl_ext    = {1'b0, n_slices_r};
     wire [15:0] idx_b_live = (idxb_sum >= nsl_ext) ? (idxb_sum - nsl_ext)
                                                    : idxb_sum[15:0];
+
+    // FOLD (面 A 半圈折叠, 0x10[6], 机械 v3.1): 面 A 穿转轴 ⇒ 后半圈的切片就是前
+    // 半圈对应片的左右镜像, 于是 DDR 里只存 n_slices/2 片, PL 侧补齐:
+    //   取片索引  idx >= half ? idx-half : idx      (half = n_slices>>1)
+    //   镜像使能  idx >= half 时对面 A 额外翻一次 (与全局 mirror_a **异或**叠加)
+    // half 跟 0x10[31:16] 的 n_slices 走, 不写死 180 (n_slices 可配, TB 里用 4/352)。
+    // half==0 (n_slices<=1, 病态配置) 时整个折叠强制不生效, 免得 idx-0 白翻镜像。
+    wire [15:0] half_slices = {1'b0, n_slices_r[15:1]};          // n_slices >> 1
+    wire        fold_a_hit  = fold_a_en && (half_slices != 16'd0) &&
+                              (at_slice_idx >= half_slices);
+    wire [15:0] idx_a_live  = fold_a_hit ? (at_slice_idx - half_slices)
+                                         : at_slice_idx;
 
     //---------- AXI-Lite WRITE FSM (套 v5 骨架) ----------
     always @(posedge s_axi_aclk) begin
@@ -191,12 +245,14 @@ module pov_dual_top #(
             fb_sel_b      <= 1'b0;
             mirror_b      <= 1'b0;   // 复位关, 保持旧行为
             mirror_a      <= 1'b0;
+            fold_a_en     <= 1'b0;   // 复位关, 保持旧行为
             n_slices_r    <= 16'd360;
             fake_period_r <= 32'd6944;
             slice_base_r  <= 32'h1000_0000;
-            phase_b_r     <= 9'd180;     // 背靠背默认 180°
+            phase_b_r     <= 9'd180;     // 背靠背默认 180° (机械 v3.1 软件应写 0)
             oe_window_b_r <= 8'd0;       // 0 = 跟随屏 A
             row_cfg_r     <= 32'h0;      // 全默认
+            slice_base_b_r <= 32'h0;     // 0 = 屏 B 回落用 slice_base_r (旧行为)
         end else begin
             oe_set_pulse <= 1'b0;
             fb_we        <= 1'b0;
@@ -242,6 +298,7 @@ module pov_dual_top #(
                         fb_sel_b  <= s_axi_wdata[3];
                         mirror_b  <= s_axi_wdata[4];
                         mirror_a  <= s_axi_wdata[5];
+                        fold_a_en <= s_axi_wdata[6];
                         if (s_axi_wdata[31:16] != 16'd0)
                             n_slices_r <= s_axi_wdata[31:16];
                     end
@@ -250,7 +307,8 @@ module pov_dual_top #(
                     4'd7: phase_b_r     <= s_axi_wdata[8:0];     // 0x1C PHASE_B
                     4'd8: oe_window_b_r <= s_axi_wdata[7:0];     // 0x20 BRIGHT_B
                     4'd9: row_cfg_r     <= s_axi_wdata;          // 0x24 行驱 cfg
-                    default: ;   // 0x00/04/08 手动命令归引擎黑盒 (遗留)
+                    4'd10: slice_base_b_r <= s_axi_wdata;        // 0x28 SLICE_BASE_B
+                    default: ;   // 0x00/04/08 手动命令归引擎黑盒, 0x2C-0x3C 未分配 (遗留)
                 endcase
                 s_axi_bvalid <= 1'b1;
                 s_axi_bresp  <= 2'b00;
@@ -268,7 +326,9 @@ module pov_dual_top #(
     reg  [1:0]  pstate;
     reg         df_go, df_tgt;
     reg  [8:0]  df_idx;
-    reg  [31:0] base_lat;        // pair 级 slice_base 快照
+    reg  [31:0] base_lat;        // pair 级 slice_base 快照 (屏 A)
+    reg  [31:0] base_lat_b;      // pair 级 slice_base_b 快照 (屏 B), 与 base_lat 同拍
+    reg         fold_mir;        // 本 pair 的屏 A fetch 是否落在折叠后半圈 (要额外镜像)
     reg  [15:0] df_last_slice;
     reg  [15:0] idx_b_lat;
     reg  [15:0] idx_prev;
@@ -281,6 +341,8 @@ module pov_dual_top #(
             df_tgt        <= 1'b0;
             df_idx        <= 9'd0;
             base_lat      <= 32'h1000_0000;
+            base_lat_b    <= 32'h1000_0000;
+            fold_mir      <= 1'b0;
             df_last_slice <= 16'hFFFF;
             idx_b_lat     <= 16'd0;
             idx_prev      <= 16'd0;
@@ -292,8 +354,14 @@ module pov_dual_top #(
                 P_IDLE: if (pov_en && at_slice_idx != df_last_slice) begin
                     df_last_slice <= at_slice_idx;
                     base_lat      <= slice_base_r;   // 翻页原子点: 每 pair 采样一次
+                    // 屏 B 基址与 base_lat 同一拍快照 → 两面必来自同一帧, 不撕裂。
+                    // slice_base_b_r==0 时取 slice_base_r (与 base_lat 同源同拍),
+                    // 即老的"两面共用一份数据"行为, 逐位不变。
+                    base_lat_b    <= (slice_base_b_r == 32'd0) ? slice_base_r
+                                                               : slice_base_b_r;
                     idx_b_lat     <= idx_b_live;
-                    df_idx        <= at_slice_idx[8:0];
+                    df_idx        <= idx_a_live[8:0];  // 折叠关时 == at_slice_idx[8:0]
+                    fold_mir      <= fold_a_hit;       // 与取片索引同拍锁存
                     df_tgt        <= 1'b0;
                     df_go         <= 1'b1;
                     pstate        <= P_A;
@@ -317,6 +385,7 @@ module pov_dual_top #(
             if (!pov_en) begin
                 df_last_slice <= 16'hFFFF;
                 pstate        <= P_IDLE;   // 在飞 fetch 自跑完, 写被 pov_en mux 丢弃
+                fold_mir      <= 1'b0;     // pov_en=0 走 AXI fb 窗直灌, 折叠镜像必须撤掉
             end
         end
     end
@@ -337,7 +406,16 @@ module pov_dual_top #(
                     4'd6:    s_axi_rdata <= {locked_ever, 15'b0, slice_max};    // 0x18
                     4'd7:    s_axi_rdata <= {at_locked, 6'b0,                   // 0x1C
                                              idx_b_live[8:0], pair_miss};
-                    default: s_axi_rdata <= {17'b0, mirror_a, mirror_b, eng_b_busy, dual_en,  // 0x00
+                    // 0x24 R: POV_CTRL 影子回读 (0x10 是只写的, 读 0x10 已被
+                    // {locked,idx} 占死不能动) — 把 0x10 那组寄存器的当前值原样拼
+                    // 回去, 位序与写口逐位对齐, 软件可直接 RMW 后写回 0x10。
+                    4'd9:    s_axi_rdata <= {n_slices_r, 9'b0, fold_a_en,        // 0x24
+                                             mirror_a, mirror_b, fb_sel_b,
+                                             dual_en, fake_en_r, pov_en};
+                    // 0x00 status: [16]=base_b_act [15]=fold_a_en (机械 v3.1 新增,
+                    // 复位默认都是 0 → 复位态回读值与加这两位之前逐位一致)
+                    default: s_axi_rdata <= {15'b0, (slice_base_b_r != 32'd0), fold_a_en,
+                                             mirror_a, mirror_b, eng_b_busy, dual_en,
                                              (pair_busy | df_busy_w), pov_en,
                                              at_locked, dclk_fast, overlap_en,
                                              use_fb, auto_en, oe_a_state,
@@ -384,6 +462,14 @@ module pov_dual_top #(
     wire [8:0]  df_fb_waddr;
     wire [31:0] df_fb_wdata;
 
+    // A/B 两次 fetch 是**串行**复用同一个 u_fetch (P_A → P_B), 所以基址按当前 pair
+    // 阶段的 df_tgt 选: A 用 base_lat, B 用 base_lat_b。df_tgt 与 df_go 是同一拍
+    // 寄存器输出, u_fetch 又是在 fetch_go 那拍才把 slice_base 算进 cur_addr,
+    // 所以选中的基址在采样沿上已经稳定, 无竞争。
+    // slice_base_b_r==0 时 base_lat_b 快照的就是 slice_base_r → 与 base_lat 全等,
+    // 老行为逐位不变 (TB 里拿 dut.base_lat 当 A/B 共同期望值也仍然成立)。
+    wire [31:0] base_lat_sel = df_tgt ? base_lat_b : base_lat;
+
     ddr_slice_fetch256 u_fetch (
         .aclk          (s_axi_aclk),
         .aresetn       (s_axi_aresetn),
@@ -401,7 +487,7 @@ module pov_dual_top #(
         .m_axi_rlast   (m_axi_rlast),
         .m_axi_rvalid  (m_axi_rvalid),
         .m_axi_rready  (m_axi_rready),
-        .slice_base    (base_lat),
+        .slice_base    (base_lat_sel),
         .slice_idx     (df_idx),
         .fetch_target  (df_tgt),
         .fetch_go      (df_go),
@@ -457,10 +543,21 @@ module pov_dual_top #(
         endcase
     end
     wire [3:0] mb_lane2 = {2'b0, mb_grp2} + {1'b0, mb_grp2, 1'b0} + {2'b0, mb_col}; // grp2*3+col
-    wire [3:0] fbB_lane = mirror_b ? mb_lane2            : fbw_lane;
-    wire [8:0] fbB_addr = mirror_b ? {mb_row2, mb_word}  : fbw_addr;
-    wire [3:0] fbA_lane = mirror_a ? mb_lane2            : fbw_lane;
-    wire [8:0] fbA_addr = mirror_a ? {mb_row2, mb_word}  : fbw_addr;
+    //---------- FOLD: 面 A 折叠的后半圈镜像 (0x10[6], 机械 v3.1) ----------
+    // 折叠时后半圈 (idx >= n_slices/2) 取的是前半圈那片的数据, 要再做一次上面同一个
+    // 左右镜像置换才是正确内容。用**异或**叠加到全局 mirror_a 上, 而不是覆盖:
+    //   mirror_a=0, fold 未命中 → 不镜像 (= 旧行为)
+    //   mirror_a=1, fold 未命中 → 镜像一次 (= 旧行为)
+    //   mirror_a=0, fold 命中   → 镜像一次 (折叠补齐)
+    //   mirror_a=1, fold 命中   → 两次镜像抵消 (置换是对合的, f(f(x))==x, 已独立验证)
+    // 复用同一套 mb_grp2/mb_row2 组合逻辑, 不加面积; 置换本身一个字都没动。
+    // fold_mir 是 pair 级锁存 (与 df_idx 同拍), A/B fetch 串行不重叠, 所以整个 A
+    // fetch 期间它恒定; B 的写走 fbB_* 分支, 不受它影响; pov_en=0 时被清 0。
+    wire       mirror_a_eff = mirror_a ^ fold_mir;
+    wire [3:0] fbB_lane = mirror_b     ? mb_lane2            : fbw_lane;
+    wire [8:0] fbB_addr = mirror_b     ? {mb_row2, mb_word}  : fbw_addr;
+    wire [3:0] fbA_lane = mirror_a_eff ? mb_lane2            : fbw_lane;
+    wire [8:0] fbA_addr = mirror_a_eff ? {mb_row2, mb_word}  : fbw_addr;
 
     //---------- 双引擎 (黑盒; xsim 用 panel_engine_stub.v) ----------
     wire [7:0] oe_window_b_eff = (oe_window_b_r == 8'd0) ? oe_window

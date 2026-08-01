@@ -9,21 +9,29 @@ import mmap, os
 f = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
 p = mmap.mmap(f, 4096, offset=0x40010000)
 def pw(off, v): p[off:off+4] = v.to_bytes(4,'little')
-ba = mmap.mmap(f, 0x438000, offset=0x10000000)
+# 帧区地址表 v3.1 (权威表见 stream/board/pov_rxd.c 文件头): bank 间距 16 MB,
+# 每 bank 实际用 0x870000 (720 片双面帧的最大尺寸)。老的 5 MB 间距/0x438000
+# 已作废——按老值清零会清到 bank A 自己身上, 而 bank B 留着上电垃圾。
+BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x11000000, 0x870000
+ba = mmap.mmap(f, BANK_BYTES, offset=BANK_A)
+n = 0
 try:
-    d = open('/home/uisrc/anime_slices.bin','rb').read(0x438000)
-    ba[:len(d)] = d
-    print('bank A <- default', len(d))
+    d = open('/home/uisrc/anime_slices.bin','rb').read(BANK_BYTES)
+    ba[:len(d)] = d; n = len(d)
+    print('bank A <- default', n)
 except Exception as e:
-    ba[:] = b'\0'*0x438000; print('bank A zeroed:', e)
+    print('bank A: no default anime:', e)
+ba[n:] = b'\0'*(BANK_BYTES - n)          # 尾部清零 (含 360 片以后的面B 区)
 ba.close()
-bb = mmap.mmap(f, 0x438000, offset=0x10500000); bb[:] = b'\0'*0x438000; bb.close()
-pw(0x18, 0x10000000)
+bb = mmap.mmap(f, BANK_BYTES, offset=BANK_B); bb[:] = b'\0'*BANK_BYTES; bb.close()
+pw(0x28, 0)                              # 面B 基址清 0 = PL 两面都用 0x18 (单面)
+pw(0x18, BANK_A)
 pw(0x0C, 0x000001FF); pw(0x0C, 0x9836C001); pw(0x0C, 0xC1000003)  # fast 25M 双沿/54行/oe192满亮(POV稀疏安全,全屏实心禁)
 pw(0x10, (360 << 16) | 0x5)          # sensor+dual 光电角度 (2026-07-17 固化; fake调试: pov6_fake.py dual 0.5)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
-/sbin/insmod /home/uisrc/povmem.ko 2>/dev/null; pkill pov_rxd 2>/dev/null
+# WC 映射窗 = bank A 起 .. bank B 末 (0x1870000) + 余量; 显式传参, 不靠模块默认
+/sbin/insmod /home/uisrc/povmem.ko base=0x10000000 size=0x2900000 2>/dev/null; pkill pov_rxd 2>/dev/null
 /home/uisrc/pov_rxd > /home/uisrc/pov_rxd.log 2>&1 &
 # ②USB PHY 复位 (短脉冲) + WiFi
 modprobe mt7921u 2>&1
