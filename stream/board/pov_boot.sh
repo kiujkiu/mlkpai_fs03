@@ -16,7 +16,10 @@ BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x11000000, 0x870000
 ba = mmap.mmap(f, BANK_BYTES, offset=BANK_A)
 n = 0
 try:
-    d = open('/home/uisrc/anime_slices.bin','rb').read(BANK_BYTES)
+    # v3.1 偏心双面默认帧 (720 片 = 面A 360 穿心 + 面B 360 偏移 14.29px)。
+    # 旧的 anime_slices.bin 是 v3 对称几何的单面 360 片, 在偏心机器上
+    # 「屏B@θ ≡ 屏A@(θ+180)」前提已作废 -> 两屏会显示两个不同的 3D 体。
+    d = open('/home/uisrc/anime_dual720.bin','rb').read(BANK_BYTES)
     ba[:len(d)] = d; n = len(d)
     print('bank A <- default', n)
 except Exception as e:
@@ -24,16 +27,18 @@ except Exception as e:
 ba[n:] = b'\0'*(BANK_BYTES - n)          # 尾部清零 (含 360 片以后的面B 区)
 ba.close()
 bb = mmap.mmap(f, BANK_BYTES, offset=BANK_B); bb[:] = b'\0'*BANK_BYTES; bb.close()
-pw(0x28, 0)                              # 面B 基址清 0 = PL 两面都用 0x18 (单面)
+pw(0x1C, 180)                            # PHASE_B: 补偿渲染侧面B 的符号/手性
+                                         #  (见 pov_rxd.c 的 PHASE_B_DUAL 注释)
+pw(0x28, BANK_A + 360*0x3000)            # 面B 基址 = 载荷后半段 (双面独立数据)
 pw(0x18, BANK_A)
-pw(0x10, (360 << 16) | 0x1)          # sensor 模式
+pw(0x10, (360 << 16) | 0x5)          # sensor 模式 + dual_en(bit2) <- 少了它屏B 不亮
 pw(0x0C, 0x000001FF); pw(0x0C, 0xB836C001); pw(0x0C, 0xC1000003)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
 # WC 映射窗 = bank A 起 .. bank B 末 (0x1870000) + 余量; 显式传参, 不靠模块默认
 /sbin/insmod /home/uisrc/povmem.ko base=0x10000000 size=0x2900000 2>/dev/null
-pkill pov_rxd 2>/dev/null
-/home/uisrc/pov_rxd > /home/uisrc/pov_rxd.log 2>&1 &
+# pov_rxd 由 povrxd.service 托管 (Restart=always + 开机自启), 本脚本不再自己起 ——
+# 两边都起会抢 9500 端口, 表现为 service 无限重启 (NRestarts 狂涨) + bind 失败。
 # ②USB PHY 复位 (短脉冲) + WiFi
 modprobe mt7921u 2>&1
 python3 - <<'PY'

@@ -14,3 +14,6 @@ cam/test*.jpg
 tools/__pycache__/
 vivado/_*.tcl
 sim_diag/
+stream/board/anim.pvs
+stream/board/anime_dual720.bin
+stream/board/pov_rxd_sw

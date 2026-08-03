@@ -152,6 +152,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <sched.h>
@@ -182,6 +184,17 @@
 #define STATUS_FOLD_A_EN   (1u << 15)           /* STATUS[15] fold_a_en 回读 */
 #define STATUS_BASE_B_ACT  (1u << 16)           /* STATUS[16] slice_base_b != 0 */
 #define PHASE_B_RESET      180u                 /* RTL 复位默认 (老共享数据玩法) */
+/* DUAL_FACE 帧屏B 用的相位。**直觉上该是 0**(两面各有各的数据, idx 就是 idx),
+ * 但 2026-08-03 真机实测必须是 180 —— 这是在补偿**渲染侧的一个约定错误**:
+ *   面B 是从 +X 侧观察的, 相对面A 观察方向相反 ⇒ 它的垂距符号和左右手性**都要翻**。
+ *   povstream 目前把面B 渲成「跟面A 同一套约定的 +13.4mm」, 两个都没翻。
+ * 数值恒等式(已验证 6/6, 不加镜像 0/6):
+ *   render(θ, −d, mir) ≡ mirror( render(θ+180, +d, mir) )
+ * ⇒ 用 PHASE_B=180 且 mirror_b=0 显示, 效果正好等于「−d 且手性翻转」= 物理真相。
+ * 🔴 若将来把渲染侧改成原生正确(面B 渲 −13.4mm 且 mirror_u 取反), **必须把这里改回 0**,
+ *    否则两处补偿叠加又错回去。二选一, 不要都做。见 memory
+ *    project_pov3d_v31_dualface_geometry_solved。 */
+#define PHASE_B_DUAL       180u
 
 /* 帧区布局 —— 完整地址表见文件头。16 MB 一格, 每格实际最多用 0x870000。 */
 #define FRAME_PHYS_DEFAULT 0x10000000u
@@ -454,10 +467,13 @@ static int      g_prev_valid;    /* 连接内是否已有 ACK 过的帧 */
 
 static int g_crc_on   = 0;       /* --crc: 每帧算 crc32 (联调用, 量产关) */
 static int g_win_dual = 0;       /* --flip-window dual: 半圈双窗 */
+static const char *idle_path = NULL;   /* --idle-anim 容器路径 */
+static int g_swap_faces = 0;     /* --swap-faces: 两面数据对调到另一块屏 (FOLD_A 帧忽略) */
 
 /* stats (RX 线程写, flip 线程读, 32-bit 对齐字, 统计精度要求低) */
 static unsigned g_st_rx, g_st_flip, g_st_drop, g_st_forced;
 static unsigned long g_st_dec_us;
+
 
 /* ---- socket helpers ------------------------------------------------------ */
 static int recv_full(int fd, void *buf, size_t len)
@@ -666,6 +682,91 @@ static int dec_run_pair(face_job_t *a, face_job_t *b)
     return (a->rc || b->rc) ? -1 : 0;
 }
 
+/* ---- 空闲动画 (--idle-anim FILE) -----------------------------------------
+ * 需求: 上电就有画面, 一旦有人推流就显示推的内容。
+ * 做法: 没有客户端连接时, 由本进程按 --idle-fps 逐帧播放一个预压缩容器;
+ *       有连接时 accept 循环进客户端分支, 自然停播。**单进程独占 DDR**,
+ *       不存在端口争抢或两个写者打架 (那正是 pov_boot.sh 也起 pov_rxd 时
+ *       出现的 bind 失败 + service 无限重启, 见 2026-08-03)。
+ * 容器 anim.pvs 布局 (小端):
+ *   'PVSA' | u32 n_frames | u32 n_slices | u32 flags | n×(u32 off,u32 len) | 压缩载荷…
+ * 载荷就是 PVS1 的 payload 原样 (zlib), 所以复用同一条解码路径, 零特例。 */
+static uint8_t *g_anim;              /* mmap 的整个容器 */
+static size_t   g_anim_sz;
+static uint32_t g_anim_n, g_anim_slices, g_anim_flags, g_anim_cur;
+static const uint32_t *g_anim_idx;   /* 指向容器里的 (off,len) 表 */
+static double   g_idle_fps = 8.0;
+
+static int idle_anim_load(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { logts("idle-anim: 打不开 %s (%s), 空闲时不播", path, strerror(errno)); return -1; }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || (size_t)st.st_size < 16) { close(fd); return -1; }
+    g_anim_sz = (size_t)st.st_size;
+    g_anim = mmap(NULL, g_anim_sz, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (g_anim == MAP_FAILED) { g_anim = NULL; return -1; }
+    if (memcmp(g_anim, "PVSA", 4) != 0) { logts("idle-anim: magic 不对"); g_anim = NULL; return -1; }
+    const uint32_t *h = (const uint32_t *)(g_anim + 4);
+    g_anim_n = h[0]; g_anim_slices = h[1]; g_anim_flags = h[2];
+    g_anim_idx = h + 3;
+    if (!g_anim_n || g_anim_slices > PVS_N_SLICES_MAX) { g_anim = NULL; return -1; }
+    logts("idle-anim: %s %u 帧 n_slices=%u flags=0x%x (%.1f MB) @ %.1f fps",
+          path, g_anim_n, g_anim_slices, g_anim_flags,
+          g_anim_sz / 1048576.0, g_idle_fps);
+    return 0;
+}
+
+/* 播下一帧: 解码 -> 发布, 走与网络帧完全相同的 staging 交接 */
+static void idle_anim_step(void)
+{
+    if (!g_anim) return;
+    uint32_t off = g_anim_idx[g_anim_cur * 2], len = g_anim_idx[g_anim_cur * 2 + 1];
+    if ((size_t)off + len > g_anim_sz) { g_anim_cur = 0; return; }
+    g_anim_cur = (g_anim_cur + 1) % g_anim_n;
+
+    uint32_t raw_len = g_anim_slices * PVS_SLICE_STRIDE;
+    uint32_t nA = (g_anim_flags & PVS_FLAG_DUAL_FACE)
+                  ? ((g_anim_flags & PVS_FLAG_FOLD_A) ? PVS_N_SLICES_FOLD : PVS_N_SLICES) : 0;
+    uint32_t fbo = nA ? nA * PVS_SLICE_STRIDE : 0;
+    /* 容器里存的就是 PVS1 payload 原样, 所以走与网络帧同一条双流解码路径。
+     * 空闲动画不带 DELTA (每帧都是关键帧), prev 恒为 NULL。 */
+    const uint8_t *p0 = g_anim + off;
+    uint32_t clen_a = 0;
+    if (fbo) {
+        clen_a = (uint32_t)p0[0] | ((uint32_t)p0[1] << 8)
+               | ((uint32_t)p0[2] << 16) | ((uint32_t)p0[3] << 24);
+        p0 += 4; len -= 4;
+        if (!clen_a || clen_a >= len) return;
+    }
+    face_job_t ja, jb;
+    memset(&ja, 0, sizeof ja); memset(&jb, 0, sizeof jb);
+    ja.src = p0;              ja.src_len = fbo ? clen_a : len;
+    ja.dst = g_wr.buf;        ja.dst_len = fbo ? fbo : raw_len;
+    uint32_t codec = g_anim_flags & (PVS_FLAG_RLE | PVS_FLAG_ZLIB);
+    ja.codec = codec;
+    if (fbo) {
+        jb.src = p0 + clen_a; jb.src_len = len - clen_a;
+        jb.dst = g_wr.buf + fbo; jb.dst_len = raw_len - fbo;
+        jb.codec = codec;
+        if (dec_run_pair(&ja, &jb) != 0) return;
+    } else {
+        face_decode(&ja);
+        if (ja.rc) return;
+    }
+
+    g_wr.raw_len = raw_len; g_wr.n_slices = g_anim_slices; g_wr.face_b_off = fbo;
+    g_wr.fold_a = !!(g_anim_flags & PVS_FLAG_FOLD_A);
+    pthread_mutex_lock(&g_mu);
+    if (g_ready_gen != g_consumed_gen) g_st_drop++;
+    stage_t t = g_wr; g_wr = g_ready; g_ready = t;
+    g_ready_gen++;
+    pthread_mutex_unlock(&g_mu);
+    g_st_rx++;
+}
+
+
 /* ---- flip thread ----------------------------------------------------------
  * 消费最新就绪缓冲: 先 memcpy 进空闲 bank (WC 6-15 ms / SO 37-73 ms, 必须
  * 在窗口开启前做完 —— 13 rps 下窗口本身只有 ~1.7 ms), 再等翻页窗写
@@ -753,11 +854,18 @@ static void *flip_thread(void *arg)
          * 面B 指向上一帧 bank 的野地址。 */
         uint32_t base_a = g_bank_phys[idle];
         uint32_t base_b = g_disp.face_b_off ? base_a + g_disp.face_b_off : 0u;
+        /* --swap-faces: 把两面的数据对调到另一块物理屏上 (调试/确认哪块屏是贴轴那面)。
+         * ⚠ 只在两面等长时才允许 —— FOLD_A 时面A 只有 180 片且 fold_a_en 是
+         * **引擎A 专属**的, 换过去引擎A 会拿着 360 片的数据还做半圈折叠 = 全错。
+         * 所以 FOLD_A 帧直接忽略本开关 (启动时已告警), 要对调请渲不带 --fold-a 的 720 片。 */
+        if (g_swap_faces && base_b && !g_disp.fold_a) {
+            uint32_t t = base_a; base_a = base_b; base_b = t;
+        }
         /* PHASE_B: 双面帧屏B 有自己那份数据 -> idx 就是 idx -> 必须写 0。
          * 单面帧回到 RTL 复位默认 180 (老的「屏B ≡ 屏A+180」共享数据玩法);
          * 纯老流两边都是 180, phase_b_set 直接短路, 一个字都不写。 */
-        phase_b_set(base_b ? 0u : PHASE_B_RESET,
-                    base_b ? "DUAL_FACE: 屏B 用自己的数据" : "单面: 共享数据默认");
+        phase_b_set(base_b ? PHASE_B_DUAL : PHASE_B_RESET,
+                    base_b ? "DUAL_FACE: 屏B 自己的数据 (180 补偿渲染侧面B 符号/手性)" : "单面: 共享数据默认");
         wmb_frame();                       /* frame data globally visible ... */
         reg_wr(REG_SLICE_BASE_B, base_b);
         fold_a_apply((int)g_disp.fold_a);
@@ -1013,6 +1121,8 @@ static void usage(const char *argv0)
         "                 per frame on the A9; debug only, default off)\n"
         "  --flip-window  single = flip near slice 0 only (default);\n"
         "                 dual   = also near slice 180 (dual-panel, 26 pps)\n"
+        "  --idle-anim F  无客户端时循环播放 F (anim.pvs 容器); 有推流自动让位\n"
+        "  --idle-fps N   空闲动画帧率 (default 8)\n"
         "  --decode       parallel = 双面两条流分别解到 CPU0/CPU1 (default);\n"
         "                 serial   = 单核串行解 (对拍 / 出问题时退回)\n",
         argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT);
@@ -1035,6 +1145,9 @@ int main(int argc, char **argv)
             fake_rps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--crc"))
             g_crc_on = 1;
+        else if (!strcmp(argv[i], "--swap-faces")) g_swap_faces = 1;
+        else if (!strcmp(argv[i], "--idle-anim") && i + 1 < argc) idle_path = argv[++i];
+        else if (!strcmp(argv[i], "--idle-fps")  && i + 1 < argc) g_idle_fps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--flip-window") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "dual")) g_win_dual = 1;
@@ -1130,17 +1243,28 @@ int main(int argc, char **argv)
                                 .sin_port = htons((uint16_t)port) };
     if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("bind"); return 1; }
     if (listen(lfd, 1) < 0) { perror("listen"); return 1; }
+    if (idle_path) idle_anim_load(idle_path);
     logts("listening on :%d", port);
 
     while (!g_stop) {
         struct sockaddr_in peer;
         socklen_t plen = sizeof peer;
+        /* 无客户端时播空闲动画: poll 超时驱动帧率, 有连接立刻让位。
+         * 不用阻塞 accept 是为了在等连接的同时还能出画面。 */
+        if (g_anim) {
+            struct pollfd pfd = { lfd, POLLIN, 0 };
+            int wait_ms = (int)(1000.0 / (g_idle_fps > 0.1 ? g_idle_fps : 0.1));
+            int pr = poll(&pfd, 1, wait_ms);
+            if (pr == 0) { idle_anim_step(); continue; }   /* 超时 = 没人连 -> 播一帧 */
+            if (pr < 0) { if (errno == EINTR) continue; perror("poll"); break; }
+        }
         int cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             perror("accept");
             break;
         }
+        if (g_anim) logts("idle-anim 暂停 (客户端接入)");
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         /* ghost guard: a killed WSL sender leaves this socket ESTAB forever
          * (FIN/RST never reaches us) and the single client slot deadlocks.
