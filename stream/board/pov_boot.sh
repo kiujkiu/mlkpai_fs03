@@ -32,7 +32,10 @@ pw(0x1C, 180)                            # PHASE_B: 补偿渲染侧面B 的符�
 pw(0x28, BANK_A + 360*0x3000)            # 面B 基址 = 载荷后半段 (双面独立数据)
 pw(0x18, BANK_A)
 pw(0x10, (360 << 16) | 0x5)          # sensor 模式 + dual_en(bit2) <- 少了它屏B 不亮
-pw(0x0C, 0x000001FF); pw(0x0C, 0xB836C001); pw(0x0C, 0xC1000003)
+# oe_window 192(箝位187) -> 111: LWAIT = max(0, oe-111), 所以 111 是
+# **免费亮度上限** —— 行周期 271->195 拍, 2D 刷新 3417->4748 Hz (+39%),
+# 967RPM 下每片扫描完整度 0.58->0.81 遍, 顺带 LED 电流约 -29% 给 5V 让余量。
+pw(0x0C, 0x000001FF); pw(0x0C, 0xB8366F01); pw(0x0C, 0xC1000003)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
 # WC 映射窗 = bank A 起 .. bank B 末 (0x1870000) + 余量; 显式传参, 不靠模块默认
