@@ -279,7 +279,7 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0):
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
 
 def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
-                        freeze_phase=False, axis_off=0.0, mirror_u=True,
+                        freeze_phase=False, axis_off=0.0, mirror_u=True, gain=None,
                         n_out=N_SLICES):
     """体素格 → 单面 n_out×0x3000 数据块 (默认 n_out=360 = 完整一面).
     render_slices < 360 时每个渲染角复制填
@@ -308,7 +308,7 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
     for k in range(render_slices):
         if k * dup >= n_out:                 # 折叠: 后半圈根本不渲 (省一半时间)
             break
-        img = gas.render_slice(vox, k * d_step, sub, d_step, axis_off, mirror_u)
+        img = gas.render_slice(vox, k * d_step, sub, d_step, axis_off, mirror_u, gain)
         for j in range(dup):
             slot = k * dup + j
             # 7 与 16 互素, 逐帧遍历相位; freeze 时只随 slot
@@ -773,6 +773,20 @@ def gen_packed_frames(args):
         print('[fold-a] ⚠ 抖动相位随数据复制: 每转独立 Bayer 相位 360→180 种, '
               '时域抖动平滑打对折 (灰度过渡略糙, 几何完全正确)', flush=True)
     checked = not (geom_flags & FLAG_FOLD_A)
+    # 逐列亮度补偿增益 (每面各一条; 只在 --radial-comp 时非 None)
+    gains = {f.name: None for f in faces}
+    if getattr(args, 'radial_comp', False):
+        # 双面覆盖阶跃只补**穿心面的内圈** —— 偏移面全部像素都在双覆盖区
+        # (它最小半径就是 off), 不该再加倍。
+        off_b_px = gas.V31_OFF_B_MM / gas.PITCH_MM
+        for f in faces:
+            dual_off = off_b_px if (len(faces) > 1 and f.axis_off == 0.0) else None
+            gains[f.name] = gas.radial_gain(f.axis_off, dual_off,
+                                            args.radial_floor, args.mirror_u)
+            g = gains[f.name]
+            print(f'[gain] 面{f.name}: 增益 {g.min():.3f}..{g.max():.3f}'
+                  f'{" (含双覆盖 2x 补偿)" if dual_off else ""}', flush=True)
+
     for i, vox in enumerate(ANIMS[args.anim](args)):
         if not checked:                      # 首帧体素上做一次几何门禁
             verify_fold_a(vox, faces[0], args)
@@ -784,7 +798,7 @@ def gen_packed_frames(args):
                                 freeze_phase=args.freeze_phase,
                                 axis_off=f.axis_off,
                                 mirror_u=args.mirror_u,
-                                n_out=f.n_slices)
+                                n_out=f.n_slices, gain=gains[f.name])
             for f in faces)
         print(f'[render] frame {i}/{args.frames} {time.time() - t0:.1f}s', flush=True)
         yield raw
@@ -1301,6 +1315,13 @@ def add_render_opts(ap):
                          '常让单帧偏离体积中心, 用它校正; 先渲 1 帧量包络再定值')
     ap.add_argument('--gap-mm', type=float, default=13.8,
                     help='[v3 对称装] 双屏间距 mm (每屏到轴垂距=一半); 0=穿心旧几何')
+    ap.add_argument('--radial-comp', action='store_true',
+                    help='逐列亮度补偿: ①径向 1/r (轴心过亮 -> 增益∝r) ②双面覆盖阶跃 '
+                         '(r<13.4mm 只被穿心面照到, 补 2x)。1-bit 内容靠抖动密度体现, '
+                         '**只能变暗不能变亮**, 代价是暗列损失空间细节。'
+                         '⚠ 径向补偿在 POV 上可能触及 Voxon P3 专利, 产品化前须确认。')
+    ap.add_argument('--radial-floor', type=float, default=0.12,
+                    help='--radial-comp 的增益下限 (default 0.12); 纯∝r 会让轴心全黑')
     ap.add_argument('--face-off-mm', type=float, default=None, metavar='MM',
                     help='[v3.1 偏心装] 本面到转轴的垂距 mm, 覆盖 --gap-mm。'
                          'A 面(贴轴)=0 / B 面=13.4。两面不对称 → 各渲一份, '

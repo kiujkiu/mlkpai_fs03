@@ -256,7 +256,37 @@ def voxelize(xyz, col, z_stretch):
     return voxel_grid(normalize_points(xyz, z_stretch), col)
 
 
-def render_slice(vox, theta, sub, d_step, axis_off=0.0, mirror_u=False):
+
+def radial_gain(axis_off, dual_cover_off=None, floor=0.12, mirror_u=False):
+    """逐列亮度补偿增益 (长度 W, 值 0..1) —— 解两个几何效应:
+
+    ① **径向 1/r**: 半径 r 处像素每转扫过周长 2πr, 同样的光摊到更大面积 ⇒
+       强度 ∝ 1/r, 轴心附近过亮。补偿增益 ∝ r。
+       ⚠ 偏移面上屏第 u 列的真实半径是 **√(u²+axis_off²)**, 不是 |u| ——
+       穿心面 (axis_off=0) 才退化成 r=|u|。
+
+    ② **双面覆盖阶跃**: 面A 穿心覆盖 r≥0, 面B 偏移覆盖 r≥off ⇒ r<off 只被
+       面A 照到 (1×), r≥off 两面都照 (2×), 在 r=off 处有 2 倍阶跃。
+       只有**面A 的内圈**要补 2× (面B 全部像素都在双覆盖区)。
+       dual_cover_off=None 表示不做这项补偿 (单面, 或本面就是面B)。
+
+    floor: 增益下限。纯 ∝r 会让轴心全黑 (r→0), 留个地板保住中心。
+    ⚠ 1-bit 内容只能**变暗**(抖掉像素), 不能变亮 —— 所以归一化到最亮列=1.0。
+    ⚠ 径向补偿在 POV 显示上可能触及 Voxon P3 专利, 产品化前须确认 (默认关闭)。
+    """
+    u = np.arange(W, dtype=np.float32) - (W - 1) / 2.0
+    if mirror_u:
+        u = -u
+    r = np.hypot(u, axis_off)                 # 该列对应的真实半径 (体素/px)
+    g = r.copy()                              # ① ∝ r
+    if dual_cover_off:                        # ② 单覆盖内圈补 2× (**先叠加再归一化**,
+        g = np.where(r < dual_cover_off, g * 2.0, g)   # 否则阶跃会被 floor 吃掉)
+    g = g / max(g.max(), 1e-6)
+    g = np.maximum(g, floor)                  # 地板: 纯 ∝r 会让轴心全黑
+    return np.clip(g, 0.0, 1.0).astype(np.float32)
+
+
+def render_slice(vox, theta, sub, d_step, axis_off=0.0, mirror_u=False, gain=None):
     """角度 theta 的观察者视角 float 图 (H,W,3)。sub 个子角度 max 混合。
 
     axis_off = 屏面到转轴的垂距 (体素单位 = 屏像素)。
@@ -289,6 +319,8 @@ def render_slice(vox, theta, sub, d_step, axis_off=0.0, mirror_u=False):
         wx = np.clip(np.rint(wxf).astype(np.int32) + GR // 2, 0, GR - 1)
         wz = np.clip(np.rint(wzf).astype(np.int32) + GR // 2, 0, GR - 1)
         np.maximum(img, vox[wx[None, :], gy[:, None], wz[None, :]], out=img)
+    if gain is not None:
+        img *= gain[None, :, None]      # 逐列亮度补偿 (见 radial_gain)
     return img
 
 
