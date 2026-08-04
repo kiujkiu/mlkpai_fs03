@@ -7,7 +7,11 @@ frame = n_slices × 0x3000 (pack_obs 硬件实测映射, 不可改), 传统单�
 = 4,423,680B。**帧长不再是常量** (2026-07-31 v3.1 偏心屏): 头里的 n_slices
 才是权威, raw_len = n_slices × 0x3000, 见下面 --dual-face / --fold-a。
 管线: 动画源 → 逐帧点云变换 → 体素化 → 切片渲染 → 1-bit Bayer 抖动
-(相位随 slice+frame 双变化, 时间抖动平滑) → pack → zlib → TCP → 板 ACK.
+(相位随 slice+frame 双变化, 时间抖动平滑) → pack → 压缩 → TCP → 板 ACK.
+压缩用 --codec 选: zlib (默认, 老行为逐字节不变) / lz4 (LZ4 raw block,
+压缩比几乎相同, 板端 A9 解压快 4 倍 → 48 fps, 见 protocol.h PVS_FLAG_LZ4)。
+--stream-split balanced 再把载荷按板端两核的**工作量**切成多条独立流
+(PVS_FLAG_MSTREAM), fold540 下 180/90/270 三条, makespan 20.6 → 15.47 ms。
 
 numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
 
@@ -77,7 +81,18 @@ N_SLICES_FOLD = 180                                   # --fold-a 折叠后的面
 FRAME_RAW_MAX = N_SLICES_MAX * pack_obs.SLICE_STRIDE  # 8847360
 FLAG_RLE, FLAG_ZLIB, FLAG_DELTA = 0x0001, 0x0002, 0x0004
 FLAG_DUAL_FACE, FLAG_FOLD_A = 0x0008, 0x0010          # v3.1 偏心屏 (protocol.h)
+FLAG_LZ4 = 0x0020                                     # v3.3 LZ4 raw block (与 ZLIB 互斥)
+FLAG_MSTREAM = 0x0040                                 # v3.3 多流流表 (取代双面 4B 前缀)
 FLAG_GEOM = FLAG_DUAL_FACE | FLAG_FOLD_A              # 描述载荷排布的位
+# 能做 DELTA 的编解码 (板端 face_decode 先解码再 XOR, 与压缩位正交)
+DELTA_CODECS = ('zlib', 'lz4')
+# LZ4_compress_HC 级别。默认 12: 同一份 anime_dual720.bin 整帧单流实测
+#   HC9 388166B(22.79x) / HC10 413178B(21.41x) / HC11 381889B / HC12 370699B(23.87x)
+# ⚠ HC10 **比 HC9 还差 6.4%**, 可复现, 不是噪声 —— 别用 10。
+# HC12 甚至比 zlib-6 (377009B) 还小, 但编码 ~1s/帧 ⇒ 只能走 --dir 离线预压缩。
+DEFAULT_LZ4_LEVEL = 12
+LZ4_BAD_LEVELS = (10,)                                # 实测反而更差的级别, 用到就告警
+DEC_WORKERS = 2                                       # 板端解码线程数 (pov_rxd.c DEC_WORKERS)
 ACK, NAK = 0x06, 0x15
 # ⚠ 帧头 n_slices = **本帧载荷里的片数** (360/540/720), 与 PL 寄存器 POV_CTRL
 #   里的 n_slices 字段不是一回事 —— 显示引擎每转仍然扫 360 片, 折叠面的
@@ -129,17 +144,100 @@ def rle_decode(data):
     return bytes(out)
 
 
-def _encode(data, codec, zlevel):
+# ---- LZ4 raw block (ctypes → liblz4.so) ------------------------------------
+# 🔴 这里刻意**不**用 python-lz4 的 lz4.frame, 也不 shell out 到 `lz4` 命令:
+#    那两个出的是 .lz4 **帧格式** (魔数 0x184D2204 + 帧描述符 + 分块头 + xxhash),
+#    板端的 LZ4_decompress_safe() 吃不了 —— 它只认 raw block。见 protocol.h。
+#    ctypes 直接调 liblz4 的 LZ4_compress_HC()/LZ4_decompress_safe(), 出入的就是
+#    raw block, 与板端逐字节同一套格式, 且不引入新的 pip 依赖。
+# WSL 里没有 liblz4.so 时: `sudo apt-get install -y liblz4-1` (只要运行时,
+# 不需要 liblz4-dev —— ctypes 不看头文件)。
+# ⚠ Windows 侧 (POV_Studio.bat 用的 Python312) 默认**没有** liblz4.dll,
+# --codec lz4 在那边会直接报错退出。推流入口目前在 WSL, 先这样; 真要在
+# Windows 上用, 把一个 liblz4.dll 放进 PATH 即可 (名字见下)。
+_LZ4_SONAMES = ('liblz4.so.1', 'liblz4.so', 'liblz4.dll', 'lz4.dll')
+_lz4_lib = None
+
+
+def _lz4():
+    """惰性加载 liblz4 并绑好签名; 只在真的用 lz4 时才要求它存在。"""
+    global _lz4_lib
+    if _lz4_lib is not None:
+        return _lz4_lib
+    import ctypes
+    import ctypes.util
+    lib = None
+    for name in _LZ4_SONAMES + ((ctypes.util.find_library('lz4') or ''),):
+        if not name:
+            continue
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        sys.exit('找不到 liblz4.so —— 装一下运行时库: '
+                 'sudo apt-get install -y liblz4-1')
+    c = ctypes
+    lib.LZ4_versionString.restype = c.c_char_p
+    lib.LZ4_compressBound.argtypes = [c.c_int]
+    lib.LZ4_compressBound.restype = c.c_int
+    # int LZ4_compress_HC(const char* src, char* dst, int srcSize,
+    #                     int dstCapacity, int compressionLevel)
+    lib.LZ4_compress_HC.argtypes = [c.c_char_p, c.c_char_p, c.c_int, c.c_int, c.c_int]
+    lib.LZ4_compress_HC.restype = c.c_int
+    # int LZ4_decompress_safe(const char* src, char* dst, int compressedSize,
+    #                         int dstCapacity)
+    lib.LZ4_decompress_safe.argtypes = [c.c_char_p, c.c_char_p, c.c_int, c.c_int]
+    lib.LZ4_decompress_safe.restype = c.c_int
+    _lz4_lib = lib
+    return lib
+
+
+def lz4_compress(data, level=DEFAULT_LZ4_LEVEL):
+    """LZ4 raw block (LZ4_compress_HC)。level 1..12, 9 = 实测选定的 HC9。"""
+    import ctypes
+    lib = _lz4()
+    n = len(data)
+    cap = lib.LZ4_compressBound(n)
+    if cap <= 0:
+        raise ValueError(f'LZ4_compressBound({n}) = {cap} (输入过大?)')
+    dst = ctypes.create_string_buffer(cap)
+    got = lib.LZ4_compress_HC(data, dst, n, cap, int(level))
+    if got <= 0:
+        raise ValueError(f'LZ4_compress_HC 失败 rc={got}')
+    return dst.raw[:got]
+
+
+def lz4_decompress(data, max_out):
+    """LZ4 raw block → 原数据。raw block 里**不带原长**, dstCapacity 必须由
+    调用方给 (线上是 hdr.raw_len / 各面的 nX*0x3000)。"""
+    import ctypes
+    lib = _lz4()
+    dst = ctypes.create_string_buffer(int(max_out))
+    got = lib.LZ4_decompress_safe(data, dst, len(data), int(max_out))
+    if got < 0:
+        raise ValueError(f'LZ4_decompress_safe 失败 rc={got} '
+                         f'(载荷不是 raw block? .lz4 帧格式会解成负数)')
+    return dst.raw[:got]
+
+
+def _encode(data, codec, zlevel, lz4_level=DEFAULT_LZ4_LEVEL):
     if codec == 'zlib':
         return zlib.compress(data, zlevel), FLAG_ZLIB
+    if codec == 'lz4':
+        return lz4_compress(data, lz4_level), FLAG_LZ4
     if codec == 'rle':
         return rle_encode(data), FLAG_RLE
     return data, 0
 
 
-def _decode(data, flags):
+def _decode(data, flags, max_out=None):
     if flags & FLAG_ZLIB:
         return zlib.decompress(data)
+    if flags & FLAG_LZ4:
+        # raw block 不自带原长 → 给一个上界缓冲, 按返回值截断
+        return lz4_decompress(data, FRAME_RAW_MAX if max_out is None else max_out)
     if flags & FLAG_RLE:
         return rle_decode(data)
     return data
@@ -147,28 +245,111 @@ def _decode(data, flags):
 
 # DUAL_FACE 双流前缀: [u32 LE comp_len_A][面A 流][面B 流]
 DUAL_HDR = struct.Struct('<I')
+# MSTREAM 流表: [u32 n_streams][n × {u32 comp_len_i, u32 n_slices_i}][流…]
+MSTR_N = struct.Struct('<I')
+MSTR_E = struct.Struct('<II')
+MAX_STREAMS = 16                                      # = protocol.h PVS_MAX_STREAMS
 
 
-def compress_frame(raw, codec, zlevel, split=None):
+def stream_plan(n_slices, geom_flags, mode='face', workers=DEC_WORKERS):
+    """→ 每条流的**片数**列表; None = 用老排布 (单流 / 按面两流), 逐字节不变。
+
+    mode='face'     : 恒返回 None = 老行为 (默认, 保住所有已有 frames_* 的等价性)。
+    mode='balanced' : 在面边界的基础上再按 w/workers 的累计片数位置切一刀, 让
+                      板端**连续分组**后每个核拿到的片数尽量相等。
+
+    为什么不能只按面切 (fold540 = 面A 折 180 + 面B 360 的实测):
+        按面切 180/360  两核 makespan = 20.6 ms (被面B 的 360 片封顶)
+        朴素三分 180×3  还是 20.6 ms (3 条流放 2 个核 = 2+1, 零收益)
+        均衡三分 180/90/270 = 15.47 ms (两核各 270 片)
+    ⚠ 由此也纠正一个旧说法: FOLD_A **只省链路 (−31%), 解码一分钱不省** ——
+      按面切的 makespan 由面B 封顶, 折不折叠都一样。
+
+    切分结果与按面切完全相同时 (例如 720 片双面 = 360/360 本来就平衡) 返回
+    None, 退回老格式 —— 这样老固件照样能收, 兼容性最大化。"""
+    n_a = N_SLICES_FOLD if geom_flags & FLAG_FOLD_A else N_SLICES
+    faces = ([n_a, n_slices - n_a] if geom_flags & FLAG_DUAL_FACE
+             else [n_slices])
+    if mode == 'face':
+        return None
+    if mode != 'balanced':
+        raise ValueError(f'未知的流切分模式 {mode!r}')
+    cuts, acc = set(), 0
+    for f in faces[:-1]:            # 面边界一定是流边界 (每条流只属于一个面)
+        acc += f
+        cuts.add(acc)
+    for w in range(1, workers):     # 再按工作量等分点切
+        cuts.add(n_slices * w // workers)
+    cuts.discard(0)
+    cuts.discard(n_slices)
+    segs, prev = [], 0
+    for b in sorted(cuts) + [n_slices]:
+        segs.append(b - prev)
+        prev = b
+    if segs == faces:               # 与按面切一样 → 用老格式 (老固件也能收)
+        return None
+    if len(segs) > MAX_STREAMS:
+        raise ValueError(f'流数 {len(segs)} > {MAX_STREAMS} (protocol.h 上限)')
+    return segs
+
+
+def compress_frame(raw, codec, zlevel, split=None, lz4_level=DEFAULT_LZ4_LEVEL,
+                   streams=None):
     """→ (payload, codec_flags)。
 
-    split=None: 单流 (单面帧 = 老行为, 逐字节不变)。
-    split=nA 字节: DUAL_FACE 帧 → **两条独立压缩流**
+    streams=[片数, …]: **MSTREAM 多流** (protocol.h bit6), 优先级最高
+        payload = [u32 n][n×{u32 comp_len_i, u32 n_slices_i}][流 0..n-1]
+        流数可变, 边界必须落在片边界上; 板端按片数把流连续分组摊到两个核。
+        表里两个字段都全给 (不省最后一条的长度): 388KB 载荷里那 4 字节
+        = 0.001%, 换来 Σcomp_len / Σn_slices 两个求和自校验, 载荷截断会当场
+        NAK 而不是解出半帧垃圾还照样 ACK。
+    split=nA 字节: 老的 DUAL_FACE **两条独立压缩流**
         payload = [u32 LE comp_len_A][面A 流][面B 流]
-    拆流的意义在板端: 两条流互不依赖 ⇒ 可以并行 inflate 到 A9 双核, 单帧解码
-    时间直接减半 (96→48ms), 且不必引入奇偶帧交错那套额外缓冲和一帧延迟。
-    代价只是丢了跨面的 zlib 后向引用 (实测 33.7x → 33.6x, 0.3%)。"""
+    split=None 且 streams=None: 单流 (单面帧 = 老行为, 逐字节不变)。
+
+    拆流的意义在板端: 流互不依赖 ⇒ 可以并行解到 A9 双核, 单帧解码时间按最
+    慢那条流算, 且不必引入奇偶帧交错那套额外缓冲和一帧延迟。
+    代价只是丢了跨流的后向引用 (实测 zlib 33.7x → 33.6x; lz4-HC9 整帧单流
+    388166B → 按面两流 388307B, +0.04%)。
+    codec='lz4' 时每条流各是一个 LZ4 raw block, 排布一模一样 (protocol.h)。"""
+    if streams:
+        parts, off, fl = [], 0, 0
+        for ns in streams:
+            nb = ns * pack_obs.SLICE_STRIDE
+            c, fl = _encode(raw[off:off + nb], codec, zlevel, lz4_level)
+            parts.append((c, ns))
+            off += nb
+        if off != len(raw):
+            raise ValueError(f'流表片数合计 {off}B != 帧长 {len(raw)}B')
+        tbl = MSTR_N.pack(len(parts)) + b''.join(MSTR_E.pack(len(c), ns)
+                                                 for c, ns in parts)
+        return tbl + b''.join(c for c, _ in parts), fl | FLAG_MSTREAM
     if split is None:
-        return _encode(raw, codec, zlevel)
-    a, fl = _encode(raw[:split], codec, zlevel)
-    b, _ = _encode(raw[split:], codec, zlevel)
+        return _encode(raw, codec, zlevel, lz4_level)
+    a, fl = _encode(raw[:split], codec, zlevel, lz4_level)
+    b, _ = _encode(raw[split:], codec, zlevel, lz4_level)
     return DUAL_HDR.pack(len(a)) + a + b, fl
 
 
 def decompress_frame(payload, flags):
-    """线上 payload → raw。DUAL_FACE 时按 u32 前缀拆两条流分别解, 再拼回
-    [面A][面B] —— 解出来与拆流前的同一帧逐字节相同 (板端两个核各解一条,
-    直接写各自的 DDR 基址, 连拼接都省了)。"""
+    """线上 payload → raw。多流时按流表/u32 前缀拆开分别解再拼回 —— 解出来
+    与拆流前的同一帧逐字节相同 (板端各个核各解各的, 直接写进 staging 缓冲的
+    对应偏移, 连拼接都省了)。"""
+    if flags & FLAG_MSTREAM:
+        (n,) = MSTR_N.unpack_from(payload)
+        if not 1 <= n <= MAX_STREAMS:
+            raise ValueError(f'MSTREAM n_streams={n} 越界 (1..{MAX_STREAMS})')
+        tbl = [MSTR_E.unpack_from(payload, MSTR_N.size + i * MSTR_E.size)
+               for i in range(n)]
+        off = MSTR_N.size + n * MSTR_E.size
+        if off + sum(c for c, _ in tbl) != len(payload):
+            raise ValueError(f'MSTREAM Σcomp_len 与 payload {len(payload)}B 不符')
+        out = []
+        for clen, nsl in tbl:
+            out.append(_decode(payload[off:off + clen], flags,
+                               nsl * pack_obs.SLICE_STRIDE))
+            off += clen
+        return b''.join(out)
     if flags & FLAG_DUAL_FACE:
         (n_a,) = DUAL_HDR.unpack_from(payload)
         end_a = DUAL_HDR.size + n_a
@@ -214,10 +395,10 @@ FrameEntry = collections.namedtuple(
 def _precomp_job(job):
     """进程池 worker: 读帧 (+前帧), 出 (key payload, delta payload|None, raw_len).
     split 非 None (DUAL_FACE) 时出的是双流 payload, 与现场压缩路径同一套编码。"""
-    path, prev_path, zlevel, split = job
+    path, prev_path, zlevel, split, codec, lz4_level, streams = job
     raw = open(path, 'rb').read()
     slices_of(len(raw), f'{path}: ')
-    key, _ = compress_frame(raw, 'zlib', zlevel, split)
+    key, _ = compress_frame(raw, codec, zlevel, split, lz4_level, streams)
     delta = None
     if prev_path is not None:
         prev = open(prev_path, 'rb').read()
@@ -226,7 +407,8 @@ def _precomp_job(job):
                              f'(同目录帧长必须一致)')
         # 逐字节 XOR 后再按同一个 split 拆流 ≡ 各面各自 XOR 自己的同面参考数据
         # (XOR 是逐字节的, 两面边界又对齐) —— 板端两个核各自 XOR 各自的参考帧。
-        delta, _ = compress_frame(xor_frames(prev, raw), 'zlib', zlevel, split)
+        delta, _ = compress_frame(xor_frames(prev, raw), codec, zlevel, split,
+                                  lz4_level, streams)
     return key, delta, len(raw)
 
 
@@ -238,15 +420,23 @@ def frame_files_from_dir(d):
     return files
 
 
-def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0):
+def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
+                  codec='zlib', lz4_level=DEFAULT_LZ4_LEVEL,
+                  stream_split='face'):
     """--dir 整目录预压缩到内存: [FrameEntry]. delta=True 时每帧还预算
-    对流序前一帧的 XOR+zlib delta 链; 帧 0 的 delta 参考最后一帧 (loop 回
+    对流序前一帧的 XOR+压缩 delta 链; 帧 0 的 delta 参考最后一帧 (loop 回
     绕), 非 loop/首连时帧 0 由发送策略强制走 key payload, 回绕 delta 只在
     loop 第 2 圈起被用到, 语义正确."""
     files = frame_files_from_dir(d)
     n = len(files)
     split = face_split_bytes(geom_flags)       # DUAL_FACE → 预压缩也出双流
-    jl = [(f, files[(i - 1) % n] if delta else None, zlevel, split)
+    n_sl0 = slices_of(os.path.getsize(files[0]), f'{files[0]}: ')
+    streams = stream_plan(n_sl0, geom_flags, stream_split)
+    if streams:
+        print(f'[precomp] 多流切分 {streams} 片 (MSTREAM), 板端 {DEC_WORKERS} 核'
+              f'连续分组后每核 ≈{sum(streams) // DEC_WORKERS} 片', flush=True)
+    jl = [(f, files[(i - 1) % n] if delta else None, zlevel, split,
+           codec, lz4_level, streams)
           for i, f in enumerate(files)]
     t0 = time.time()
     if jobs == 1 or n == 1:
@@ -255,8 +445,11 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0):
         import multiprocessing as mp
         with mp.Pool(processes=jobs or None) as pool:
             results = pool.map(_precomp_job, jl, chunksize=1)
-    entries = [FrameEntry(key=k, delta=dl, key_flags=FLAG_ZLIB,
-                          delta_flags=FLAG_ZLIB | FLAG_DELTA,
+    cflag = FLAG_LZ4 if codec == 'lz4' else FLAG_ZLIB
+    if streams:
+        cflag |= FLAG_MSTREAM
+    entries = [FrameEntry(key=k, delta=dl, key_flags=cflag,
+                          delta_flags=cflag | FLAG_DELTA,
                           raw_len=rl)
                for k, dl, rl in results]
     n_sl = {e.raw_len // pack_obs.SLICE_STRIDE for e in entries}
@@ -871,10 +1064,13 @@ class Streamer:
                  ack_timeout=30.0, delta=False, keyint=DEFAULT_KEYINT,
                  link_mbps=DEFAULT_LINK_MBPS, stats_interval=5.0,
                  max_frames=0, on_frame=None, on_status=None, on_stats=None,
-                 stop=None, geom_flags=0):
+                 stop=None, geom_flags=0, lz4_level=DEFAULT_LZ4_LEVEL,
+                 stream_split='face'):
         self.host, self.port = host, port
         self.fps, self.loop = fps, loop
         self.codec, self.zlevel = codec, zlevel
+        self.lz4_level = lz4_level
+        self.stream_split = stream_split
         self.reconnect, self.retry_interval = reconnect, retry_interval
         self.ack_timeout = ack_timeout
         self.delta, self.keyint = delta, max(int(keyint), 1)
@@ -928,12 +1124,18 @@ class Streamer:
             return item.delta, item.delta_flags, True, None
         raw = item                       # 现场压缩路径 (bytes)
         split = face_split_bytes(self.geom_flags)   # DUAL_FACE → 两条独立流
+        streams = stream_plan(len(raw) // pack_obs.SLICE_STRIDE,
+                              self.geom_flags, self.stream_split)
         if (self.delta and not want_key and self._prev_raw is not None
-                and len(self._prev_raw) == len(raw) and self.codec == 'zlib'):
-            payload, _ = compress_frame(xor_frames(self._prev_raw, raw),
-                                        'zlib', self.zlevel, split)
-            return payload, FLAG_ZLIB | FLAG_DELTA, True, raw
-        payload, flags = compress_frame(raw, self.codec, self.zlevel, split)
+                and len(self._prev_raw) == len(raw)
+                and self.codec in DELTA_CODECS):
+            # DELTA 位与压缩位正交: 板端先按压缩位解码再 XOR, 所以 zlib/lz4 都行
+            payload, cflag = compress_frame(xor_frames(self._prev_raw, raw),
+                                            self.codec, self.zlevel, split,
+                                            self.lz4_level, streams)
+            return payload, cflag | FLAG_DELTA, True, raw
+        payload, flags = compress_frame(raw, self.codec, self.zlevel, split,
+                                        self.lz4_level, streams)
         return payload, flags, False, raw
 
     def _send_one(self, sock, item):
@@ -1190,8 +1392,9 @@ def geom_flags_from_dir(d):
 
 
 def cmd_stream(args):
-    if args.delta and args.codec != 'zlib':
-        sys.exit('--delta 需要 --codec zlib (协议 DELTA|ZLIB 组合)')
+    if args.delta and args.codec not in DELTA_CODECS:
+        sys.exit(f'--delta 需要 --codec {"/".join(DELTA_CODECS)} '
+                 f'(协议 DELTA 与压缩位正交, 但 raw/rle 侧没实现)')
     # 几何 flags: --dir 走目录 meta.json, 现渲走 CLI (face_plan 同时做合法性检查)
     if args.dir:
         geom_flags = geom_flags_from_dir(args.dir)
@@ -1207,11 +1410,22 @@ def cmd_stream(args):
     else:
         _faces, geom_flags = face_plan(args)
         check_layout(sum(f.n_slices for f in _faces), geom_flags, '渲染计划: ')
+    if args.codec == 'lz4':
+        if args.lz4_level in LZ4_BAD_LEVELS:
+            print(f'[net] ⚠ --lz4-level {args.lz4_level} 实测**反而比 9 更差** '
+                  f'(413178 vs 388166 B, 可复现), 建议 9/11/12', flush=True)
+        if not args.dir or args.no_precomp:
+            # HC12 x86 单核 ~1 s/帧, HC9 也要 ~135 ms/帧 —— 现渲直推兜不住
+            print(f'[net] ⚠ --codec lz4 走的是**逐帧现场压缩** (HC{args.lz4_level} '
+                  f'约 0.1~1 s/帧), 帧率会被编码封顶。正常用法是 '
+                  f'`render` 预渲染到目录后 `stream --dir` 走预压缩缓存。', flush=True)
     entries = None
-    if args.dir and args.codec == 'zlib' and not args.no_precomp:
+    if args.dir and args.codec in DELTA_CODECS and not args.no_precomp:
         entries = build_precomp(args.dir, zlevel=args.zlevel,
                                 delta=args.delta, jobs=args.jobs,
-                                geom_flags=geom_flags)
+                                geom_flags=geom_flags, codec=args.codec,
+                                lz4_level=args.lz4_level,
+                                stream_split=args.stream_split)
 
     def make_iter():
         if entries is not None:
@@ -1232,7 +1446,8 @@ def cmd_stream(args):
 
     s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop,
                  window=args.window,
-                 codec=args.codec, zlevel=args.zlevel, reconnect=args.reconnect,
+                 codec=args.codec, zlevel=args.zlevel, lz4_level=args.lz4_level,
+                 stream_split=args.stream_split, reconnect=args.reconnect,
                  delta=args.delta, keyint=args.keyint, link_mbps=args.link_mbps,
                  max_frames=args.max_frames, geom_flags=geom_flags,
                  on_frame=on_frame, on_status=on_status)
@@ -1259,8 +1474,15 @@ def cmd_bench(args):
     zero = (np.frombuffer(raw, np.uint8) == 0).mean()
     print(f'{args.file}: {len(raw)}B, {zero * 100:.1f}% zeros')
     rows = []
+    # dec_ms 这一列是 **x86 上** 的解压耗时, 只能用来横向比较编解码器;
+    # 板端 (A9) 的绝对值另测 (protocol.h 的 PVS_FLAG_LZ4 注释里有实测表)。
+    # ⚠ lz4 那两行的 dec_ms 还含 ctypes 每次新建 8.8MB 输出缓冲(清零)的开销,
+    #   纯解压其实快一个量级 (同一份数据的 C 侧对拍: lz4 0.59ms vs zlib 7.5ms)。
+    lz4_dec = lambda d: lz4_decompress(d, len(raw))          # noqa: E731
     for name, fn, dec in [('zlib-1', lambda d: zlib.compress(d, 1), zlib.decompress),
                           ('zlib-6', lambda d: zlib.compress(d, 6), zlib.decompress),
+                          ('lz4-1', lambda d: lz4_compress(d, 1), lz4_dec),
+                          ('lz4-HC9', lambda d: lz4_compress(d, 9), lz4_dec),
                           ('rle', rle_encode, rle_decode)]:
         t0 = time.time(); c = fn(raw); te = time.time() - t0
         t0 = time.time(); d = dec(c); td = time.time() - t0
@@ -1382,8 +1604,20 @@ def main():
     s.add_argument('--loop', action='store_true')
     s.add_argument('--reconnect', action='store_true',
                    help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推)')
-    s.add_argument('--codec', choices=['zlib', 'rle', 'raw'], default='zlib')
+    s.add_argument('--codec', choices=['zlib', 'lz4', 'rle', 'raw'], default='zlib',
+                   help='压缩位 (protocol.h)。默认 zlib = 与所有已有 frames_* '
+                        '预渲染目录逐字节兼容的老行为; lz4 = LZ4 raw block, '
+                        '压缩比几乎相同但板端解压快 4 倍 (A9 实测 163.5→41.2ms)')
     s.add_argument('--zlevel', type=int, default=6)
+    s.add_argument('--lz4-level', type=int, default=DEFAULT_LZ4_LEVEL,
+                   help=f'--codec lz4 的 LZ4_compress_HC 级别 1..12 '
+                        f'(默认 {DEFAULT_LZ4_LEVEL}; ⚠ 10 实测比 9 还差 6%%, '
+                        f'用 9/11/12)')
+    s.add_argument('--stream-split', choices=['face', 'balanced'], default='face',
+                   help='载荷拆成几条独立压缩流 (板端并行解码的粒度)。'
+                        'face = 按面切 (默认, 与老固件/老行为逐字节一致); '
+                        'balanced = 按板端两核的**工作量**切 (PVS_FLAG_MSTREAM), '
+                        'fold540 下 180/90/270 三条, 两核 makespan 20.6→15.47ms')
     s.add_argument('--delta', action='store_true',
                    help='帧间 XOR delta (PVS_FLAG_DELTA), 首帧/重连首帧自动 keyframe')
     s.add_argument('--keyint', type=int, default=DEFAULT_KEYINT,

@@ -79,7 +79,7 @@ All integers **little-endian**.
 | 4   | 4    | comp_len   | payload bytes as transmitted                   |
 | 8   | 4    | raw_len    | decompressed size, **must == n_slices * 0x3000** |
 | 12  | 2    | n_slices   | 权威片数, 1..720 (老帧 = 360)                  |
-| 14  | 2    | flags      | bit0 = RLE, bit1 = zlib, bit2 = DELTA, bit3 = DUAL_FACE, bit4 = FOLD_A, 0 = raw |
+| 14  | 2    | flags      | bit0 = RLE, bit1 = zlib, bit2 = DELTA, bit3 = DUAL_FACE, bit4 = FOLD_A, bit5 = LZ4, bit6 = MSTREAM, 0 = raw |
 | 16  | comp_len | payload |                                                |
 
 **DELTA (bit2, PVS1.1)**: payload (after RLE/zlib decode) = `cur XOR prev_raw`,
@@ -130,6 +130,111 @@ Projected model fps on a 9.4 MB/s link (payload-bound, header/ACK negligible):
 `9.4 / (4.42/ratio)` → **~20 fps** @ zlib-1, **~27 fps** @ zlib-6, 1.1 fps raw.
 Actual figures vary ±20% with scene density; povstream prints live stats.
 
+### 2026-08-04: LZ4 (bit5) 顶掉 zlib —— 板端 12 fps → 48 fps
+
+上面那张表是在 **PC** 上测的，选 zlib 时看的是压缩比。真正的瓶颈后来被证明在
+**板端解压**：A9 单核 inflate 只有 ~52 MB/s，双面 8.85 MB 一帧要 163 ms，双核也就
+82 ms ⇒ 封顶 12 fps，链路根本没跑满。
+
+板上真实内容 `anime_dual720.bin`（720 片偏心双面，8,847,360 B）在 **ARM Cortex-A9
+单核**实测（**单流**压的，不是拆两条流）：
+
+| codec   | size    | ratio  | 解压耗时 | 解压吞吐   |
+|---------|---------|--------|----------|------------|
+| zlib-6  | 376,780 | 23.5×  | 163.5 ms | 51.6 MB/s  |
+| **lz4-HC9** | **388,166** | **22.8×** | **41.2 ms** | **204.6 MB/s** |
+
+压缩比只差 3%（每帧多 11 KB，2.4G WiFi 上可忽略），解压快 **4×**。
+`DUAL_FACE` 的两条流照旧双核并行 ⇒ 单帧 ≈ 20.6 ms ⇒ **48 fps**。
+
+**`LZ4` (bit5) 与 `zlib` (bit1)、`RLE` (bit0) 互斥** —— 一帧最多置一个压缩位，
+多于一位是非法帧，接收方 NAK。载荷排布与 zlib 完全一致（含 `DUAL_FACE` 的
+`[u32 comp_len_A][A][B]` 双流前缀），`DELTA|LZ4` = `lz4(prev ^ cur)`。
+
+🔴 **必须是 LZ4 raw block，不是 `.lz4` 帧格式。** 这是最容易踩的坑：
+
+| | 产生方 | 内容 | 板端能不能解 |
+|---|---|---|---|
+| **raw block** ✅ | `LZ4_compress_HC()` / `LZ4_compress_default()`（`lz4.h`/`lz4hc.h`） | 纯 token 流，无头无尾无校验，**不带原长** | `LZ4_decompress_safe()`，`dstCapacity` 由调用方给（单面 = `raw_len`，双面 = 各面 `nX*0x3000`） |
+| `.lz4` 帧格式 ❌ | `lz4` 命令行 / `lz4frame.h` / python `lz4.frame` | 魔数 `0x184D2204` + 帧描述符 + 分块头 + 可选 xxhash | **不能** —— `LZ4_decompress_safe()` 会把魔数当 token 解，返回负数 |
+
+所以发送端不能 `lz4 -9 f.bin`，也不能 `lz4.frame.compress()`；povstream 用 ctypes
+直接调 `liblz4.so.1` 的 `LZ4_compress_HC()`（`--codec lz4`，级别 `--lz4-level`，默认 9）。
+
+拆两条流的压缩代价（x86 实测，同一个 `anime_dual720.bin`）：
+lz4-HC9 单流 388,166 B → 双流 388,307 B（+141 B，+0.04%）；zlib-6 单流 377,009 B →
+双流 377,093 B（+84 B，+0.02%）。与上面 §"为什么拆两条"的结论一致。
+
+**HC 级别（x86 liblz4 1.10.0，整帧单流实测）**：
+
+| level | size | ratio | encode |
+|---|---|---|---|
+| HC9  | 388,166 | 22.79× | 135 ms |
+| HC10 | 413,178 | 21.41× | 138 ms |
+| HC11 | 381,889 | 23.17× | 497 ms |
+| **HC12** | **370,699** | **23.87×** | 977 ms |
+
+🔴 **HC10 比 HC9 还差 6.4%，可复现，跳过 10。** 默认用 **HC12**：比 HC9 小 4.5%，
+甚至比 zlib-6（377,009 B）还小 —— 于是 LZ4 在这份内容上**压缩比和解压速度双赢**。
+代价全在 PC 编码侧（≈1 s/帧）⇒ **必须走 `--dir` 的离线预压缩缓存**，
+现渲直推（`stream --anim` 或 `--no-precomp`）会被编码封顶，povstream 会打警告。
+解压速度与级别无关（raw block 格式一样）。
+
+### 2026-08-04: MSTREAM (bit6) —— 流数可变，按**工作量**切而不是按**面**切
+
+并行解码的 makespan 由**最慢那条流**决定。`DUAL_FACE|FOLD_A`（面A 折 180 +
+面B 360，共 540 片）按面切时两条流是 1:2，**双核完全压不平**：
+
+| 切法 | 两核 makespan | @30fps 解码余量 |
+|---|---|---|
+| 按面切 A180 / B360 | 20.6 ms（被面B 的 360 片封顶） | 1.53× ❌ |
+| 朴素三分 180/180/180 | 20.6 ms（3 条流放 2 个核 = 2+1，零收益，还白亏 489 B） | 1.53× ❌ |
+| **均衡三分 A180 / B0-89 / B90-359** | **15.47 ms**（两核各 270 片） | **2.04×** ✅ |
+
+⇒ **切点必须落在面B 的第 90 片**。代价：本仓库 `anime_dual720` 派生的 fold540 帧
+实测 lz4-HC12 按面两流 265,850 B → 均衡三流 266,330 B（**+480 B，+0.18%**）。
+
+🔴 **顺带纠正一个旧说法**：`FOLD_A` 曾被说成"链路和解码两头都省"。**解码那半是错的** ——
+按面切时 makespan 由面B 封顶，折不折叠完全一样，**`FOLD_A` 只省链路（−31%）**。
+正因为如此才必须重新切分负载。
+
+**载荷格式**（置 `MSTREAM` 时，取代 `DUAL_FACE` 那个 4 B 前缀）：
+
+```
+[u32 n_streams]
+[n_streams × { u32 comp_len_i, u32 n_slices_i }]      # 8 B/条
+[流 0][流 1] … [流 n-1]
+接收方必须校验:  comp_len == 4 + 8*n_streams + Σ comp_len_i
+                Σ n_slices_i == hdr.n_slices
+流 i 解压后落在 buf + (Σ_{j<i} n_slices_j) * 0x3000, 长度 n_slices_i * 0x3000
+n_streams ∈ [1, PVS_MAX_STREAMS = 16]
+```
+
+- **表里必须带 `n_slices_i`**：压缩流里读不出原长，而 `LZ4_decompress_safe` 要先知道
+  `dstCapacity` 和落点。只给压缩长度的话，流 i 的落点得等流 i-1 解完才知道 =
+  退化成串行，并行的意义就没了。
+- **末条的长度不省那 4 字节**：388 KB 载荷里 4 字节 = 0.001%，换来两个独立的求和
+  自校验 —— 载荷截断/错位当场 NAK，而不是解出半帧垃圾还照样 ACK。
+- **边界必须落在片边界**（长度都是 `0x3000` 的整数倍）：板端是按片给两个核派活的。
+- 流之间**不能有跨流引用**，各压各的。
+- 与 `DUAL_FACE` **正交**：`DUAL_FACE` 说"显示怎么分"（两个 DDR 基址，分界 `nA*0x3000`），
+  `MSTREAM` 说"解码怎么分"（几条流）。`MSTREAM` 也可用在单面帧上（360 片切两条 =
+  单面也吃满双核）。
+
+**板端派活必须是连续分组，不能轮转**：三条流 180/90/270 轮转会得到
+核0={流0,流2}=450 片 / 核1={流1}=90 片，makespan 450 —— 比按面切还差；
+连续分组才能取到 {流0,流1}=270 / {流2}=270。
+
+**向后兼容（两个方向）**：
+
+- **老固件 + 新发送端**：默认 `--stream-split face` 不置 `MSTREAM`，逐字节还是老排布。
+  且当均衡切分结果**恰好等于按面切**时（720 片双面 = 360/360 本来就平衡），发送端
+  自动退回老的两流格式。真要用三流时置了 `MSTREAM`，老固件的未知 flag 掩码会直接
+  NAK —— **响亮地失败**，不会静默解错。
+- **新固件 + 老发送端**：没有 `MSTREAM` 位就走老的两流分支，逐字节兼容。
+
+发送端开关：`povstream.py stream --stream-split {face|balanced}`（默认 `face`）。
+
 ## Sender pipeline
 
 ```
@@ -137,7 +242,7 @@ source (spinpulse GLB anim | procedural globe | dir of .bin)
   → per-frame: transform points → voxelize → 360 slice renders
   → 1-bit Bayer dither (phase varies per slice AND per frame)
   → pack_obs.pack_slice → 360×0x3000 frame
-  → zlib → PVS1 frame → TCP, wait ACK, pace to --fps
+  → zlib (默认) / lz4 (--codec lz4) → PVS1 frame → TCP, wait ACK, pace to --fps
 ```
 
 Because live numpy rendering costs seconds/frame, the normal workflow is
