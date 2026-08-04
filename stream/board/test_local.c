@@ -3,15 +3,17 @@
  *
  * Spawns ./pov_rxd_sim (--crc --flip-window dual) on a local port, connects,
  * and exercises:
- *   - all three codecs (raw / zero-run RLE / zlib), ACK-paced
+ *   - all four codecs (raw / zero-run RLE / zlib / LZ4 raw block), ACK-paced
  *   - DELTA chain: zlib keyframe + 3x DELTA|ZLIB, asserts the daemon's
  *     logged crc32 of every reconstructed raw frame == crc of what the
  *     PC-side raw was (proves prev_acked_raw ^ decoded reconstruction)
  *   - two frames back-to-back with no ACK wait (ready-buffer overwrite /
  *     drop path; both must still ACK - RX is decoupled from the flip)
+ *   - DELTA|LZ4: 压缩位与 DELTA 位正交, 组合必须与 DELTA|ZLIB 一样成立
  *   - NAK cases, each on a fresh connection (daemon closes after NAK):
- *     garbage magic / unknown flag bit / DELTA as first frame (no
- *     reference) / DELTA first after reconnect (reference must reset)
+ *     garbage magic / unknown flag bit / ZLIB|LZ4 同时置位 (压缩位互斥) /
+ *     DELTA as first frame (no reference) / DELTA first after reconnect
+ *     (reference must reset)
  *   - at least one FLIP line (flip thread alive, window logic ran)
  *
  * Exit 0 = pass.
@@ -30,8 +32,12 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <zlib.h>
+#include <lz4.h>
+#include <lz4hc.h>
 
 #include "../protocol.h"
+
+#define LZ4_HC_LEVEL 9        /* = povstream.py 的 DEFAULT_LZ4_LEVEL */
 
 #define TEST_PORT 9517
 #define MAX_FRAMES 32
@@ -101,7 +107,17 @@ static int send_frame(int fd, const uint8_t *raw, const uint8_t *prev,
     }
 
     const uint8_t *payload = body;
-    if (flags & PVS_FLAG_ZLIB) {
+    if (flags & PVS_FLAG_LZ4) {
+        /* 🔴 raw block (LZ4_compress_HC), **不是** .lz4 帧格式 —— 板端的
+         * LZ4_decompress_safe 只认 raw block, 见 protocol.h。 */
+        int clen = LZ4_compress_HC((const char *)body, (char *)scratch,
+                                   PVS_FRAME_RAW,
+                                   LZ4_compressBound(PVS_FRAME_RAW),
+                                   LZ4_HC_LEVEL);
+        if (clen <= 0) { fprintf(stderr, "LZ4_compress_HC rc=%d\n", clen); return -1; }
+        h.comp_len = (uint32_t)clen;
+        payload = scratch;
+    } else if (flags & PVS_FLAG_ZLIB) {
         uLongf clen = compressBound(PVS_FRAME_RAW);
         if (compress2(scratch, &clen, body, PVS_FRAME_RAW, 6) != Z_OK) return -1;
         h.comp_len = (uint32_t)clen;
@@ -118,6 +134,58 @@ static int send_frame(int fd, const uint8_t *raw, const uint8_t *prev,
     sent_crc[n_sent++] = crc32(0L, raw, PVS_FRAME_RAW);
     printf("test: sent frame %d flags=0x%x comp=%u crc=%08x\n",
            n_sent - 1, flags, h.comp_len, sent_crc[n_sent - 1]);
+    return 0;
+}
+
+/* MSTREAM: 把一整帧切成 nseg 段 (每段片数由 seg[] 给) 分别压成独立流,
+ * 前面挂上流表 [u32 n][n×{u32 clen,u32 nsl}] —— 与 protocol.h / povstream.py
+ * 的 stream_plan 出来的排布逐字节相同。 */
+static int send_mstream(int fd, const uint8_t *raw, const uint8_t *prev,
+                        uint16_t flags, const int *seg, int nseg,
+                        uint8_t *xbuf, uint8_t *scratch)
+{
+    pvs_hdr_t h;
+    memcpy(h.magic, PVS_MAGIC, 4);
+    h.raw_len = PVS_FRAME_RAW;
+    h.n_slices = PVS_N_SLICES;
+    h.flags = (uint16_t)(flags | PVS_FLAG_MSTREAM);
+
+    const uint8_t *body = raw;
+    if (flags & PVS_FLAG_DELTA) {
+        if (!prev) { fprintf(stderr, "test bug: DELTA without prev\n"); return -1; }
+        for (size_t i = 0; i < PVS_FRAME_RAW; i++) xbuf[i] = raw[i] ^ prev[i];
+        body = xbuf;
+    }
+    uint32_t tbl_len = 4u + (uint32_t)nseg * 8u;
+    uint8_t *p = scratch + tbl_len;         /* 流体从表后开始 */
+    uint32_t clen[16];
+    uint32_t soff = 0;
+    for (int i = 0; i < nseg; i++) {
+        uint32_t nb = (uint32_t)seg[i] * PVS_SLICE_STRIDE;
+        int c;
+        if (flags & PVS_FLAG_ZLIB) {          /* 压缩位说什么就压什么 */
+            uLongf zc = compressBound(nb);
+            if (compress2(p, &zc, body + soff, nb, 6) != Z_OK) {
+                fprintf(stderr, "compress2 seg %d failed\n", i); return -1;
+            }
+            c = (int)zc;
+        } else {
+            c = LZ4_compress_HC((const char *)body + soff, (char *)p,
+                                (int)nb, LZ4_compressBound((int)nb), LZ4_HC_LEVEL);
+            if (c <= 0) { fprintf(stderr, "LZ4_compress_HC seg %d rc=%d\n", i, c); return -1; }
+        }
+        clen[i] = (uint32_t)c;
+        p += c; soff += nb;
+    }
+    if (soff != PVS_FRAME_RAW) { fprintf(stderr, "test bug: seg sum != frame\n"); return -1; }
+    uint32_t *t = (uint32_t *)scratch;      /* 小端机, 直接写 u32 */
+    t[0] = (uint32_t)nseg;
+    for (int i = 0; i < nseg; i++) { t[1 + i * 2] = clen[i]; t[2 + i * 2] = (uint32_t)seg[i]; }
+    h.comp_len = (uint32_t)(p - scratch);
+    if (send_all(fd, &h, sizeof h) || send_all(fd, scratch, h.comp_len)) return -1;
+    sent_crc[n_sent++] = crc32(0L, raw, PVS_FRAME_RAW);
+    printf("test: sent frame %d MSTREAM n=%d flags=0x%x comp=%u crc=%08x\n",
+           n_sent - 1, nseg, h.flags, h.comp_len, sent_crc[n_sent - 1]);
     return 0;
 }
 
@@ -149,10 +217,13 @@ static int connect_retry(int port)
     return -1;
 }
 
-/* send a bare header, expect NAK then close (daemon NAKs before payload) */
-static int expect_nak_close(int fd, const pvs_hdr_t *h, const char *what)
+/* send a header (+ optional extra bytes, e.g. a bad MSTREAM stream table),
+ * expect NAK then close */
+static int expect_nak_close2(int fd, const pvs_hdr_t *h, const void *extra,
+                             size_t elen, const char *what)
 {
     if (send_all(fd, h, sizeof *h)) { fprintf(stderr, "FAIL: send hdr (%s)\n", what); return -1; }
+    if (elen && send_all(fd, extra, elen)) { fprintf(stderr, "FAIL: send extra (%s)\n", what); return -1; }
     uint8_t b; ssize_t n;
     do n = recv(fd, &b, 1, 0); while (n < 0 && errno == EINTR);
     if (n != 1 || b != PVS_NAK) {
@@ -163,6 +234,11 @@ static int expect_nak_close(int fd, const pvs_hdr_t *h, const char *what)
     if (n != 0) { fprintf(stderr, "FAIL: %s: connection not closed after NAK\n", what); return -1; }
     printf("test: NAK + close on %s OK\n", what);
     return 0;
+}
+
+static int expect_nak_close(int fd, const pvs_hdr_t *h, const char *what)
+{
+    return expect_nak_close2(fd, h, NULL, 0, what);
 }
 
 int main(void)
@@ -206,9 +282,39 @@ int main(void)
     gen_frame(raw, 3);
     if (send_frame(fd, raw, NULL, PVS_FLAG_ZLIB, xbuf, scratch) || recv_ack(fd)) goto out;
 
-    /* 4-6: DELTA chain vs the last ACKed frame (seed 3 is the reference).
+    /* 4-5: LZ4 raw block keyframe, 再跟一个 DELTA|LZ4 —— DELTA 位与压缩位
+     * 正交 (板端先按压缩位解码再 XOR), 所以这个组合必须与 DELTA|ZLIB 一样成立。*/
+    gen_frame(raw, 8);
+    if (send_frame(fd, raw, NULL, PVS_FLAG_LZ4, xbuf, scratch) || recv_ack(fd)) goto out;
+    memcpy(raw2, raw, PVS_FRAME_RAW);              /* prev = seed 8 */
+    gen_frame(raw, 9);
+    if (send_frame(fd, raw, raw2, PVS_FLAG_LZ4 | PVS_FLAG_DELTA, xbuf, scratch)
+        || recv_ack(fd)) goto out;
+
+    /* 5b-5e: MSTREAM 流表 —— 1/2/3 条流 + 一个 DELTA|MSTREAM。
+     * 单面 360 片, 所以 3 条流用 120/120/120, 2 条流用 180/180 (板端 dec_plan
+     * 会把 3 条连续分组成 240/120 —— 分组正确性由 daemon 日志的 decode plan
+     * 行体现, 这里保证的是「解出来逐字节没错」)。 */
+    {
+        static const int s1[] = { 360 }, s2[] = { 180, 180 }, s3[] = { 120, 120, 120 };
+        gen_frame(raw, 20);
+        if (send_mstream(fd, raw, NULL, PVS_FLAG_LZ4, s1, 1, xbuf, scratch)
+            || recv_ack(fd)) goto out;
+        gen_frame(raw, 21);
+        if (send_mstream(fd, raw, NULL, PVS_FLAG_LZ4, s2, 2, xbuf, scratch)
+            || recv_ack(fd)) goto out;
+        gen_frame(raw, 22);
+        if (send_mstream(fd, raw, NULL, PVS_FLAG_ZLIB, s3, 3, xbuf, scratch)
+            || recv_ack(fd)) goto out;
+        memcpy(raw2, raw, PVS_FRAME_RAW);          /* prev = seed 22 */
+        gen_frame(raw, 23);
+        if (send_mstream(fd, raw, raw2, PVS_FLAG_LZ4 | PVS_FLAG_DELTA, s3, 3,
+                         xbuf, scratch) || recv_ack(fd)) goto out;
+    }
+
+    /* 6-8: DELTA|ZLIB chain vs the last ACKed frame (seed 23 是参考帧).
      * Daemon must rebuild raw = prev ^ decoded; crc check below proves it. */
-    memcpy(raw2, raw, PVS_FRAME_RAW);              /* raw2 = prev (seed 3) */
+    memcpy(raw2, raw, PVS_FRAME_RAW);              /* raw2 = prev (seed 23) */
     for (uint32_t seed = 10; seed < 13; seed++) {
         gen_frame(raw, seed);
         if (send_frame(fd, raw, raw2, PVS_FLAG_ZLIB | PVS_FLAG_DELTA,
@@ -273,6 +379,51 @@ int main(void)
         fd = connect_retry(TEST_PORT);
         if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
         if (expect_nak_close(fd, &bad, "unknown flag bit")) goto out;
+        close(fd);
+    }
+
+    /* NAK 2b: 压缩位同时置 ZLIB|LZ4 -> 互斥 (protocol.h: 一帧只能有一个
+     * 压缩位)。板端按「codec_bits 是不是 2 的幂」判, 这条守着它。 */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
+        bad.n_slices = PVS_N_SLICES; bad.flags = PVS_FLAG_ZLIB | PVS_FLAG_LZ4;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "ZLIB|LZ4 both set")) goto out;
+        close(fd);
+    }
+
+    /* NAK 2c/2d: MSTREAM 流表的两个求和自校验。这两条是流表格式的命根子 ——
+     * 少了它们, 一条被截断/错位的载荷会解出半帧垃圾还照样 ACK。 */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.raw_len = PVS_FRAME_RAW; bad.n_slices = PVS_N_SLICES;
+        bad.flags = (uint16_t)(PVS_FLAG_LZ4 | PVS_FLAG_MSTREAM);
+        /* [u32 n=2][clen=100,nsl=180][clen=100,nsl=100] -> Σn_slices=280 != 360 */
+        uint32_t tbl[5] = { 2, 100, 180, 100, 100 };
+        bad.comp_len = 4 + 16 + 200;                  /* Σclen 对得上, 片数对不上 */
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close2(fd, &bad, tbl, sizeof tbl,
+                              "MSTREAM Σn_slices mismatch")) goto out;
+        close(fd);
+
+        tbl[2] = 180; tbl[4] = 180;                   /* 片数改对 (360) */
+        bad.comp_len = 4 + 16 + 199;                  /* Σcomp_len 差 1 字节 */
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close2(fd, &bad, tbl, sizeof tbl,
+                              "MSTREAM Σcomp_len mismatch")) goto out;
+        close(fd);
+
+        tbl[0] = PVS_MAX_STREAMS + 1;                 /* 流数越界 */
+        bad.comp_len = 4 + 16 + 200;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close2(fd, &bad, tbl, 4, "MSTREAM n_streams out of range")) goto out;
         close(fd);
     }
 

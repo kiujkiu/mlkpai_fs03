@@ -117,6 +117,24 @@
  *   - DDR 侧从双 bank 扩到**三 bank** (bank C 上线, 见上面的地址表)。
  *     ACK 与翻页的解耦 v2 就做了 (RX 解完立刻 ACK, 从不等翻页窗), v3.2 只是
  *     把 DDR 侧也补成三缓冲, 并在日志里把这件事显式化。
+ *   v3.3 (LZ4 顶掉 zlib, 12 fps -> 48 fps):
+ *   - 新增 PVS_FLAG_LZ4 (protocol.h bit5) = **LZ4 raw block**, 与 ZLIB/RLE
+ *     互斥。A9 实测 (anime_dual720.bin, 720 片双面 8847360 B, 单核):
+ *       zlib-6  376780 B 23.5x 163.5 ms  51.6 MB/s
+ *       lz4-HC9 388166 B 22.8x  41.2 ms 204.6 MB/s
+ *     压缩比只掉 3%, 解压快 4 倍。双面两条流照旧双核并行 -> ~20.6 ms/帧。
+ *   - 🔴 只认 raw block (LZ4_decompress_safe), 不认 CLI 的 .lz4 帧格式;
+ *     raw block 不带原长, dstCapacity 由 hdr.raw_len / 面长度给。
+ *   - liblz4 是**静态链**进来的 (deps/arm/liblz4.a), 理由见下面 #include。
+ *   - 老流 (ZLIB/RLE/raw) 逐字节不变: 压缩位没置 LZ4 就走原来的分支。
+ *   - PVS_FLAG_MSTREAM (bit6): 载荷改成「流表 + 可变条数独立流」, 因为并行
+ *     解码要按**工作量**切而不是按**面**切。fold540 (面A 折 180 + 面B 360)
+ *     按面切时两核 makespan 被面B 的 360 片封顶 = 20.6 ms; 切成
+ *     180/90/270 三条 (核0 拿前两条 = 270 片, 核1 拿第三条 = 270 片) 降到
+ *     15.47 ms。⚠ 顺带纠正一个旧说法: **FOLD_A 只省链路 (−31%), 解码一分钱
+ *     不省** —— 按面切的 makespan 由面B 封顶, 折不折叠一样。
+ *     分组必须**连续**不能轮转 (见 dec_plan)。没置 MSTREAM 的帧照旧走
+ *     「单流 / 按面两流」老分支, 逐字节不变。
  *   - 帧区映射优先走 /dev/povmem (povmem.ko, Write-Combine, memcpy 实效
  *     300-800 MB/s), 不在则回退 /dev/mem (Strongly-Ordered, 60-120 MB/s)。
  *     寄存器页永远走 /dev/mem (寄存器就该 SO)。
@@ -164,6 +182,24 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <zlib.h>
+/* ---- LZ4: 为什么是**静态链进来**而不是 dlopen / -l:liblz4.so.1 ------------
+ * 板上确实有 /usr/lib/arm-linux-gnueabihf/liblz4.so.1.8.3, 但没有开发包
+ * (apt 装不到 lz4/liblz4-dev)。三种接法只有一种在这里成立:
+ *   -llz4          ✗ 交叉环境没有 ARM 的 liblz4.so + lz4.h, 链不了。
+ *   -l:liblz4.so.1 ✗ 同上 (仍要一份 ARM 的 .so 在 sysroot 里), 而且本程序是
+ *                    **-static** 构建 (见 Makefile / README: "板子不需要任何
+ *                    工具链和匹配的 libz"), 静态可执行文件不能链动态库。
+ *   dlopen()       ✗ 静态链接的 glibc 里 dlopen 事实上不可用 (要求运行时有
+ *                    与构建时**完全同版本**的 libc.so, 否则直接失败), 为了一个
+ *                    编解码器把整个二进制改成动态 = 丢掉「板子零依赖」这条
+ *                    已经用了一年的性质, 还得赌板上 1.8.3 的 ABI。
+ *   deps/arm/liblz4.a  ✓ 与既有 deps/arm/libz.a 同一套做法: 交叉编译一份
+ *                    静态库committed 进仓库, 二进制自带解码器, 板上有没有
+ *                    liblz4 都无所谓, 也不受板上 1.8.3 这个老版本影响。
+ * 只用到 LZ4_decompress_safe() (板端只解不压), 但 .a 里两个 .o 都在, 链接器
+ * 只会拉进真正用到的那个。LZ4 raw block 的格式跨版本稳定, 所以 PC 侧
+ * liblz4 1.10.0 压的流, 这里 1.10.0 静态解, 与板上 1.8.3 也是互通的。 */
+#include <lz4.h>
 
 #include "../protocol.h"
 
@@ -215,14 +251,19 @@
 #define WIN_DUAL_CENTER    180                  /* second window @ slice 180 */
 #define FLIP_TIMEOUT_MS    2000                 /* engine idle? flip anyway */
 #define COMP_LEN_MAX       (PVS_FRAME_RAW_MAX + 0x10000u)
-#define DUAL_PFX_LEN       4u                   /* [u32 LE comp_len_A] */
-#define DEC_WORKERS        2                    /* 面A / 面B 各一个核 */
+#define DUAL_PFX_LEN       4u                   /* [u32 LE comp_len_A] (老两流格式) */
+#define MSTR_ENT_LEN       8u                   /* 流表一条 = {u32 comp_len, u32 n_slices} */
+#define MSTR_TBL_MAX       (4u + PVS_MAX_STREAMS * MSTR_ENT_LEN)   /* 132 B */
+#define DEC_WORKERS        2                    /* A9 双核 */
 /* PC 端 window=2 (最多 2 帧在途), 板端要能吸掉 ~1.5 帧压缩数据。双面实测
  * 约 300 KB/帧 -> 450 KB; 取 768 KB 留余量 (内核会 x2 记账)。 */
 #define RCVBUF_BYTES       (768 * 1024)
 #define RCVBUF_MIN_EFF     (450 * 1024)         /* 生效值低于此就告警 */
 #define PVS_FLAGS_KNOWN    (PVS_FLAG_RLE | PVS_FLAG_ZLIB | PVS_FLAG_DELTA | \
-                            PVS_FLAG_DUAL_FACE | PVS_FLAG_FOLD_A)
+                            PVS_FLAG_DUAL_FACE | PVS_FLAG_FOLD_A | PVS_FLAG_LZ4 | \
+                            PVS_FLAG_MSTREAM)
+/* 压缩位集合: 恰好置一位 (或一位都不置 = raw)。多于一位 = 非法帧 -> NAK。 */
+#define PVS_FLAGS_CODEC    (PVS_FLAG_RLE | PVS_FLAG_ZLIB | PVS_FLAG_LZ4)
 
 /* ---- logging ------------------------------------------------------------ */
 /* 单次 fputs 整行输出: RX/flip 两个线程并发打日志, 拼好再写才不串行 */
@@ -551,17 +592,35 @@ typedef struct {
     uint8_t       *dst;      /* staging 缓冲里本面的起点 */
     uint32_t       dst_len;  /* 本面解压后字节数 (必然是 0x3000 的整数倍) */
     const uint8_t *prev;     /* DELTA 参考帧里**同面同偏移**的位置; NULL=不做 */
-    uint32_t       codec;    /* PVS_FLAG_ZLIB / PVS_FLAG_RLE / 0 */
+    uint32_t       codec;    /* 🔴 这里存的是**协议 flag 位**, 不是 0/1/2 的枚举:
+                              * PVS_FLAG_ZLIB(2) / PVS_FLAG_RLE(1) / PVS_FLAG_LZ4(32)
+                              * / 0 = raw。踩过的坑: 曾经按「第几种编解码器」填
+                              * codec=1, 正好命中 PVS_FLAG_RLE, 于是每帧都拿 zlib
+                              * 流去跑 RLE 解码 —— 静默失败, 日志里一个字都没有。
+                              * 加新编解码器时**只**加 flag 位, 别改成序号。 */
     int            rc;       /* 0 = ok */
     char           err[80];
 } face_job_t;
 
-/* 纯函数: 只读 src/prev, 只写 dst。两个 job 并发跑没有共享状态。 */
+/* 纯函数: 只读 src/prev, 只写 dst。两个 job 并发跑没有共享状态。
+ * (LZ4_decompress_safe 与 zlib 的 uncompress 一样是无全局状态的纯函数。) */
 static void face_decode(face_job_t *j)
 {
     j->rc = 0;
     j->err[0] = '\0';
-    if (j->codec & PVS_FLAG_ZLIB) {
+    if (j->codec & PVS_FLAG_LZ4) {
+        /* raw block: 流里不带原长, dstCapacity 必须自己给 = 本面解压后字节数。
+         * 返回值 = 实际写出的字节数; < 0 = 流损坏 (最常见的是被喂了 .lz4
+         * **帧格式** —— 魔数 0x184D2204 会被当 token 解, 直接负数)。 */
+        int n = LZ4_decompress_safe((const char *)j->src, (char *)j->dst,
+                                    (int)j->src_len, (int)j->dst_len);
+        if (n < 0 || (uint32_t)n != j->dst_len) {
+            snprintf(j->err, sizeof j->err, "lz4 rc=%d want=%u (raw block?)",
+                     n, j->dst_len);
+            j->rc = -1;
+            return;
+        }
+    } else if (j->codec & PVS_FLAG_ZLIB) {
         uLongf dl = j->dst_len;
         int zr = uncompress(j->dst, &dl, j->src, j->src_len);
         if (zr != Z_OK || dl != j->dst_len) {
@@ -581,7 +640,45 @@ static void face_decode(face_job_t *j)
         xor_frame(j->dst, j->prev, j->dst_len);
 }
 
-static face_job_t g_job[DEC_WORKERS];
+/* ---- 把 N 条流静态派给 DEC_WORKERS 个核 --------------------------------
+ * 分组必须是**连续区间**, 不能轮转。反例: 三条流 180/90/270 片, 轮转会得到
+ * 核0={流0,流2}=450 片 / 核1={流1}=90 片, makespan 450 —— 比按面切还差;
+ * 连续分组能取到 {流0,流1}=270 / {流2}=270 的完美平衡 (makespan 270)。
+ * 权重用 dst_len (解压后字节数 ∝ 片数), 因为解压耗时基本正比于输出量。
+ * 纯静态派活, 不做工作窃取: 流表是发送端算好的, 板端不需要再猜。
+ */
+static void dec_plan(const face_job_t *j, int n, int *first, int *count)
+{
+    uint64_t total = 0, left;
+    if (n <= DEC_WORKERS) {              /* 流数不多于核数: 一核一条, 多的核闲着 */
+        for (int w = 0; w < DEC_WORKERS; w++) {
+            first[w] = w < n ? w : n;
+            count[w] = w < n ? 1 : 0;
+        }
+        return;
+    }
+    for (int i = 0; i < n; i++) total += j[i].dst_len;
+    left = total;
+    int i = 0;
+    for (int w = 0; w < DEC_WORKERS; w++) {
+        first[w] = i;
+        count[w] = 0;
+        int wleft = DEC_WORKERS - w;            /* 含本 worker 在内还剩几个 */
+        if (wleft == 1) { count[w] = n - i; break; }   /* 最后一个吃光 */
+        uint64_t target = left / (uint64_t)wleft, acc = 0;
+        while (i < n - (wleft - 1)) {           /* 每个后续 worker 至少留一条 */
+            uint64_t next = acc + j[i].dst_len;
+            /* 已经拿了东西, 再拿一条会越过 target 且离得更远 -> 停 */
+            if (acc && next > target && (next - target) > (target - acc)) break;
+            acc = next; count[w]++; i++;
+            if (acc >= target) break;
+        }
+        left -= acc;
+    }
+}
+
+static face_job_t g_job[PVS_MAX_STREAMS];
+static int        g_wfirst[DEC_WORKERS], g_wcount[DEC_WORKERS];
 static pthread_t  g_dec_tid[DEC_WORKERS];
 static pthread_mutex_t g_dmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_dc_start = PTHREAD_COND_INITIALIZER;
@@ -616,8 +713,10 @@ static void *dec_thread(void *arg)
             pthread_cond_wait(&g_dc_start, &g_dmu);
         if (g_stop) break;
         seen = g_dec_gen;
+        int f = g_wfirst[idx], c = g_wcount[idx];
         pthread_mutex_unlock(&g_dmu);
-        face_decode(&g_job[idx]);          /* 锁外跑, 两核真并行 */
+        for (int k = 0; k < c; k++)        /* 锁外跑, 两核真并行 */
+            face_decode(&g_job[f + k]);
         pthread_mutex_lock(&g_dmu);
         if (--g_dec_left == 0)
             pthread_cond_signal(&g_dc_done);
@@ -659,27 +758,76 @@ static void dec_pool_stop(void)
     g_dec_pool = 0;
 }
 
-/* 提交两个 job 并等它们跑完。池子没起来 / --decode serial 时就地串行跑,
- * 结果逐字节相同 (face_decode 是纯函数)。 */
-static int dec_run_pair(face_job_t *a, face_job_t *b)
+/* 提交 n 条流并等它们跑完 (n ∈ [1, PVS_MAX_STREAMS])。池子没起来 /
+ * --decode serial 时就地串行跑, 结果逐字节相同 (face_decode 是纯函数)。
+ * 返回 -1 = 有流解失败 (jobs[i].rc/err 里有细节)。 */
+static int dec_run(face_job_t *jobs, int n)
 {
     if (!g_dec_pool) {
-        face_decode(a);
-        face_decode(b);
+        for (int i = 0; i < n; i++) face_decode(&jobs[i]);
     } else {
         pthread_mutex_lock(&g_dmu);
-        g_job[0] = *a;
-        g_job[1] = *b;
+        for (int i = 0; i < n; i++) g_job[i] = jobs[i];
+        dec_plan(g_job, n, g_wfirst, g_wcount);
+        /* 派活方案变了才打一行 (26+ fps 下不刷屏)。上板调参时这一行是唯一能
+         * 看出「两个核到底各拿了多少片」的地方。 */
+        {
+            static int last_n = -1, last_c[DEC_WORKERS];
+            int changed = (last_n != n);
+            for (int w = 0; w < DEC_WORKERS; w++)
+                if (last_c[w] != g_wcount[w]) changed = 1;
+            if (changed) {
+                char line[160];
+                size_t k = 0;
+                for (int w = 0; w < DEC_WORKERS && k + 1 < sizeof line; w++) {
+                    uint64_t sl = 0;
+                    for (int i = 0; i < g_wcount[w]; i++)
+                        sl += g_job[g_wfirst[w] + i].dst_len / PVS_SLICE_STRIDE;
+                    if (g_wcount[w] == 0)
+                        k += (size_t)snprintf(line + k, sizeof line - k,
+                                              "%score%d=空闲", w ? ", " : "", w);
+                    else
+                        k += (size_t)snprintf(line + k, sizeof line - k,
+                                              "%score%d=流[%d..%d] %llu片", w ? ", " : "",
+                                              w, g_wfirst[w],
+                                              g_wfirst[w] + g_wcount[w] - 1,
+                                              (unsigned long long)sl);
+                }
+                logts("decode plan: %d 条流 -> %s", n, line);
+                last_n = n;
+                for (int w = 0; w < DEC_WORKERS; w++) last_c[w] = g_wcount[w];
+            }
+        }
         g_dec_left = DEC_WORKERS;
         g_dec_gen++;
         pthread_cond_broadcast(&g_dc_start);
         while (g_dec_left)
             pthread_cond_wait(&g_dc_done, &g_dmu);
-        *a = g_job[0];
-        *b = g_job[1];
+        for (int i = 0; i < n; i++) jobs[i] = g_job[i];
         pthread_mutex_unlock(&g_dmu);
     }
-    return (a->rc || b->rc) ? -1 : 0;
+    for (int i = 0; i < n; i++)
+        if (jobs[i].rc) return -1;
+    return 0;
+}
+
+/* FRAME 日志的解码标签: 流数 + 并行/串行。单流单面时留空 (与老日志一致)。 */
+static const char *dec_tag(uint32_t nstr, uint32_t face_b_off)
+{
+    static char tag[24];
+    uint32_t n = nstr ? nstr : (face_b_off ? 2u : 1u);
+    if (n < 2) return "";
+    snprintf(tag, sizeof tag, " %ustr/%s", n, g_dec_pool ? "par" : "ser");
+    return tag;
+}
+
+/* 出错时把每条流的状态拼成一行日志 (哪条流坏了要一眼看出来) */
+static void dec_errline(const face_job_t *jobs, int n, char *out, size_t cap)
+{
+    size_t k = 0;
+    for (int i = 0; i < n && k + 1 < cap; i++)
+        k += (size_t)snprintf(out + k, cap - k, "%s#%d:%s", i ? " | " : "", i,
+                              jobs[i].rc ? jobs[i].err : "ok");
 }
 
 /* ---- 空闲动画 (--idle-anim FILE) -----------------------------------------
@@ -712,6 +860,13 @@ static int idle_anim_load(const char *path)
     g_anim_n = h[0]; g_anim_slices = h[1]; g_anim_flags = h[2];
     g_anim_idx = h + 3;
     if (!g_anim_n || g_anim_slices > PVS_N_SLICES_MAX) { g_anim = NULL; return -1; }
+    /* 容器格式只覆盖「单流 / DUAL_FACE 两流」这两种排布 (下面 idle_anim_step
+     * 就是照着这两种写的)。带 MSTREAM 流表的载荷这里解不了 —— 与其静默解出
+     * 半帧垃圾, 不如当场拒掉。要用就重新打一份不带 MSTREAM 的容器。 */
+    if (g_anim_flags & PVS_FLAG_MSTREAM) {
+        logts("idle-anim: flags 带 PVS_FLAG_MSTREAM, 本容器路径不支持多流流表, 不播");
+        g_anim = NULL; return -1;
+    }
     logts("idle-anim: %s %u 帧 n_slices=%u flags=0x%x (%.1f MB) @ %.1f fps",
           path, g_anim_n, g_anim_slices, g_anim_flags,
           g_anim_sz / 1048576.0, g_idle_fps);
@@ -740,20 +895,20 @@ static void idle_anim_step(void)
         p0 += 4; len -= 4;
         if (!clen_a || clen_a >= len) return;
     }
-    face_job_t ja, jb;
-    memset(&ja, 0, sizeof ja); memset(&jb, 0, sizeof jb);
-    ja.src = p0;              ja.src_len = fbo ? clen_a : len;
-    ja.dst = g_wr.buf;        ja.dst_len = fbo ? fbo : raw_len;
-    uint32_t codec = g_anim_flags & (PVS_FLAG_RLE | PVS_FLAG_ZLIB);
-    ja.codec = codec;
+    face_job_t j2[2];
+    memset(j2, 0, sizeof j2);
+    j2[0].src = p0;              j2[0].src_len = fbo ? clen_a : len;
+    j2[0].dst = g_wr.buf;        j2[0].dst_len = fbo ? fbo : raw_len;
+    uint32_t codec = g_anim_flags & PVS_FLAGS_CODEC;   /* flag 位原样, 不是枚举 */
+    j2[0].codec = codec;
     if (fbo) {
-        jb.src = p0 + clen_a; jb.src_len = len - clen_a;
-        jb.dst = g_wr.buf + fbo; jb.dst_len = raw_len - fbo;
-        jb.codec = codec;
-        if (dec_run_pair(&ja, &jb) != 0) return;
+        j2[1].src = p0 + clen_a; j2[1].src_len = len - clen_a;
+        j2[1].dst = g_wr.buf + fbo; j2[1].dst_len = raw_len - fbo;
+        j2[1].codec = codec;
+        if (dec_run(j2, 2) != 0) return;
     } else {
-        face_decode(&ja);
-        if (ja.rc) return;
+        face_decode(&j2[0]);
+        if (j2[0].rc) return;
     }
 
     g_wr.raw_len = raw_len; g_wr.n_slices = g_anim_slices; g_wr.face_b_off = fbo;
@@ -913,16 +1068,19 @@ static int serve_client(int fd, uint8_t *cbuf)
         if (r <= 0) return r;
 
         /* 头校验 (v3.1): n_slices 是权威, raw_len 必须与它自洽; 不再硬比
-         * PVS_N_SLICES。未知 flag 仍用位掩码拒掉 (给未来留位), RLE+ZLIB 互斥。
+         * PVS_N_SLICES。未知 flag 仍用位掩码拒掉 (给未来留位)。
+         * 压缩位互斥 (RLE/ZLIB/LZ4 最多置一位): v3.3 加 LZ4 后从「两两比较」
+         * 改成数位数, 免得以后再加编解码器时漏掉某一对组合。
          * 注意用 uint32_t 算长度: 720*0x3000 = 8847360, u16 会溢出。 */
         uint32_t n_slices = h.n_slices;
         uint32_t need_raw = n_slices * (uint32_t)PVS_SLICE_STRIDE;
+        uint32_t codec_bits = h.flags & PVS_FLAGS_CODEC;
         if (memcmp(h.magic, PVS_MAGIC, 4) != 0 ||
             n_slices < 1 || n_slices > PVS_N_SLICES_MAX ||
             h.raw_len != need_raw               ||
             h.comp_len == 0 || h.comp_len > COMP_LEN_MAX ||
             (h.flags & ~PVS_FLAGS_KNOWN) != 0   ||
-            ((h.flags & PVS_FLAG_RLE) && (h.flags & PVS_FLAG_ZLIB))) {
+            (codec_bits & (codec_bits - 1)) != 0) {
             logts("NAK: bad header (magic=%.4s comp=%u raw=%u n=%u flags=0x%x)",
                   h.magic, h.comp_len, h.raw_len, h.n_slices, h.flags);
             send_byte(fd, PVS_NAK);
@@ -970,16 +1128,73 @@ static int serve_client(int fd, uint8_t *cbuf)
             return -1;
         }
 
-        /* ---- 载荷排布 (protocol.h v3.2) -----------------------------------
-         *   单面: [压缩流]                            comp_len = 流长度
-         *   双面: [u32 LE comp_len_A][面A 流][面B 流]  comp_len 含这 4 字节
-         * 未压缩帧直接收进 g_wr.buf (双面时 A/B 连着收就正好是解压后的排布)。
+        /* ---- 载荷排布 (protocol.h v3.3) -----------------------------------
+         *   单面:    [压缩流]                            comp_len = 流长度
+         *   双面:    [u32 LE comp_len_A][面A 流][面B 流]  comp_len 含这 4 字节
+         *   MSTREAM: [u32 n][n×{u32 clen,u32 nsl}][流 0..n-1]  (取代上面的 4B 前缀)
+         * 未压缩帧直接收进 g_wr.buf (前缀/流表另收到小缓冲, 剩下的连着收就正好
+         * 是解压后的排布)。
          */
-        int comp = h.flags & (PVS_FLAG_RLE | PVS_FLAG_ZLIB);
-        uint32_t body_len = h.comp_len;      /* 去掉 4B 前缀后的净载荷 */
+        /* comp = 本帧的**压缩 flag 位** (0 = raw), 原样传给 face_job_t.codec */
+        int comp = (int)codec_bits;
+        uint32_t body_len = h.comp_len;      /* 去掉前缀/流表后的净载荷 */
         uint32_t clen_a = 0, clen_b = 0;
+        uint32_t nstr = 0;                   /* >0 = 走 MSTREAM 流表 */
+        uint32_t s_clen[PVS_MAX_STREAMS], s_nsl[PVS_MAX_STREAMS];
 
-        if (face_b_off) {
+        if (h.flags & PVS_FLAG_MSTREAM) {
+            /* 流表: 先收 4B 条数, 再收 n*8 的表体。两个求和校验一个都不能省 ——
+             * 少了它们, 一条被截断的载荷会解出半帧垃圾还照样 ACK。 */
+            uint8_t tbl[PVS_MAX_STREAMS * MSTR_ENT_LEN];
+            uint8_t n4[4];
+            if (h.comp_len < 4u + MSTR_ENT_LEN + 1u) {
+                logts("NAK: MSTREAM comp_len=%u 装不下流表", h.comp_len);
+                send_byte(fd, PVS_NAK);
+                return -1;
+            }
+            r = recv_full(fd, n4, 4);
+            if (r <= 0) return r;
+            nstr = (uint32_t)n4[0] | ((uint32_t)n4[1] << 8) |
+                   ((uint32_t)n4[2] << 16) | ((uint32_t)n4[3] << 24);
+            if (nstr < 1 || nstr > PVS_MAX_STREAMS) {
+                logts("NAK: MSTREAM n_streams=%u 越界 (1..%d)", nstr, PVS_MAX_STREAMS);
+                send_byte(fd, PVS_NAK);
+                return -1;
+            }
+            uint32_t tlen = nstr * MSTR_ENT_LEN;
+            if (h.comp_len < 4u + tlen + nstr) {   /* 每条流至少 1 字节 */
+                logts("NAK: MSTREAM comp_len=%u < 4+%u+%u", h.comp_len, tlen, nstr);
+                send_byte(fd, PVS_NAK);
+                return -1;
+            }
+            r = recv_full(fd, tbl, tlen);
+            if (r <= 0) return r;
+            uint64_t sum_c = 0, sum_s = 0;
+            int bad_ent = 0;
+            for (uint32_t i = 0; i < nstr; i++) {
+                const uint8_t *e = tbl + i * MSTR_ENT_LEN;
+                s_clen[i] = (uint32_t)e[0] | ((uint32_t)e[1] << 8) |
+                            ((uint32_t)e[2] << 16) | ((uint32_t)e[3] << 24);
+                s_nsl[i]  = (uint32_t)e[4] | ((uint32_t)e[5] << 8) |
+                            ((uint32_t)e[6] << 16) | ((uint32_t)e[7] << 24);
+                if (s_clen[i] == 0 || s_nsl[i] == 0) bad_ent = 1;
+                /* raw 帧: 每条流就是原始数据, 压缩长度必须 == 解压长度 */
+                if (!comp && s_clen[i] != s_nsl[i] * (uint32_t)PVS_SLICE_STRIDE)
+                    bad_ent = 1;
+                sum_c += s_clen[i];
+                sum_s += s_nsl[i];
+            }
+            body_len = h.comp_len - 4u - tlen;
+            if (bad_ent || sum_c != body_len || sum_s != n_slices) {
+                logts("NAK: MSTREAM 流表不自洽 (n=%u Σclen=%llu want %u, "
+                      "Σn_slices=%llu want %u%s)", nstr,
+                      (unsigned long long)sum_c, body_len,
+                      (unsigned long long)sum_s, n_slices,
+                      bad_ent ? ", 有空流/raw 长度不符" : "");
+                send_byte(fd, PVS_NAK);
+                return -1;
+            }
+        } else if (face_b_off) {
             uint8_t pfx[DUAL_PFX_LEN];
             if (h.comp_len < DUAL_PFX_LEN + 2) {   /* 两条流至少各 1 字节 */
                 logts("NAK: DUAL_FACE comp_len=%u too short for [u32][A][B]",
@@ -1016,34 +1231,51 @@ static int serve_client(int fd, uint8_t *cbuf)
 
         long dec_t0 = mono_us();
 
-        if (face_b_off) {
-            /* 双面: 两条独立流 -> 两个 job -> 两个核。各面各自 XOR 上一帧的
-             * 同面数据 (参考帧布局已在头校验里确认与本帧一致)。 */
+        if (nstr || face_b_off) {
+            /* 多条独立流 -> 多个 job -> dec_plan 按片数摊到两个核。
+             * 每条流各自 XOR 参考帧里**同偏移**的那一段 (参考帧布局已在头校验
+             * 里确认与本帧一致); 流的边界是片边界, 逐字节 XOR 天然对齐。
+             * nstr==0 时就是老的「按面切两条」, 等价于 nstr==2 的特例。 */
             const uint8_t *ref = (h.flags & PVS_FLAG_DELTA) ? g_prev : NULL;
-            face_job_t ja, jb;
-            memset(&ja, 0, sizeof ja);
-            memset(&jb, 0, sizeof jb);
-            ja.src     = comp ? cbuf : NULL;
-            ja.src_len = clen_a;
-            ja.dst     = g_wr.buf;
-            ja.dst_len = face_b_off;
-            ja.prev    = ref;
-            ja.codec   = (uint32_t)comp;
-            jb.src     = comp ? cbuf + clen_a : NULL;
-            jb.src_len = clen_b;
-            jb.dst     = g_wr.buf + face_b_off;
-            jb.dst_len = h.raw_len - face_b_off;
-            jb.prev    = ref ? ref + face_b_off : NULL;
-            jb.codec   = (uint32_t)comp;
-            if (dec_run_pair(&ja, &jb) != 0) {
-                logts("NAK: dual-face decode failed (A: %s | B: %s)",
-                      ja.rc ? ja.err : "ok", jb.rc ? jb.err : "ok");
+            face_job_t jobs[PVS_MAX_STREAMS];
+            uint32_t n = nstr ? nstr : 2u;
+            uint32_t cl[2] = { clen_a, clen_b };
+            uint32_t dl[2] = { face_b_off, h.raw_len - face_b_off };
+            uint32_t soff = 0, doff = 0;
+            memset(jobs, 0, sizeof jobs);
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t clen = nstr ? s_clen[i] : cl[i];
+                uint32_t dlen = nstr ? s_nsl[i] * (uint32_t)PVS_SLICE_STRIDE : dl[i];
+                jobs[i].src     = comp ? cbuf + soff : NULL;
+                jobs[i].src_len = clen;
+                jobs[i].dst     = g_wr.buf + doff;
+                jobs[i].dst_len = dlen;
+                jobs[i].prev    = ref ? ref + doff : NULL;
+                jobs[i].codec   = (uint32_t)comp;
+                soff += clen;
+                doff += dlen;
+            }
+            if (dec_run(jobs, (int)n) != 0) {
+                char why[256];
+                dec_errline(jobs, (int)n, why, sizeof why);
+                logts("NAK: %u-stream decode failed (%s)", n, why);
                 send_byte(fd, PVS_NAK);
                 return -1;
             }
         } else {
             /* 单面: 与 v2 完全同一条路径 (不过线程池, 不多一次交接) */
-            if (h.flags & PVS_FLAG_ZLIB) {
+            if (h.flags & PVS_FLAG_LZ4) {
+                /* raw block: dstCapacity = hdr.raw_len (流里不带原长) */
+                int n = LZ4_decompress_safe((const char *)cbuf,
+                                            (char *)g_wr.buf,
+                                            (int)h.comp_len, (int)h.raw_len);
+                if (n < 0 || (uint32_t)n != h.raw_len) {
+                    logts("NAK: lz4 decode failed (rc=%d want=%u; 载荷必须是 "
+                          "raw block, 不是 .lz4 帧格式)", n, h.raw_len);
+                    send_byte(fd, PVS_NAK);
+                    return -1;
+                }
+            } else if (h.flags & PVS_FLAG_ZLIB) {
                 uLongf dlen = h.raw_len;
                 int zr = uncompress(g_wr.buf, &dlen, cbuf, h.comp_len);
                 if (zr != Z_OK || dlen != h.raw_len) {
@@ -1096,11 +1328,11 @@ static int serve_client(int fd, uint8_t *cbuf)
         if (g_crc_on)
             logts("FRAME seq=%u n=%u comp=%u flags=0x%x crc=%08x dec=%.1fms%s",
                   seq++, n_slices, h.comp_len, h.flags, crc, dec_us / 1000.0,
-                  face_b_off ? (g_dec_pool ? " par" : " ser") : "");
+                  dec_tag(nstr, face_b_off));
         else
             logts("FRAME seq=%u n=%u comp=%u flags=0x%x dec=%.1fms%s",
                   seq++, n_slices, h.comp_len, h.flags, dec_us / 1000.0,
-                  face_b_off ? (g_dec_pool ? " par" : " ser") : "");
+                  dec_tag(nstr, face_b_off));
         if (g_stop) return -1;
     }
 }

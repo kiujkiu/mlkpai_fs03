@@ -2,14 +2,50 @@
 
 TCP daemon for the Zynq-7020 (MLKPAI-FS03, Debian buster, kernel 6.6) that
 receives compressed POV frames from the PC sender
-(`stream/pc/povstream.py`), decompresses them (zlib / RLE / raw, 可选
+(`stream/pc/povstream.py`), decompresses them (LZ4 / zlib / RLE / raw, 可选
 DELTA 帧间差分), and flips the PL POV engine (`0x40010000`) between two
 reserved-DDR banks inside a flip window so the display never glitches or
 blocks.
 
 Protocol: [`stream/protocol.h`](../protocol.h) +
-[`stream/pc/protocol.md`](../pc/protocol.md) (PVS1: 16 B header, zlib
-default / zero-run RLE / raw, flags bit2 = DELTA, 1-byte ACK per frame).
+[`stream/pc/protocol.md`](../pc/protocol.md) (PVS1: 16 B header, LZ4 /
+zlib / zero-run RLE / raw, flags bit2 = DELTA, 1-byte ACK per frame).
+
+## LZ4 (2026-08-04, v3.3): 12 fps → 48 fps
+
+瓶颈一直在**板端解压**，不在链路。A9 单核实测 (`anime_dual720.bin`,
+720 片双面 8,847,360 B): zlib-6 = 376,780 B / 163.5 ms / 51.6 MB/s，
+lz4-HC9 = 388,166 B / 41.2 ms / 204.6 MB/s —— 压缩比只掉 3%，解压快 4×。
+`DUAL_FACE` 的两条流照旧双核并行 ⇒ ≈20.6 ms/帧 ⇒ **48 fps**。
+发送端: `povstream.py stream --codec lz4`（默认仍是 zlib，老的 `frames_*`
+目录行为逐字节不变）。级别默认 **HC12**（比 HC9 小 4.5%，甚至比 zlib-6 还小）；
+⚠ **HC10 实测比 HC9 差 6.4%，跳过 10**；HC12 编码 ≈1 s/帧 ⇒ 只能走 `--dir`
+离线预压缩，现渲直推会被编码封顶。
+
+## MSTREAM (bit6): 按工作量切流，不是按面切
+
+`DUAL_FACE|FOLD_A`（面A 折 180 + 面B 360）按面切时两条流是 1:2，双核压不平：
+makespan 被面B 的 360 片封顶 = 20.6 ms。切成 **180/90/270 三条**（`dec_plan` 连续
+分组 → 核0 拿前两条 = 270 片，核1 拿第三条 = 270 片）降到 **15.47 ms**，
+代价只有 +480 B（+0.18%）。
+⚠ 顺带纠正一个旧说法：**`FOLD_A` 只省链路（−31%），解码一分钱不省** —— 按面切的
+makespan 由面B 封顶，折不折叠都一样。
+
+载荷 = `[u32 n][n×{u32 comp_len_i, u32 n_slices_i}][流…]`，两个求和自校验
+（`Σcomp_len` / `Σn_slices`）不符一律 NAK。**分组必须连续不能轮转**（轮转会得到
+450/90，比按面切还差）。没置 `MSTREAM` 的帧照旧走单流/按面两流老分支。
+发送端: `povstream.py stream --stream-split balanced`（默认 `face` = 老行为）。
+日志里 `decode plan: 3 条流 -> core0=流[0..1] 270片, core1=流[2..2] 270片` 一行
+就是派活结果，上板调参看它。
+
+🔴 只认 **LZ4 raw block**（`LZ4_decompress_safe`），不认 `lz4` 命令行那种
+`.lz4` 帧格式（带 `0x184D2204` 魔数 + xxhash，会被当 token 解出负数）。
+raw block 不带原长，`dstCapacity` 由 `hdr.raw_len` / 各面的 `nX*0x3000` 给。
+
+**liblz4 是静态链进来的**（`deps/arm/liblz4.a`，lz4 1.10.0 交叉编译，与
+`libz.a` 同一套做法）。板上虽然有 `liblz4.so.1.8.3`，但没有开发包，而且这里
+的 ARM 产物是 `-static` 的：静态可执行文件不能 `-l:liblz4.so.1`，静态 glibc
+下 `dlopen()` 也基本不可用。详见 `pov_rxd.c` 里 `#include <lz4.h>` 上方的注释。
 
 v2 design: `docs/design_icnd2047/04_sw_stream_26fps.md` §3 — 三缓冲 +
 RX/flip 双线程 (ACK 与翻页解耦), DELTA 重建, WC 映射 (povmem.ko), 半圈
@@ -50,9 +86,14 @@ make ko         # povmem.ko - needs board kernel headers, see povmem/Makefile
 ```
 
 The ARM binaries are fully **static** (glibc + `deps/arm/libz.a`, zlib
-1.3.1 cross-built, prebuilt copy committed; `make deps` re-fetches/rebuilds
-it), so the board needs no toolchain and no matching libz. NEON is enabled
+1.3.1 + `deps/arm/liblz4.a`, lz4 1.10.0, both cross-built with prebuilt
+copies committed; `make deps` / `make deps-lz4` re-fetch/rebuild them), so
+the board needs no toolchain and no matching libz/liblz4. NEON is enabled
 (`-mfpu=neon`, Zynq A9 has it) for the DELTA XOR loop.
+
+x86 的 `make sim` / `make test` 用 `-l:liblz4.so.1` 直接点 soname，所以
+**只要运行时包 `liblz4-1`**，不需要 `liblz4-dev`（`-llz4` 才要 dev 包装的
+`liblz4.so` 符号链接）；头文件借 `deps/arm/lz4.h`（纯 C 头，与架构无关）。
 
 `povmem.ko` cannot be built on the dev machine without the board kernel
 tree (6.6.0-xilinx headers): `make -C povmem KDIR=~/mlkpai-kernel/linux-xlnx
