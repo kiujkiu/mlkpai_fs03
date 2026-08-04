@@ -1,0 +1,14 @@
+STEP0 connect
+STEP1 �? Cortex-A9 #0
+STEP1a 核已�?
+  stop 警告: Already stopped
+STEP1b �? stop (跳过 rst -processor)
+STEP2-pre source ps7_init.tcl
+STEP2 �? ps7_init (DDR/MIO/时钟) �? 若卡这里=DDR配置不�??
+STEP3 ps7_init 完成! 开�? DDR 读写
+  DDR 0x00100000 = 0xA5A5A5A5 OK
+  DDR 0x10000000 = 0xDEADBEEF OK
+  DDR 0x1FF00000 = 0xCAFEBABE OK
+STEP4 块测�? 8 �?
+  �?: 8/8 OK
+RESULT �? DDR 跑�?

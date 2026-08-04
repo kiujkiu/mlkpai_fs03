@@ -531,7 +531,7 @@ static int g_diag = 1;                       /* --diag off 关掉 DIAG 行 */
  * 用来回答「那次拷贝到底吃掉多少解码吞吐」—— 两个解码核和 flip 线程在
  * 同一颗双核 A9 上抢内存带宽, 拷贝的代价不是它自己那几十毫秒而已。 */
 static int g_nocopy = 0;
-static unsigned long g_w_dec_us, g_w_dec_max, g_w_a_us, g_w_b_us, g_w_dec_n;
+static unsigned long g_w_dec_us, g_w_dec_max, g_w_c0_us, g_w_c1_us, g_w_dec_n;
 static unsigned long g_w_cpy_us, g_w_cpy_max, g_w_wait_us, g_w_wait_max, g_w_cpy_n;
 /* 引擎转速: flip 线程等翻页窗时本来就在死盯 slice_idx, 顺手算转速。
  * ⚠ 不能数 wrap 次数 —— 轮询循环**正是被一次回绕(slice 进窗)终止的**, 采样
@@ -992,7 +992,7 @@ static void *flip_thread(void *arg)
                     double dt = (now - stat_t0) / 1000.0;
                     unsigned long dn = g_w_dec_n, cn = g_w_cpy_n;
                     logts("DIAG %.1fs eng=%.1frev/s rx=%.2f/s flip=%.2f/s drop=%u | "
-                          "dec %.1f/%.1fms (A %.1f B %.1f) | cpy %.1f/%.1fms | "
+                          "dec %.1f/%.1fms (core0 %.1f core1 %.1f) | cpy %.1f/%.1fms | "
                           "wait %.1f/%.1fms",
                           dt,
                           g_w_poll_us ? g_w_adv * 1e6 / n_eng / g_w_poll_us : 0.0,
@@ -1000,14 +1000,14 @@ static void *flip_thread(void *arg)
                           g_st_drop,
                           dn ? g_w_dec_us / (double)dn / 1000.0 : 0.0,
                           g_w_dec_max / 1000.0,
-                          dn ? g_w_a_us / (double)dn / 1000.0 : 0.0,
-                          dn ? g_w_b_us / (double)dn / 1000.0 : 0.0,
+                          dn ? g_w_c0_us / (double)dn / 1000.0 : 0.0,
+                          dn ? g_w_c1_us / (double)dn / 1000.0 : 0.0,
                           cn ? g_w_cpy_us / (double)cn / 1000.0 : 0.0,
                           g_w_cpy_max / 1000.0,
                           cn ? g_w_wait_us / (double)cn / 1000.0 : 0.0,
                           g_w_wait_max / 1000.0);
                 }
-                g_w_dec_us = g_w_dec_max = g_w_a_us = g_w_b_us = g_w_dec_n = 0;
+                g_w_dec_us = g_w_dec_max = g_w_c0_us = g_w_c1_us = g_w_dec_n = 0;
                 g_w_cpy_us = g_w_cpy_max = g_w_wait_us = g_w_wait_max = g_w_cpy_n = 0;
                 g_w_poll_us = g_w_adv = 0;
             }
@@ -1316,7 +1316,12 @@ static int serve_client(int fd, uint8_t *cbuf)
         if (r <= 0) return r;
 
         long dec_t0 = mono_us();
-        long face_a_us = 0, face_b_us = 0;   /* 诊断: 两条流各自的解码耗时 */
+        /* 🔴 诊断口径: **每个解码核的墙钟**, 不是"每一面"。
+         * MSTREAM 之后流数可变(1..16), "面A/面B"这个概念不再成立; 而决定
+         * 帧率的本来就是两个核的 makespan。合并两条分支时这里出过错 ——
+         * 诊断分支写的是 ja.us/jb.us(固定两个 job), 而 lz4 分支已经把两 job
+         * 换成了可变长 jobs[] + dec_plan, 文本能合但编译不过。 */
+        long core0_us = 0, core1_us = 0;
 
         if (nstr || face_b_off) {
             /* 多条独立流 -> 多个 job -> dec_plan 按片数摊到两个核。
@@ -1349,7 +1354,17 @@ static int serve_client(int fd, uint8_t *cbuf)
                 send_byte(fd, PVS_NAK);
                 return -1;
             }
-            face_a_us = ja.us; face_b_us = jb.us;
+            /* dec_plan 是纯函数, 这里再算一次拿分组, 把各核负责的流累加起来 */
+            {
+                int wf[DEC_WORKERS], wc[DEC_WORKERS];
+                long sum[DEC_WORKERS] = { 0 };
+                dec_plan(jobs, (int)n, wf, wc);
+                for (int w = 0; w < DEC_WORKERS; w++)
+                    for (int i = wf[w]; i < wf[w] + wc[w]; i++)
+                        sum[w] += jobs[i].us;
+                core0_us = sum[0];
+                core1_us = DEC_WORKERS > 1 ? sum[1] : 0;
+            }
         } else {
             /* 单面: 与 v2 完全同一条路径 (不过线程池, 不多一次交接) */
             if (h.flags & PVS_FLAG_LZ4) {
@@ -1388,8 +1403,8 @@ static int serve_client(int fd, uint8_t *cbuf)
         long dec_us = mono_us() - dec_t0;   /* 解码耗时: 不含 crc, 不含翻页 */
         g_w_dec_us += (unsigned long)dec_us;
         if ((unsigned long)dec_us > g_w_dec_max) g_w_dec_max = (unsigned long)dec_us;
-        g_w_a_us += (unsigned long)face_a_us;
-        g_w_b_us += (unsigned long)face_b_us;
+        g_w_c0_us += (unsigned long)core0_us;
+        g_w_c1_us += (unsigned long)core1_us;
         g_w_dec_n++;
 
         uint32_t crc = 0;
