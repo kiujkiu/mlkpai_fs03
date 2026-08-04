@@ -696,6 +696,7 @@ static size_t   g_anim_sz;
 static uint32_t g_anim_n, g_anim_slices, g_anim_flags, g_anim_cur;
 static const uint32_t *g_anim_idx;   /* 指向容器里的 (off,len) 表 */
 static double   g_idle_fps = 8.0;
+static long     idle_t0;        /* 上一帧起点, 用于扣掉解码耗时算等待 */
 
 static int idle_anim_load(const char *path)
 {
@@ -1252,10 +1253,15 @@ int main(int argc, char **argv)
         /* 无客户端时播空闲动画: poll 超时驱动帧率, 有连接立刻让位。
          * 不用阻塞 accept 是为了在等连接的同时还能出画面。 */
         if (g_anim) {
+            /* ⚠ 节奏必须**减去解码耗时**再等: 早先写成固定等 1000/fps 再解码,
+             * 两段时间相加 -> 实际帧率只有目标的一半 (11fps 目标实测 6fps)。 */
             struct pollfd pfd = { lfd, POLLIN, 0 };
-            int wait_ms = (int)(1000.0 / (g_idle_fps > 0.1 ? g_idle_fps : 0.1));
+            long period_us = (long)(1000000.0 / (g_idle_fps > 0.1 ? g_idle_fps : 0.1));
+            long spent_us  = mono_us() - idle_t0;
+            int  wait_ms   = (int)((period_us - spent_us) / 1000);
+            if (wait_ms < 1) wait_ms = 1;          /* 解码已超预算 -> 立刻再来一帧 */
             int pr = poll(&pfd, 1, wait_ms);
-            if (pr == 0) { idle_anim_step(); continue; }   /* 超时 = 没人连 -> 播一帧 */
+            if (pr == 0) { idle_t0 = mono_us(); idle_anim_step(); continue; }
             if (pr < 0) { if (errno == EINTR) continue; perror("poll"); break; }
         }
         int cfd = accept(lfd, (struct sockaddr *)&peer, &plen);
