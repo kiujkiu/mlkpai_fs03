@@ -515,6 +515,30 @@ static int g_swap_faces = 0;     /* --swap-faces: 两面数据对调到另一块
 static unsigned g_st_rx, g_st_flip, g_st_drop, g_st_forced;
 static unsigned long g_st_dec_us;
 
+/* ---- 诊断计数器 (2026-08-04 丢帧/端到端帧率排查) --------------------------
+ * 老 STAT 行只有 dec_avg, 而且是**自启动以来的累计均值** —— 跑上几百帧后对
+ * 参数变化完全钝感 (换一档要等好久才看得出差别), 也看不见时间花在哪一段。
+ * 这里补一组**每个统计窗内清零**的量, 把一帧的开销拆开:
+ *   dec   RX 线程解码 (zlib + DELTA XOR), 双面时 = max(面A, 面B)
+ *   A/B   两条流各自的解码耗时 —— 双核是否真的对半分, 一眼可见
+ *   cpy   flip 线程 memcpy 8.85 MB 进 DDR bank (WC/SO 差 5-10 倍)
+ *   wait  flip 线程等翻页窗的时间 (引擎没转时会顶到 FLIP_TIMEOUT_MS)
+ * 只加计数与打印, 不碰编解码/翻页逻辑。--diag off 可关掉那一行。
+ */
+static int g_diag = 1;                       /* --diag off 关掉 DIAG 行 */
+/* --diag-nocopy: **只用于消融实验**, 跳过 flip 线程那次 8.85 MB 的
+ * staging->DDR bank memcpy (画面因此不再更新, 但 rx/解码路径逐字节不变)。
+ * 用来回答「那次拷贝到底吃掉多少解码吞吐」—— 两个解码核和 flip 线程在
+ * 同一颗双核 A9 上抢内存带宽, 拷贝的代价不是它自己那几十毫秒而已。 */
+static int g_nocopy = 0;
+static unsigned long g_w_dec_us, g_w_dec_max, g_w_a_us, g_w_b_us, g_w_dec_n;
+static unsigned long g_w_cpy_us, g_w_cpy_max, g_w_wait_us, g_w_wait_max, g_w_cpy_n;
+/* 引擎转速: flip 线程等翻页窗时本来就在死盯 slice_idx, 顺手算转速。
+ * ⚠ 不能数 wrap 次数 —— 轮询循环**正是被一次回绕(slice 进窗)终止的**, 采样
+ * 区间的端点由事件本身定义, 数出来必然偏大 (实测 16 rps 报成 34.8)。改成
+ * **积分 slice 增量**: rev/s = Σ(slice 增量)/每圈片数/轮询时长, 与端点无关。 */
+static unsigned long g_w_poll_us, g_w_adv;
+
 
 /* ---- socket helpers ------------------------------------------------------ */
 static int recv_full(int fd, void *buf, size_t len)
@@ -599,6 +623,7 @@ typedef struct {
                               * 流去跑 RLE 解码 —— 静默失败, 日志里一个字都没有。
                               * 加新编解码器时**只**加 flag 位, 别改成序号。 */
     int            rc;       /* 0 = ok */
+    long           us;       /* 诊断: 本面实际解码耗时 (µs) */
     char           err[80];
 } face_job_t;
 
@@ -606,6 +631,7 @@ typedef struct {
  * (LZ4_decompress_safe 与 zlib 的 uncompress 一样是无全局状态的纯函数。) */
 static void face_decode(face_job_t *j)
 {
+    long t_face = mono_us();
     j->rc = 0;
     j->err[0] = '\0';
     if (j->codec & PVS_FLAG_LZ4) {
@@ -627,17 +653,20 @@ static void face_decode(face_job_t *j)
             snprintf(j->err, sizeof j->err, "zlib rc=%d dlen=%lu want=%u",
                      zr, (unsigned long)dl, j->dst_len);
             j->rc = -1;
+            j->us = mono_us() - t_face;
             return;
         }
     } else if (j->codec & PVS_FLAG_RLE) {
         if (rle_decode(j->src, j->src_len, j->dst, j->dst_len) != 0) {
             snprintf(j->err, sizeof j->err, "RLE decode failed");
             j->rc = -1;
+            j->us = mono_us() - t_face;
             return;
         }
     }
     if (j->prev)
         xor_frame(j->dst, j->prev, j->dst_len);
+    j->us = mono_us() - t_face;
 }
 
 /* ---- 把 N 条流静态派给 DEC_WORKERS 个核 --------------------------------
@@ -945,6 +974,7 @@ static void *flip_thread(void *arg)
     (void)arg;
     int active = 0;              /* 当前显示 bank (main 启动时已指向 bank A) */
     int last_flip_win = -1;      /* 上次翻页所在窗口 id (-1 = 无约束) */
+    uint32_t n_eng = PVS_N_SLICES;   /* 引擎每圈片数 (诊断算转速用) */
     long stat_t0 = mono_ms();
     unsigned stat_rx0 = 0, stat_flip0 = 0;
 
@@ -953,10 +983,34 @@ static void *flip_thread(void *arg)
         long now = mono_ms();
         if (now - stat_t0 >= 1000) {
             unsigned rx = g_st_rx, fl = g_st_flip;
-            if (rx != stat_rx0 || fl != stat_flip0)
+            if (rx != stat_rx0 || fl != stat_flip0) {
                 logts("STAT rx=%u flip=%u drop=%u forced=%u dec_avg=%.1fms",
                       rx, fl, g_st_drop, g_st_forced,
                       rx ? (double)g_st_dec_us / rx / 1000.0 : 0.0);
+                /* 窗内瞬时值: 累计均值对变化钝感, 排查参数时看这行 */
+                if (g_diag) {
+                    double dt = (now - stat_t0) / 1000.0;
+                    unsigned long dn = g_w_dec_n, cn = g_w_cpy_n;
+                    logts("DIAG %.1fs eng=%.1frev/s rx=%.2f/s flip=%.2f/s drop=%u | "
+                          "dec %.1f/%.1fms (A %.1f B %.1f) | cpy %.1f/%.1fms | "
+                          "wait %.1f/%.1fms",
+                          dt,
+                          g_w_poll_us ? g_w_adv * 1e6 / n_eng / g_w_poll_us : 0.0,
+                          (rx - stat_rx0) / dt, (fl - stat_flip0) / dt,
+                          g_st_drop,
+                          dn ? g_w_dec_us / (double)dn / 1000.0 : 0.0,
+                          g_w_dec_max / 1000.0,
+                          dn ? g_w_a_us / (double)dn / 1000.0 : 0.0,
+                          dn ? g_w_b_us / (double)dn / 1000.0 : 0.0,
+                          cn ? g_w_cpy_us / (double)cn / 1000.0 : 0.0,
+                          g_w_cpy_max / 1000.0,
+                          cn ? g_w_wait_us / (double)cn / 1000.0 : 0.0,
+                          g_w_wait_max / 1000.0);
+                }
+                g_w_dec_us = g_w_dec_max = g_w_a_us = g_w_b_us = g_w_dec_n = 0;
+                g_w_cpy_us = g_w_cpy_max = g_w_wait_us = g_w_wait_max = g_w_cpy_n = 0;
+                g_w_poll_us = g_w_adv = 0;
+            }
             stat_rx0 = rx; stat_flip0 = fl; stat_t0 = now;
         }
 
@@ -977,29 +1031,60 @@ static void *flip_thread(void *arg)
          * 逐字节相同。 */
         int idle = active + 1;
         if (idle >= FRAME_BANKS) idle = 0;      /* A -> B -> C -> A 轮转 */
-        memcpy(g_bank[idle], g_disp.buf, g_disp.raw_len);
+        long t_cpy = mono_us();
+        if (!g_nocopy)                          /* --diag-nocopy: 消融实验 */
+            memcpy(g_bank[idle], g_disp.buf, g_disp.raw_len);
         wmb_frame();
+        t_cpy = mono_us() - t_cpy;              /* 诊断: 进 DDR bank 的耗时 */
 
         /* 等翻页窗 (先离开上次翻页的窗口, 再命中任一窗口) */
+        long t_wait = mono_us();
         long t0 = mono_ms();
         int need_leave = (last_flip_win >= 0);
         int win = -1, forced = 0;
+        /* 每圈片数取 POV_CTRL 影子回读 (0x24), 兜底 PVS_N_SLICES */
+        n_eng = (reg_rd(REG_POV_CTRL_RB) >> 16) & 0xffffu;
+        if (!n_eng) n_eng = PVS_N_SLICES;
+        uint32_t slice = reg_rd(REG_POV_CTRL) & 0xffffu, prev_slice = slice;
+        unsigned long adv = 0;
         for (;;) {
-            uint32_t slice = reg_rd(REG_POV_CTRL) & 0xffffu;
+            slice = reg_rd(REG_POV_CTRL) & 0xffffu;
+            adv += (slice - prev_slice + n_eng) % n_eng;   /* 走过的片数 */
+            prev_slice = slice;
             win = slice_window(slice);
             if (need_leave && win != last_flip_win)
                 need_leave = 0;
             if (!need_leave && win >= 0)
                 break;
             if (mono_ms() - t0 > FLIP_TIMEOUT_MS) {
-                logts("WARN: no flip window in %d ms (engine idle?), flipping anyway",
-                      FLIP_TIMEOUT_MS);
+                /* 🔴 这条以前只说 "engine idle?", 于是现场看到的只有 drop 一路
+                 * 飙升, 被当成**网络丢帧**查了很久 (2026-08-04 定案: 电机不转时
+                 * slice_idx 恒定, 翻页窗的「先离开再进入」去抖条件永远不成立,
+                 * 每帧顶满 2 秒才强制翻一次 -> flip≈0.5/s, drop 90%+)。
+                 * 现在把判据直接印出来: slice 卡住 = 机械/传感器问题, 不是链路。*/
+                if (!adv)
+                    logts("WARN: %d ms 内引擎一片都没走 (slice_idx 恒为 %u) —— "
+                          "电机停了 / index 脉冲丢了 / 还在 sensor 模式而没上电? "
+                          "本次强制翻页。⚠ 这种状态下 drop 会飙到 90%%+, "
+                          "**与网络无关**, 别去查链路", FLIP_TIMEOUT_MS, slice);
+                else
+                    logts("WARN: no flip window in %d ms (slice=%u, 本轮走了 %lu 片, "
+                          "翻页窗判据没命中?), flipping anyway",
+                          FLIP_TIMEOUT_MS, slice, adv);
                 forced = 1;
                 break;
             }
             if (g_stop) return NULL;
             usleep(200);
         }
+        t_wait = mono_us() - t_wait;            /* 诊断: 等翻页窗的耗时 */
+        g_w_poll_us += (unsigned long)t_wait;   /* 轮询时长 = slice 增量的积分区间 */
+        g_w_adv     += adv;
+        g_w_cpy_us += (unsigned long)t_cpy;
+        if ((unsigned long)t_cpy > g_w_cpy_max) g_w_cpy_max = (unsigned long)t_cpy;
+        g_w_wait_us += (unsigned long)t_wait;
+        if ((unsigned long)t_wait > g_w_wait_max) g_w_wait_max = (unsigned long)t_wait;
+        g_w_cpy_n++;
 
         /* 本帧的几何全部在同一个翻页窗内背靠背落寄存器: 中间隔一整圈的话,
          * 一面来自新帧另一面来自旧帧 = 撕裂。顺序 PHASE_B -> BASE_B ->
@@ -1231,6 +1316,7 @@ static int serve_client(int fd, uint8_t *cbuf)
         if (r <= 0) return r;
 
         long dec_t0 = mono_us();
+        long face_a_us = 0, face_b_us = 0;   /* 诊断: 两条流各自的解码耗时 */
 
         if (nstr || face_b_off) {
             /* 多条独立流 -> 多个 job -> dec_plan 按片数摊到两个核。
@@ -1263,6 +1349,7 @@ static int serve_client(int fd, uint8_t *cbuf)
                 send_byte(fd, PVS_NAK);
                 return -1;
             }
+            face_a_us = ja.us; face_b_us = jb.us;
         } else {
             /* 单面: 与 v2 完全同一条路径 (不过线程池, 不多一次交接) */
             if (h.flags & PVS_FLAG_LZ4) {
@@ -1299,6 +1386,11 @@ static int serve_client(int fd, uint8_t *cbuf)
         }
 
         long dec_us = mono_us() - dec_t0;   /* 解码耗时: 不含 crc, 不含翻页 */
+        g_w_dec_us += (unsigned long)dec_us;
+        if ((unsigned long)dec_us > g_w_dec_max) g_w_dec_max = (unsigned long)dec_us;
+        g_w_a_us += (unsigned long)face_a_us;
+        g_w_b_us += (unsigned long)face_b_us;
+        g_w_dec_n++;
 
         uint32_t crc = 0;
         if (g_crc_on)
@@ -1357,7 +1449,11 @@ static void usage(const char *argv0)
         "  --idle-anim F  无客户端时循环播放 F (anim.pvs 容器); 有推流自动让位\n"
         "  --idle-fps N   空闲动画帧率 (default 8)\n"
         "  --decode       parallel = 双面两条流分别解到 CPU0/CPU1 (default);\n"
-        "                 serial   = 单核串行解 (对拍 / 出问题时退回)\n",
+        "                 serial   = 单核串行解 (对拍 / 出问题时退回)\n"
+        "  --diag on|off  每秒多打一行 DIAG (窗内瞬时 rx/flip 帧率 + 一帧开销\n"
+        "                 拆成 dec/A/B/cpy/wait), default on\n"
+        "  --diag-nocopy  消融实验: 跳过 staging->DDR bank 的 memcpy (画面不再\n"
+        "                 更新!), 量那次拷贝对解码吞吐的真实代价。别在生产用\n",
         argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT);
 }
 
@@ -1385,6 +1481,12 @@ int main(int argc, char **argv)
             const char *m = argv[++i];
             if (!strcmp(m, "dual")) g_win_dual = 1;
             else if (strcmp(m, "single")) { usage(argv[0]); return 2; }
+        }
+        else if (!strcmp(argv[i], "--diag-nocopy")) g_nocopy = 1;
+        else if (!strcmp(argv[i], "--diag") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "off")) g_diag = 0;
+            else if (strcmp(m, "on")) { usage(argv[0]); return 2; }
         }
         else if (!strcmp(argv[i], "--decode") && i + 1 < argc) {
             const char *m = argv[++i];
