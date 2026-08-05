@@ -531,8 +531,141 @@ static int g_diag = 1;                       /* --diag off 关掉 DIAG 行 */
  * 用来回答「那次拷贝到底吃掉多少解码吞吐」—— 两个解码核和 flip 线程在
  * 同一颗双核 A9 上抢内存带宽, 拷贝的代价不是它自己那几十毫秒而已。 */
 static int g_nocopy = 0;
+/* --no-rmem-fix: **只用于对照实验**, 跳过启动时抬 net.core.rmem_max 那一步,
+ * 用来量"接收窗被钳住"到底值多少帧率。⚠ 生产别用: 实测这一步是本轮最大的
+ * 单项收益。而且必须**交替跑** (低/高/低/高...) 才有意义 —— WiFi 环境在
+ * 十几分钟里会自己漂移, 先跑 3 次高再跑 3 次低会把漂移记到改动头上。 */
+static int g_no_rmem_fix = 0;
 static unsigned long g_w_dec_us, g_w_dec_max, g_w_c0_us, g_w_c1_us, g_w_dec_n;
 static unsigned long g_w_cpy_us, g_w_cpy_max, g_w_wait_us, g_w_wait_max, g_w_cpy_n;
+/* 🔴 2026-08-05 加: 收包耗时。老 DIAG 只有 dec/cpy/wait —— 一帧的四段里
+ * **偏偏漏了最大的那一段**, 于是"链路不是瓶颈"这个结论一直没人能证伪。
+ *   hdr  阻塞在等下一帧帧头 = 发送端还没发 (发送端节奏/ACK 往返)
+ *   body 收帧体的时长      = 真正的链路投递时间
+ * 实测这两段加起来 55-80 ms/帧, 比 dec(28) + cpy(18) 还大。 */
+static unsigned long g_w_hdr_us, g_w_hdr_max, g_w_body_us, g_w_body_max, g_w_rcv_n;
+/* 相位仪表: 翻页窗是 slice<8 (一圈 360 片里只有 8 片 = 1.5 ms @15rps)。
+ * 帧"到货"(flip 线程拿到 ready) 的 slice 决定了它还来不来得及在本圈翻中,
+ * 所以真正要看的是**到货相位的分布**, 不是 wait 的均值。arr[] = 到货 slice
+ * 的 8 分箱直方图; rev1/rev2 = 相邻两次翻页间隔了 1 圈 / >=2 圈 的次数。 */
+#define PHASE_BINS 8
+static unsigned long g_w_arr[PHASE_BINS];
+static unsigned long g_w_gap_us, g_w_gap_max, g_w_gap_n, g_w_rev1, g_w_rev2;
+
+/* ---- 翻页相位锁定 (--phase-lock on, 默认 off) -----------------------------
+ * 🔴 先说结论, 免得下一个人再花一天走同一条路:
+ *    **在本板实测到的所有工况下, 相位都不是损失点, 这个开关不该打开。**
+ *    留着它是因为机制本身是对的, 且 PHASE 行的仪表很有用。
+ *
+ * 原假设 (2026-08-05 立项时的): 一圈 66.7 ms(900 RPM), 一帧的活 dec 28 +
+ * cpy 18 = 46 ms 装得下, 但解码启动相位随机 -> 一半时候赔一整圈 -> 7.5 fps,
+ * "翻中就 15, 翻不中直接掉一半, 没有中间态"。
+ *
+ * 实测把它推翻了, 三条证据:
+ *  1) 真实工况 (15 rps, fold540 + lz4-HC9) 跑 5x20 s: rx 8.0/s, flip 8.0/s,
+ *     **drop = 0 / 668 帧**。收到的每一帧都上了屏, 没有任何一帧因为错过翻页窗
+ *     而白收 —— 相位可损失的量是 0。DIAG 里那个 "wait 33-39 ms" 不是错过的
+ *     机会, 是 flip 线程**没帧可翻在空转**。
+ *  2) 每圈翻中 0.53 这个数, 完全由 rx(8.0/s) / eng(15 rev/s) = 0.53 解释,
+ *     和相位无关: 供给只有需求的一半, 一半的圈本来就没有新帧。
+ *  3) 把链路影响去掉 (delta 流) 后自由跑本来就有 90-98% 的"每圈翻中":
+ *     随机相位**不是稳定态** —— 一旦错过一次, 翻页被推后一整圈, 下一帧就
+ *     已经在 ready 里等着了, 环路自己把相位纠回来。所以"掉到 7.5 fps 就回不来"
+ *     这个模型不成立。8 rps 交替 A/B 实测: lock=off 98% 翻中 8.00 flip/s,
+ *     lock=on 91% 翻中 7.99 flip/s —— 锁了反而略差。
+ *
+ * 真正的瓶颈是**收包**: 一帧 272 KB 压缩数据要收 85-96 ms (≈3 MB/s), 而一圈
+ * 只有 66.7 ms。老 DIAG 把 dec/cpy/wait 拆得很细却唯独没量收包, 所以
+ * "链路 125 Mbps 不是瓶颈" 这个前提一直没被证伪。要 15 fps, 得先让
+ * body + dec <= 66.7 ms, 也就是收包压到 ~40 ms 以内 (≈7 MB/s)。
+ *
+ * 机制本身 (下面的代码) 是这样的: 帧体收完、开始解码**之前**, 把 RX 线程按
+ * 转子相位停一小会儿, 让 (dec + cpy) 正好在翻页窗开启前结束:
+ *     起解片号 target = (0 - (dec+cpy+margin) / 每片微秒) mod n_slices
+ * dec/cpy 取实测 EMA; 每片微秒由 flip 线程轮询 slice 时顺手积分 (它本来就在
+ * 死盯 slice_idx, 不额外读寄存器)。
+ *
+ * 🔴 三条保险 —— 少一条就会把板子锁死或者越锁越慢:
+ *  1) 引擎没转 (每片微秒还没测出来) -> 放行。否则没电机 / fake 没开时 RX
+ *     线程会在这里死等, 表现和"网络断了"一模一样, 又是一次误诊。
+ *  2) **一帧的服务时间 (收包 + 解码 + 拷贝) 已经 >= 一圈** -> 放行 (state=over)。
+ *     这种情况下等只会把周期硬钉到 2 圈 (7.5 fps); 而自由跑虽然抖 (1 圈/2 圈
+ *     交替), 平均反而更高。锁相是"把够用的余量花在对齐上", 没余量就别锁。
+ *  3) 只在"往前等不超过 GATE_MAX_FRAC 圈"时等, 且有硬超时。已经错过 target
+ *     就**立刻开解**: 错过就是错过, 硬等下一圈只会让 RX 线程停止收包, 把
+ *     发送端也一起拖住 -> 下一帧更晚 -> 越锁越差。
+ */
+#define LOCK_MARGIN_US    4000   /* dec/cpy 有抖动, 早到不亏, 晚到赔一整圈 */
+#define GATE_SPAN_SLICES  4      /* 命中窗宽(片): 太窄会被 usleep 粒度跳过 */
+#define GATE_MAX_FRAC     0.55   /* 最多等这么多圈, 超过就当"已经错过" */
+#define GATE_TIMEOUT_MS   150    /* 硬超时, 任何情况下不许卡死 RX 线程 */
+static int g_lock = 0;                     /* --phase-lock on */
+static const char *g_lock_state = "off";   /* off/nospin/over/wait/late */
+static volatile unsigned long g_ups_q8;    /* 每片微秒 << 8 (flip 线程写) */
+static volatile unsigned long g_ema_dec_us, g_ema_cpy_us, g_ema_svc_us;
+
+/* x = 7/8 x + 1/8 v; 首次直接赋值 (否则要爬几十帧才到位) */
+static void ema_add(volatile unsigned long *x, long v)
+{
+    unsigned long o = *x;
+    *x = o ? (unsigned long)((o * 7 + (unsigned long)v) / 8) : (unsigned long)v;
+}
+
+static uint32_t engine_n_slices(void)
+{
+    uint32_t n = (reg_rd(REG_POV_CTRL_RB) >> 16) & 0xffffu;
+    return n ? n : (uint32_t)PVS_N_SLICES;
+}
+
+/* 收完帧体、开始解码之前调。返回等了多少微秒 (0 = 没等)。*/
+static long phase_gate(void)
+{
+    unsigned long ups = g_ups_q8;                 /* 每片微秒 << 8 */
+    if (!g_lock)  { g_lock_state = "off";    return 0; }
+    if (ups < 16) { g_lock_state = "nospin"; return 0; }   /* 保险 1 */
+    uint32_t n_eng = engine_n_slices();
+    long rev_us = (long)((ups * n_eng) >> 8);
+    /* 保险 2: RX 线程一帧的服务时间 (收包 + 解码) 装不进一圈就别锁。
+     * ⚠ 这里**不能**把 cpy 加进来 —— 第一版加了, 结果条件过严。锁住之后的
+     * 稳态是这样排的 (t=0 是翻页窗):
+     *      t=target          放行, 开始解
+     *      t=target+dec=-cpy 发布 + ACK; flip 线程开拷
+     *      t=0               拷完, 翻页 ✅
+     *      t=-cpy .. -cpy+body  RX 收下一帧 (**与 flip 线程的 memcpy 并行**)
+     *      t=target+rev      再次放行
+     * 收敛条件解出来只有 body + dec <= rev, cpy 整个被 flip 线程那条腿吸收掉了。
+     * 把 cpy 算进来会在 body+dec 明明够用时误判成 over 而白白关掉锁。 */
+    long need_us = (long)g_ema_svc_us + LOCK_MARGIN_US;
+    if (need_us >= rev_us) { g_lock_state = "over"; return 0; }
+
+    /* 保险 2b: 目标相位 = "往回退 dec+cpy"。这个量一旦 >= 一圈, 取模之后
+     * 就**绕回来指向一个毫无意义的相位**, 锁会把解码对齐到错误的地方 ——
+     * 实测 (delta @12rps, dec 59 + cpy 34 = 93 > 一圈 83) 就是这样把
+     * 12.0 flip/s 锁成了 11.0。装不下就老实放行。 */
+    long back_us = (long)g_ema_dec_us + (long)g_ema_cpy_us + LOCK_MARGIN_US;
+    if (back_us >= rev_us) { g_lock_state = "over"; return 0; }
+
+    /* 目标: dec + cpy 干完正好赶上 slice 回到 0 (翻页窗 slice<8) */
+    long back = back_us * 256 / (long)ups;            /* 需要提前的片数 */
+    long target = ((long)n_eng - back) % (long)n_eng;
+
+    uint32_t s = reg_rd(REG_POV_CTRL) & 0xffffu;
+    long fwd = ((long)target - (long)s + (long)n_eng) % (long)n_eng;
+    /* 保险 3: 要等超过 GATE_MAX_FRAC 圈 = 其实是"刚刚错过", 立刻开解 */
+    if (fwd > (long)(n_eng * GATE_MAX_FRAC)) { g_lock_state = "late"; return 0; }
+
+    g_lock_state = "wait";
+    long t0 = mono_us(), tm0 = mono_ms();
+    for (;;) {
+        s = reg_rd(REG_POV_CTRL) & 0xffffu;
+        long d = ((long)target - (long)s + (long)n_eng) % (long)n_eng;
+        if (d == 0 || d > (long)n_eng - GATE_SPAN_SLICES) break;  /* 到/刚过 */
+        if (mono_ms() - tm0 > GATE_TIMEOUT_MS) { g_lock_state = "tmo"; break; }
+        if (g_stop) break;
+        usleep(200);
+    }
+    return mono_us() - t0;
+}
 /* 引擎转速: flip 线程等翻页窗时本来就在死盯 slice_idx, 顺手算转速。
  * ⚠ 不能数 wrap 次数 —— 轮询循环**正是被一次回绕(slice 进窗)终止的**, 采样
  * 区间的端点由事件本身定义, 数出来必然偏大 (实测 16 rps 报成 34.8)。改成
@@ -975,6 +1108,7 @@ static void *flip_thread(void *arg)
     int active = 0;              /* 当前显示 bank (main 启动时已指向 bank A) */
     int last_flip_win = -1;      /* 上次翻页所在窗口 id (-1 = 无约束) */
     uint32_t n_eng = PVS_N_SLICES;   /* 引擎每圈片数 (诊断算转速用) */
+    long last_flip_us = 0;           /* 上次翻页时刻 (算翻页间隔 = 几圈) */
     long stat_t0 = mono_ms();
     unsigned stat_rx0 = 0, stat_flip0 = 0;
 
@@ -991,9 +1125,10 @@ static void *flip_thread(void *arg)
                 if (g_diag) {
                     double dt = (now - stat_t0) / 1000.0;
                     unsigned long dn = g_w_dec_n, cn = g_w_cpy_n;
+                    unsigned long rn = g_w_rcv_n;
                     logts("DIAG %.1fs eng=%.1frev/s rx=%.2f/s flip=%.2f/s drop=%u | "
                           "dec %.1f/%.1fms (core0 %.1f core1 %.1f) | cpy %.1f/%.1fms | "
-                          "wait %.1f/%.1fms",
+                          "wait %.1f/%.1fms | hdr %.1f/%.1fms | body %.1f/%.1fms",
                           dt,
                           g_w_poll_us ? g_w_adv * 1e6 / n_eng / g_w_poll_us : 0.0,
                           (rx - stat_rx0) / dt, (fl - stat_flip0) / dt,
@@ -1005,10 +1140,27 @@ static void *flip_thread(void *arg)
                           cn ? g_w_cpy_us / (double)cn / 1000.0 : 0.0,
                           g_w_cpy_max / 1000.0,
                           cn ? g_w_wait_us / (double)cn / 1000.0 : 0.0,
-                          g_w_wait_max / 1000.0);
+                          g_w_wait_max / 1000.0,
+                          rn ? g_w_hdr_us / (double)rn / 1000.0 : 0.0,
+                          g_w_hdr_max / 1000.0,
+                          rn ? g_w_body_us / (double)rn / 1000.0 : 0.0,
+                          g_w_body_max / 1000.0);
+                    /* 单独一行, 免得 DIAG 行长到串口换行。字段顺序被
+                     * tools/phase_bench.py 的 PHASE_RE 依赖, 改要一起改。 */
+                    unsigned long gn = g_w_gap_n;
+                    logts("PHASE arr=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu "
+                          "gap %.1f/%.1fms rev1=%lu rev2+=%lu lock=%s",
+                          g_w_arr[0], g_w_arr[1], g_w_arr[2], g_w_arr[3],
+                          g_w_arr[4], g_w_arr[5], g_w_arr[6], g_w_arr[7],
+                          gn ? g_w_gap_us / (double)gn / 1000.0 : 0.0,
+                          g_w_gap_max / 1000.0, g_w_rev1, g_w_rev2,
+                          g_lock_state);
                 }
                 g_w_dec_us = g_w_dec_max = g_w_c0_us = g_w_c1_us = g_w_dec_n = 0;
                 g_w_cpy_us = g_w_cpy_max = g_w_wait_us = g_w_wait_max = g_w_cpy_n = 0;
+                g_w_hdr_us = g_w_hdr_max = g_w_body_us = g_w_body_max = g_w_rcv_n = 0;
+                memset(g_w_arr, 0, sizeof g_w_arr);
+                g_w_gap_us = g_w_gap_max = g_w_gap_n = g_w_rev1 = g_w_rev2 = 0;
                 g_w_poll_us = g_w_adv = 0;
             }
             stat_rx0 = rx; stat_flip0 = fl; stat_t0 = now;
@@ -1024,6 +1176,14 @@ static void *flip_thread(void *arg)
         }
         pthread_mutex_unlock(&g_mu);
         if (!fresh) { usleep(500); continue; }
+
+        /* 相位仪表: 帧"到货"时转子在哪一片。这才是决定本圈翻不翻得中的量,
+         * 分布均匀 = 相位随机 (老行为), 集中在某一箱 = 锁住了。 */
+        {
+            uint32_t ne = engine_n_slices();
+            uint32_t sa = reg_rd(REG_POV_CTRL) & 0xffffu;
+            if (ne) g_w_arr[(sa * PHASE_BINS / ne) % PHASE_BINS]++;
+        }
 
         /* 拷贝进空闲 bank, DSB 排空 write buffer 后引擎才可能取到。
          * 双面帧的 [面A][面B] 是连着的, 所以仍然只是一次 memcpy; 拆分只体现
@@ -1085,6 +1245,11 @@ static void *flip_thread(void *arg)
         g_w_wait_us += (unsigned long)t_wait;
         if ((unsigned long)t_wait > g_w_wait_max) g_w_wait_max = (unsigned long)t_wait;
         g_w_cpy_n++;
+        ema_add(&g_ema_cpy_us, t_cpy);
+        /* 每片微秒: 轮询循环本来就在积分 slice 增量, 顺手换算。adv 太小时
+         * (一进来就命中窗) 比值噪声大, 要求走过 >=16 片才采信。 */
+        if (adv >= 16 && t_wait > 0)
+            ema_add(&g_ups_q8, (long)((unsigned long)t_wait * 256 / adv));
 
         /* 本帧的几何全部在同一个翻页窗内背靠背落寄存器: 中间隔一整圈的话,
          * 一面来自新帧另一面来自旧帧 = 撕裂。顺序 PHASE_B -> BASE_B ->
@@ -1129,6 +1294,22 @@ static void *flip_thread(void *arg)
         last_flip_win = forced ? -1 : win;
         g_st_flip++;
         if (forced) g_st_forced++;
+        /* 翻页间隔 -> 换算成"隔了几圈"。rev1 = 每圈翻中 (目标), rev2+ = 赔了
+         * 至少一整圈。⚠ 这两个数才是"翻中率", flip/s 会被转速抖动稀释。 */
+        {
+            long now_us = mono_us();
+            unsigned long ups = g_ups_q8;
+            if (last_flip_us && ups >= 16) {
+                long gap = now_us - last_flip_us;
+                long rev_us = (long)((ups * engine_n_slices()) >> 8);
+                g_w_gap_us += (unsigned long)gap;
+                if ((unsigned long)gap > g_w_gap_max) g_w_gap_max = (unsigned long)gap;
+                g_w_gap_n++;
+                if (rev_us > 0 && gap < rev_us * 3 / 2) g_w_rev1++;
+                else g_w_rev2++;
+            }
+            last_flip_us = now_us;
+        }
         if (base_b || g_disp.fold_a)
             logts("FLIP gen=%u bank=%d win=%d n=%u A=0x%08x B=0x%08x fold=%u%s",
                   g_consumed_gen, idle, win, g_disp.n_slices, base_a, base_b,
@@ -1150,7 +1331,13 @@ static int serve_client(int fd, uint8_t *cbuf)
 
     for (;;) {
         pvs_hdr_t h;
+        /* 🔴 收包耗时单独计时。老 DIAG 把 dec/cpy/wait 拆得很细, 却唯独没量
+         * 这一段 —— 而实测它比 dec + cpy 加起来还大, "链路不是瓶颈"这个前提
+         * 因此一直没被证伪。hdr = 等下一帧帧头 (发送端还没发出来),
+         * body = 收帧体 (真正的投递时间)。 */
+        long t_hdr = mono_us();
         int r = recv_full(fd, &h, sizeof h);
+        t_hdr = mono_us() - t_hdr;
         if (r <= 0) return r;
 
         /* 头校验 (v3.1): n_slices 是权威, raw_len 必须与它自洽; 不再硬比
@@ -1312,8 +1499,20 @@ static int serve_client(int fd, uint8_t *cbuf)
             return -1;
         }
 
+        long t_body = mono_us();
         r = recv_full(fd, comp ? cbuf : g_wr.buf, body_len);
         if (r <= 0) return r;
+        t_body = mono_us() - t_body;
+        g_w_hdr_us  += (unsigned long)t_hdr;
+        g_w_body_us += (unsigned long)t_body;
+        if ((unsigned long)t_hdr  > g_w_hdr_max)  g_w_hdr_max  = (unsigned long)t_hdr;
+        if ((unsigned long)t_body > g_w_body_max) g_w_body_max = (unsigned long)t_body;
+        g_w_rcv_n++;
+
+        /* ---- 翻页相位锁定: 停在"解完 + 拷完正好赶上翻页窗"的相位再开解 ----
+         * 必须放在收包**之后**、解码之前: 放在收包之前会让 socket 不被抽干,
+         * 发送端被 TCP 背压顶住, 下一帧更晚 —— 越锁越差。 */
+        long t_gate = phase_gate();
 
         long dec_t0 = mono_us();
         /* 🔴 诊断口径: **每个解码核的墙钟**, 不是"每一面"。
@@ -1406,6 +1605,16 @@ static int serve_client(int fd, uint8_t *cbuf)
         g_w_c0_us += (unsigned long)core0_us;
         g_w_c1_us += (unsigned long)core1_us;
         g_w_dec_n++;
+        ema_add(&g_ema_dec_us, dec_us);
+        /* 服务时间 = **收帧体 + 解码**。故意不含两段:
+         *  - gate 自己等的那段 (否则自我实现: 等得越久 svc 越大, 越容易被
+         *    保险 2 误判成"装不下"而把锁关掉)。
+         *  - t_hdr, 也就是阻塞在"等下一帧帧头"上的时间 —— 那是**发送端还没发**
+         *    的空闲, 不是板子的活。踩过: 发送端 --fps 10 时 hdr 自动补到
+         *    ~(100ms - dec), svc 于是恒等于一圈, 保险 2 永远判 over, 锁永远
+         *    不生效, 而且怎么调都看不出差别。 */
+        ema_add(&g_ema_svc_us, t_body + dec_us);
+        (void)t_gate; (void)t_hdr;
 
         uint32_t crc = 0;
         if (g_crc_on)
@@ -1468,7 +1677,15 @@ static void usage(const char *argv0)
         "  --diag on|off  每秒多打一行 DIAG (窗内瞬时 rx/flip 帧率 + 一帧开销\n"
         "                 拆成 dec/A/B/cpy/wait), default on\n"
         "  --diag-nocopy  消融实验: 跳过 staging->DDR bank 的 memcpy (画面不再\n"
-        "                 更新!), 量那次拷贝对解码吞吐的真实代价。别在生产用\n",
+        "                 更新!), 量那次拷贝对解码吞吐的真实代价。别在生产用\n"
+        "  --phase-lock   on = 收完帧体后按转子相位停一小会儿再开解, 让\n"
+        "                 dec+cpy 正好赶在翻页窗前结束 (每圈翻中一次)。\n"
+        "                 引擎没转 / 一帧装不进一圈时自动放行, 见 PHASE 行的\n"
+        "                 lock= 字段 (off/nospin/over/late/wait/tmo)。\n"
+        "                 ⚠ default off, 而且**实测没用**: 本板的损失全在收包,\n"
+        "                 相位可回收的量实测为 0 (drop=0/668 帧)。细节见\n"
+        "                 pov_rxd.c 里 phase_gate 上方那段注释\n"
+        "  --no-rmem-fix  对照实验: 不抬 net.core.rmem_max (生产别用)\n",
         argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT);
 }
 
@@ -1498,6 +1715,12 @@ int main(int argc, char **argv)
             else if (strcmp(m, "single")) { usage(argv[0]); return 2; }
         }
         else if (!strcmp(argv[i], "--diag-nocopy")) g_nocopy = 1;
+        else if (!strcmp(argv[i], "--no-rmem-fix")) g_no_rmem_fix = 1;
+        else if (!strcmp(argv[i], "--phase-lock") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "on")) g_lock = 1;
+            else if (strcmp(m, "off")) { usage(argv[0]); return 2; }
+        }
         else if (!strcmp(argv[i], "--diag") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "off")) g_diag = 0;
@@ -1633,6 +1856,36 @@ int main(int argc, char **argv)
          * (双面约 300 KB/帧)。内核记账时会把设定值 x2, 所以回读一下打出来。 */
         int rbuf = RCVBUF_BYTES;
         const char *how = "SO_RCVBUF";
+        /* 2026-08-05: 板子的 net.core.rmem_max 出厂只有 **176 KB**, 比一帧压缩
+         * 数据 (fold540 + lz4-HC9 = 272 KB) 还小; SO_RCVBUFFORCE 在这台板子上
+         * 也一直失败 (日志里 how 恒为 SO_RCVBUF), 于是生效值只有 416 KB ——
+         * **低于本文件自己定的 RCVBUF_MIN_EFF(450 KB)**, 那条 WARN 一直在刷。
+         * 抬完 rmem_max 后 SO_RCVBUFFORCE 就成功了, 生效 1.5 MB。
+         *
+         * ⚠ 老实说清楚收益: 头一次量到 收包 96->49 ms / 上屏 8.0->12.0 帧每秒,
+         *   看着像天上掉馅饼。但**交替 A/B (低/高/低/高/低/高, 各 20 s)**
+         *   复测下来两组中位数都是 8.00 帧/秒 (body 96.0 vs 89.7 ms, 高的那组
+         *   σ 还有 66.9) —— 那次 12.0 是 WiFi 环境自己变好, 不是这行代码。
+         *   保留它的理由只是"接收窗小于一帧显然不对 + 消掉自家的 WARN",
+         *   **不要**拿它当帧率优化往外说。这也正是 tools/phase_bench.py 存在
+         *   的意义: 单次测量在这条链路上根本分不出 8 和 12。 */
+        if (!g_no_rmem_fix) {
+            long want = RCVBUF_BYTES * 2L;   /* 内核记账要 x2 */
+            FILE *f = fopen("/proc/sys/net/core/rmem_max", "r+");
+            long cur = 0;
+            if (f && fscanf(f, "%ld", &cur) == 1 && cur < want) {
+                rewind(f);
+                if (fprintf(f, "%ld", want) > 0)
+                    logts("net.core.rmem_max %ld -> %ld B (原值比一帧压缩数据"
+                          "还小, 接收窗会把链路掐到 1/2 速; 见上方注释)",
+                          cur, want);
+                else
+                    logts("WARN: 抬 net.core.rmem_max 失败 (%s), 当前 %ld B —— "
+                          "收包会变慢一倍, 手动: sysctl -w net.core.rmem_max=%ld",
+                          strerror(errno), cur, want);
+            }
+            if (f) fclose(f);
+        }
         /* 先试 SO_RCVBUFFORCE: 本进程本来就要 root (/dev/mem), 有 CAP_NET_ADMIN
          * 就能绕过 net.core.rmem_max 的上限 —— 默认 rmem_max 常常只有 208 KB,
          * 普通 SO_RCVBUF 会被悄悄砍到一半需求量。失败再退回普通设置。 */
