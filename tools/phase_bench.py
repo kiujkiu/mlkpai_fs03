@@ -97,6 +97,9 @@ FLOATS = ('dt', 'eng', 'rx', 'flip', 'dec', 'decmax', 'c0', 'c1',
 # hdr/body 是 2026-08-05 才加的字段, 老二进制的 DIAG 行没有 -> 缺了记 0
 FLOATS_OPT = ('hdr', 'hdrmax', 'body', 'bodymax')
 
+# 见 parse_diag: --diag-rxonly 消融模式要放行 dec==0 的样本
+ALLOW_DEC0 = False
+
 
 def parse_diag(text, warm=2, tail=1):
     """journal 文本 -> 每秒一条的样本 list。滤掉空闲动画行, 掐头去尾。"""
@@ -109,8 +112,10 @@ def parse_diag(text, warm=2, tail=1):
         s = {k: float(d[k]) for k in FLOATS}
         s.update({k: float(d[k]) if d.get(k) else 0.0 for k in FLOATS_OPT})
         s['drop'] = int(d['drop'])
-        # 判据 2: dec 累加器为 0 = 空闲动画, 不是推流
-        if s['dec'] <= 0.0:
+        # 判据 2: dec 累加器为 0 = 空闲动画, 不是推流。
+        # ⚠ 例外: --diag-rxonly 消融模式下 dec 本来就恒为 0, 那时必须放行,
+        #   否则整组样本被这条判据吃光 (调用方置 ALLOW_DEC0=True)。
+        if s['dec'] <= 0.0 and not ALLOW_DEC0:
             continue
         # DIAG 窗口本该 ~1s; 明显异常的窗口 (进程刚起/刚停) 丢掉
         if not (0.7 <= s['dt'] <= 2.0):

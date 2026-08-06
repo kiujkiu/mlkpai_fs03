@@ -255,10 +255,9 @@
 #define MSTR_ENT_LEN       8u                   /* 流表一条 = {u32 comp_len, u32 n_slices} */
 #define MSTR_TBL_MAX       (4u + PVS_MAX_STREAMS * MSTR_ENT_LEN)   /* 132 B */
 #define DEC_WORKERS        2                    /* A9 双核 */
-/* PC 端 window=2 (最多 2 帧在途), 板端要能吸掉 ~1.5 帧压缩数据。双面实测
- * 约 300 KB/帧 -> 450 KB; 取 768 KB 留余量 (内核会 x2 记账)。 */
-#define RCVBUF_BYTES       (768 * 1024)
-#define RCVBUF_MIN_EFF     (450 * 1024)         /* 生效值低于此就告警 */
+/* ⚠ 这里原本有 RCVBUF_BYTES/RCVBUF_MIN_EFF 两个常量和一段"把接收缓冲设到
+ * 768 KB"的逻辑, 2026-08-06 删了 —— 设 SO_RCVBUF 会关掉内核接收窗自动放大,
+ * 是"收包只有 3 MB/s"的真身。详见 g_rcvbuf 的注释。 */
 #define PVS_FLAGS_KNOWN    (PVS_FLAG_RLE | PVS_FLAG_ZLIB | PVS_FLAG_DELTA | \
                             PVS_FLAG_DUAL_FACE | PVS_FLAG_FOLD_A | PVS_FLAG_LZ4 | \
                             PVS_FLAG_MSTREAM)
@@ -531,11 +530,36 @@ static int g_diag = 1;                       /* --diag off 关掉 DIAG 行 */
  * 用来回答「那次拷贝到底吃掉多少解码吞吐」—— 两个解码核和 flip 线程在
  * 同一颗双核 A9 上抢内存带宽, 拷贝的代价不是它自己那几十毫秒而已。 */
 static int g_nocopy = 0;
-/* --no-rmem-fix: **只用于对照实验**, 跳过启动时抬 net.core.rmem_max 那一步,
- * 用来量"接收窗被钳住"到底值多少帧率。⚠ 生产别用: 实测这一步是本轮最大的
- * 单项收益。而且必须**交替跑** (低/高/低/高...) 才有意义 —— WiFi 环境在
- * 十几分钟里会自己漂移, 先跑 3 次高再跑 3 次低会把漂移记到改动头上。 */
+/* --no-rmem-fix: 跳过抬 net.core.rmem_max 那一步。现在只在 --rcvbuf N (>0)
+ * 时才有意义 —— 默认路径根本不设 SO_RCVBUF, 也就不受 rmem_max 上限约束。
+ * ⚠ 2026-08-05 曾把"抬 rmem_max"当成本轮最大收益写在这里, 那是错的: 交错
+ *   A/B 两组中位数都是 8.00 帧/秒。真正的问题是**设 SO_RCVBUF 这个动作本身**
+ *   会关掉接收窗自动放大, 见 g_rcvbuf 的注释。 */
 static int g_no_rmem_fix = 0;
+/* --diag-rxonly: **只用于消融实验**, 收完帧体立刻 ACK —— 不解码、不发布、
+ * 不翻页、不 memcpy。画面完全不动, 但 socket 上的收包节奏与真实推流逐字节
+ * 相同 (同一个发送端、同样的 272 KB 分帧、同样的每帧 ACK)。
+ * 🔴 它回答的是一个别的办法回答不了的问题: DIAG 里的 `body` 有多少是**链路
+ *    本身**, 有多少是**板端自己的处理把链路挤慢的**。合成 sink 测出的
+ *    5-7 MB/s 与 pov_rxd 实测的 3.2 MB/s 差了一倍, 而两者的协议形状一样 ——
+ *    差别只可能在这个进程里, 只能在这个进程里量。
+ * ⚠ 这个模式下 dec 恒为 0, phase_bench 的「dec 0 = 空闲动画」判据会把样本
+ *    全滤掉, 要配合 phase_ab 的 dec0=1。 */
+static int g_rxonly = 0;
+/* --rcvbuf N: 接收缓冲策略。**默认 0 = 一个字节都不设, 全交给内核自动调**。
+ * 🔴 这是 2026-08-06 找到的真正瓶颈, 反直觉到必须写清楚:
+ *   Linux 的接收窗默认由 DRS (tcp_rcv_space_adjust) **随吞吐自动长大**,
+ *   上限 tcp_rmem[2] (本板 1.9 MB)。而**一旦应用调用 setsockopt(SO_RCVBUF)**,
+ *   内核就置上 SOCK_RCVBUF_LOCK, DRS 从此**整个关掉** —— 窗口被钉死在
+ *   握手时按初始 rcvbuf 算出的 window_clamp (几十 KB) 上, 再也长不大。
+ *   于是"把接收缓冲调大"这件事的净效果是**把接收窗调小**。
+ *   实测 (同一个 povstream, 同一条链路, 交错):
+ *     设 768 KB (老行为): 2.1-2.8 MB/s     不设 (本默认): 6.6-7.8 MB/s
+ *   同一时间同一块板上, 一个 Python 写的最小 sink (什么都没设) 就有 6-8 MB/s,
+ *   比 C 写的 pov_rxd 快 3 倍 —— 差别全在这一行 setsockopt 上。
+ * ⚠ 别再"因为一帧 272 KB 比缓冲大所以要调大缓冲"了: 窗口 x RTT 才是吞吐,
+ *   而这条链路 RTT 有 30 ms, 钉死的几十 KB 窗正好就是 2-3 MB/s。 */
+static int g_rcvbuf = 0;
 static unsigned long g_w_dec_us, g_w_dec_max, g_w_c0_us, g_w_c1_us, g_w_dec_n;
 static unsigned long g_w_cpy_us, g_w_cpy_max, g_w_wait_us, g_w_wait_max, g_w_cpy_n;
 /* 🔴 2026-08-05 加: 收包耗时。老 DIAG 只有 dec/cpy/wait —— 一帧的四段里
@@ -1509,6 +1533,14 @@ static int serve_client(int fd, uint8_t *cbuf)
         if ((unsigned long)t_body > g_w_body_max) g_w_body_max = (unsigned long)t_body;
         g_w_rcv_n++;
 
+        /* ---- 消融: --diag-rxonly 收完就 ACK, 后面全跳过 ------------------- */
+        if (g_rxonly) {
+            g_st_rx++;
+            if (send_byte(fd, PVS_ACK) != 0) return -1;
+            if (g_stop) return -1;
+            continue;
+        }
+
         /* ---- 翻页相位锁定: 停在"解完 + 拷完正好赶上翻页窗"的相位再开解 ----
          * 必须放在收包**之后**、解码之前: 放在收包之前会让 socket 不被抽干,
          * 发送端被 TCP 背压顶住, 下一帧更晚 —— 越锁越差。 */
@@ -1677,6 +1709,11 @@ static void usage(const char *argv0)
         "  --diag on|off  每秒多打一行 DIAG (窗内瞬时 rx/flip 帧率 + 一帧开销\n"
         "                 拆成 dec/A/B/cpy/wait), default on\n"
         "  --diag-nocopy  消融实验: 跳过 staging->DDR bank 的 memcpy (画面不再\n"
+        "  --diag-rxonly  消融实验: 收完帧体立刻 ACK, 不解码/不发布/不翻页。\n"
+        "  --rcvbuf N     SO_RCVBUF 字节数。**默认 0 = 不设**, 让内核自动调窗;\n"
+        "                 设了反而会关掉 DRS 把接收窗钉死 (见 g_rcvbuf 注释),\n"
+        "                 实测吞吐掉到 1/3。非 0 只用于 A/B 对照。\n"
+        "                 用来把 DIAG 的 body 拆成「链路本身」与「板端处理挤慢的」\n"
         "                 更新!), 量那次拷贝对解码吞吐的真实代价。别在生产用\n"
         "  --phase-lock   on = 收完帧体后按转子相位停一小会儿再开解, 让\n"
         "                 dec+cpy 正好赶在翻页窗前结束 (每圈翻中一次)。\n"
@@ -1715,6 +1752,8 @@ int main(int argc, char **argv)
             else if (strcmp(m, "single")) { usage(argv[0]); return 2; }
         }
         else if (!strcmp(argv[i], "--diag-nocopy")) g_nocopy = 1;
+        else if (!strcmp(argv[i], "--diag-rxonly")) g_rxonly = 1;
+        else if (!strcmp(argv[i], "--rcvbuf") && i + 1 < argc) g_rcvbuf = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-rmem-fix")) g_no_rmem_fix = 1;
         else if (!strcmp(argv[i], "--phase-lock") && i + 1 < argc) {
             const char *m = argv[++i];
@@ -1852,57 +1891,57 @@ int main(int argc, char **argv)
         int ka = 10; setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE,  &ka, sizeof ka);
         ka = 3;      setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &ka, sizeof ka);
         ka = 3;      setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT,   &ka, sizeof ka);
-        /* 接收缓冲: PC 端 window=2 (最多 2 帧在途), 要能吸掉 ~1.5 帧压缩数据
-         * (双面约 300 KB/帧)。内核记账时会把设定值 x2, 所以回读一下打出来。 */
-        int rbuf = RCVBUF_BYTES;
-        const char *how = "SO_RCVBUF";
-        /* 2026-08-05: 板子的 net.core.rmem_max 出厂只有 **176 KB**, 比一帧压缩
-         * 数据 (fold540 + lz4-HC9 = 272 KB) 还小; SO_RCVBUFFORCE 在这台板子上
-         * 也一直失败 (日志里 how 恒为 SO_RCVBUF), 于是生效值只有 416 KB ——
-         * **低于本文件自己定的 RCVBUF_MIN_EFF(450 KB)**, 那条 WARN 一直在刷。
-         * 抬完 rmem_max 后 SO_RCVBUFFORCE 就成功了, 生效 1.5 MB。
-         *
-         * ⚠ 老实说清楚收益: 头一次量到 收包 96->49 ms / 上屏 8.0->12.0 帧每秒,
-         *   看着像天上掉馅饼。但**交替 A/B (低/高/低/高/低/高, 各 20 s)**
-         *   复测下来两组中位数都是 8.00 帧/秒 (body 96.0 vs 89.7 ms, 高的那组
-         *   σ 还有 66.9) —— 那次 12.0 是 WiFi 环境自己变好, 不是这行代码。
-         *   保留它的理由只是"接收窗小于一帧显然不对 + 消掉自家的 WARN",
-         *   **不要**拿它当帧率优化往外说。这也正是 tools/phase_bench.py 存在
-         *   的意义: 单次测量在这条链路上根本分不出 8 和 12。 */
-        if (!g_no_rmem_fix) {
-            long want = RCVBUF_BYTES * 2L;   /* 内核记账要 x2 */
-            FILE *f = fopen("/proc/sys/net/core/rmem_max", "r+");
-            long cur = 0;
-            if (f && fscanf(f, "%ld", &cur) == 1 && cur < want) {
-                rewind(f);
-                if (fprintf(f, "%ld", want) > 0)
-                    logts("net.core.rmem_max %ld -> %ld B (原值比一帧压缩数据"
-                          "还小, 接收窗会把链路掐到 1/2 速; 见上方注释)",
-                          cur, want);
-                else
-                    logts("WARN: 抬 net.core.rmem_max 失败 (%s), 当前 %ld B —— "
-                          "收包会变慢一倍, 手动: sysctl -w net.core.rmem_max=%ld",
-                          strerror(errno), cur, want);
+        /* ---- 接收缓冲: 默认**什么都不做** ----------------------------------
+         * 🔴 2026-08-06 定案, 与 2026-08-05 的结论**相反** —— 老结论是错的:
+         *   老代码为了"一帧 272 KB 得装得下"去 SO_RCVBUFFORCE 768 KB。但
+         *   setsockopt(SO_RCVBUF) 的副作用是给 socket 置上 SOCK_RCVBUF_LOCK,
+         *   内核的接收窗自动放大 (DRS, tcp_rcv_space_adjust) **从此整个关闭**,
+         *   窗口被钉死在握手时按初始 rcvbuf 算出的 window_clamp 上, 再也长不大。
+         *   吞吐 = 在途窗口 / RTT; 这条 WiFi 链路 RTT 约 30 ms, 钉死的窗正好
+         *   给出 2-3 MB/s —— 就是"收包只有 3 MB/s"的全部真身。
+         *   实测 (同一个 povstream, 同一条链路, 交错跑):
+         *     设 768 KB (老行为)  2.76 / 2.12 / 1.73 MB/s
+         *     不设   (本默认)     7.75 / 6.59 / 4.44 MB/s
+         *   同一时刻, 一个什么 socket 选项都没设的 **Python** 最小 sink 也有
+         *   6-8 MB/s, 比 C 写的 pov_rxd 快 3 倍 —— 差别只在这一段。
+         * ⚠ "一帧比接收缓冲大" 从来不是问题: TCP 是字节流, recv_full 本来就
+         *   分多次收。决定吞吐的是**在途窗口**, 不是能不能一次缓存下整帧。
+         * 保留 --rcvbuf N 只是为了能把老行为 A/B 复现出来。 */
+        if (g_rcvbuf > 0) {
+            int rbuf = g_rcvbuf;
+            const char *how = "SO_RCVBUF";
+            /* 只有真要设 rcvbuf 时才有必要抬 net.core.rmem_max (出厂 176 KB,
+             * 不抬的话 SO_RCVBUFFORCE 会失败而悄悄砍半)。默认路径不设 rcvbuf,
+             * 也就不需要动这个 sysctl。 */
+            if (!g_no_rmem_fix) {
+                long want = (long)g_rcvbuf * 2L;   /* 内核记账要 x2 */
+                FILE *f = fopen("/proc/sys/net/core/rmem_max", "r+");
+                long cur = 0;
+                if (f && fscanf(f, "%ld", &cur) == 1 && cur < want) {
+                    rewind(f);
+                    if (fprintf(f, "%ld", want) <= 0)
+                        logts("WARN: 抬 net.core.rmem_max 失败 (%s), 当前 %ld B",
+                              strerror(errno), cur);
+                }
+                if (f) fclose(f);
             }
-            if (f) fclose(f);
-        }
-        /* 先试 SO_RCVBUFFORCE: 本进程本来就要 root (/dev/mem), 有 CAP_NET_ADMIN
-         * 就能绕过 net.core.rmem_max 的上限 —— 默认 rmem_max 常常只有 208 KB,
-         * 普通 SO_RCVBUF 会被悄悄砍到一半需求量。失败再退回普通设置。 */
-        if (setsockopt(cfd, SOL_SOCKET, SO_RCVBUFFORCE, &rbuf, sizeof rbuf) == 0)
-            how = "SO_RCVBUFFORCE";
-        else if (setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf) != 0)
-            logts("WARN: setsockopt SO_RCVBUF %d failed (%s)", rbuf, strerror(errno));
-        int rbuf_eff = 0;
-        socklen_t rlen = sizeof rbuf_eff;
-        if (getsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &rbuf_eff, &rlen) == 0) {
-            logts("SO_RCVBUF: requested %d B via %s -> effective %d B "
-                  "(%.1f 帧双面压缩 @300KB)", rbuf, how, rbuf_eff,
-                  rbuf_eff / (300.0 * 1024.0));
-            if (rbuf_eff < RCVBUF_MIN_EFF)
-                logts("WARN: SO_RCVBUF effective %d B < %d B: window=2 的突发"
-                      "可能压不住 (非 root? 抬 net.core.rmem_max)",
-                      rbuf_eff, RCVBUF_MIN_EFF);
+            if (setsockopt(cfd, SOL_SOCKET, SO_RCVBUFFORCE, &rbuf, sizeof rbuf) == 0)
+                how = "SO_RCVBUFFORCE";
+            else if (setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf) != 0)
+                logts("WARN: setsockopt SO_RCVBUF %d failed (%s)", rbuf,
+                      strerror(errno));
+            int rbuf_eff = 0;
+            socklen_t rlen = sizeof rbuf_eff;
+            if (getsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &rbuf_eff, &rlen) == 0)
+                logts("SO_RCVBUF: requested %d B via %s -> effective %d B "
+                      "⚠ 这会关掉内核接收窗自动放大, 只该用于 A/B 对照",
+                      rbuf, how, rbuf_eff);
+        } else {
+            int rbuf_eff = 0;
+            socklen_t rlen = sizeof rbuf_eff;
+            getsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &rbuf_eff, &rlen);
+            logts("接收缓冲: 不设 SO_RCVBUF, 交给内核 DRS 自动放大 "
+                  "(此刻 %d B, 上限见 net.ipv4.tcp_rmem[2])", rbuf_eff);
         }
         struct timeval rto = { .tv_sec = 30, .tv_usec = 0 };
         setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof rto);

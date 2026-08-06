@@ -1600,7 +1600,13 @@ def main():
     s.add_argument('--host', default='127.0.0.1')
     s.add_argument('--port', type=int, default=DEFAULT_PORT)
     s.add_argument('--fps', type=float, default=12.0,
-                   help='发送节奏上限; 设高于转速让逐帧 ACK 自动贴住翻页率 (设 4 反而被 RTT 拖到 3.5)')
+                   help='发送节奏上限。🔴 设成**等于转速** (900 RPM = 15) —— '
+                        '别再"设高于转速让 ACK 自己贴住翻页率"了, 那条老经验只在'
+                        '链路是瓶颈时成立。链路修好后 (2026-08-06) 发 40 板端能'
+                        '解 22 帧/秒, 但每圈只翻得动 1 帧 = 最多 15, 多解的 7 帧'
+                        '纯属白解, 还要和 flip 线程抢 DDR: 实测 cpy 25→32ms、'
+                        'dec 25→32ms, 上屏反而从 15.00 掉到 12.99 帧/秒 '
+                        '(交错 A/B 4x20s, 效应量 1.43)。')
     s.add_argument('--loop', action='store_true')
     s.add_argument('--reconnect', action='store_true',
                    help='连接断/ACK 超时不退出, 每 5s 重连 (板重启自动续推)')
