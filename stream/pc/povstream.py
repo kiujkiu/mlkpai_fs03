@@ -79,6 +79,21 @@ FRAME_RAW = N_SLICES * pack_obs.SLICE_STRIDE          # 4423680 (传统单面帧
 N_SLICES_MAX = 720                                    # 双面上限 (面A 360 + 面B 360)
 N_SLICES_FOLD = 180                                   # --fold-a 折叠后的面A 片数
 FRAME_RAW_MAX = N_SLICES_MAX * pack_obs.SLICE_STRIDE  # 8847360
+
+
+def _apply_slot_count(ns):
+    """把「一圈多少槽」落到模块全局。**必须在任何渲染/打包之前调用。**
+
+    为什么要能改: 面板实测 2D 刷新只有 ~1340 Hz, 15 rps 下每圈只画得出 ~89 个
+    不同角度 (见 project_pov3d_refresh_vs_rpm 的 oe 扫描)。渲 360 片里有 3/4
+    根本没机会上屏, 而链路/解码/memcpy 为它们付的代价是实打实的。
+    协议侧本来就支持任意片数 (protocol.h:37 「头里的 n_slices 是权威」, 1..720),
+    所以这是**纯 PC 侧改动, 板端零改动**。
+    """
+    global N_SLICES, FRAME_RAW, N_SLICES_FOLD
+    N_SLICES = ns
+    FRAME_RAW = N_SLICES * pack_obs.SLICE_STRIDE
+    N_SLICES_FOLD = N_SLICES // 2      # --fold-a: 穿心面只渲半圈
 FLAG_RLE, FLAG_ZLIB, FLAG_DELTA = 0x0001, 0x0002, 0x0004
 FLAG_DUAL_FACE, FLAG_FOLD_A = 0x0008, 0x0010          # v3.1 偏心屏 (protocol.h)
 FLAG_LZ4 = 0x0020                                     # v3.3 LZ4 raw block (与 ZLIB 互斥)
@@ -492,7 +507,8 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
     n_out: 本面输出的槽数 (默认 360 = 整圈)。180 = --fold-a 折叠面A, 只出
     θ=0..179° —— 槽↔角度映射与整圈渲染完全一致, 前 180 槽逐字节相同,
     180..359 由 PL 取 idx-180 再做镜像置换补出 (仅穿心面成立)。"""
-    assert N_SLICES % render_slices == 0, '--render-slices 必须整除 360'
+    assert N_SLICES % render_slices == 0, \
+        f'--render-slices {render_slices} 必须整除槽数 {N_SLICES}'
     dup = N_SLICES // render_slices
     assert 0 < n_out <= N_SLICES and n_out % dup == 0, \
         f'n_out={n_out} 须 ≤360 且是复制因子 dup={dup} 的整数倍'
@@ -1498,8 +1514,18 @@ def cmd_bench(args):
 def add_render_opts(ap):
     ap.add_argument('--anim', choices=sorted(ANIMS), default='spinpulse')
     ap.add_argument('--frames', type=int, default=36, help='动画帧数 (=循环周期)')
-    ap.add_argument('--render-slices', type=int, default=360,
-                    help='实际渲染角度数 (整除 360, 减少省时, 布局仍 360 槽)')
+    ap.add_argument('--render-slices', type=int, default=0,
+                    help='实际渲染角度数 (整除槽数, 减少省时, 布局仍是槽数那么多槽); '
+                         '0 = 跟 --n-slices 走 (每槽一个真实角度)')
+    # 🔴 2026-08-10: 把"一圈多少槽"从写死的 360 变成可调。
+    # 为什么: 面板实测 2D 刷新只有 ~1340 Hz, 15 rps 下每圈只画得出 ~89 个不同角度
+    # (见 project_pov3d_refresh_vs_rpm)。渲 360 片里有 3/4 根本没机会上屏,
+    # 而链路/解码/memcpy 为它们付的代价是实打实的。
+    # 协议侧本来就支持: protocol.h:37「头里的 n_slices 是权威, 不再硬校验 == 360」,
+    # 范围 1..720 ⇒ **板端零改动**。
+    ap.add_argument('--n-slices', type=int, default=360,
+                    help='一圈的槽数 (=帧里的 n_slices, 1..720)。默认 360 保持原行为; '
+                         '90 ≈ 面板 1340Hz @15rps 的真实能力, 载荷/解码/memcpy 全线 ÷4')
     ap.add_argument('--sub', type=int, default=3)
     ap.add_argument('--thresh', type=float, default=128)
     ap.add_argument('--no-dither', action='store_true')
@@ -1644,6 +1670,19 @@ def main():
     b.set_defaults(fn=cmd_bench)
 
     args = ap.parse_args()
+
+    # 🔴 顺序要紧: 槽数必须在任何渲染/打包之前落到全局 (FRAME_RAW 等按它算)。
+    ns = getattr(args, 'n_slices', None)
+    if ns is not None:
+        if not 1 <= ns <= N_SLICES_MAX:
+            sys.exit(f'--n-slices 须在 1..{N_SLICES_MAX} (给的是 {ns})')
+        _apply_slot_count(ns)
+    # --render-slices 0 = 每槽一个真实角度 (不复制填充)
+    if not getattr(args, 'render_slices', 0):
+        args.render_slices = N_SLICES
+    if N_SLICES % args.render_slices:
+        sys.exit(f'--render-slices {args.render_slices} 必须整除槽数 {N_SLICES}')
+
     args.fn(args)
 
 
