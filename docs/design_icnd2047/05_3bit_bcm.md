@@ -8,7 +8,7 @@
 | 项 | 值 | 出处 |
 |---|---|---|
 | 色深 | 每通道 1-bit，每像素 8 色 | `tools/pack_obs.py` |
-| 观察者图 | 160×160... `H=180, W=160, 3` | `pack_obs.pack_slice` |
+| 观察者图 | `H=180, W=160, 3` | `pack_obs.pack_slice` |
 | fb 布局 | 9 lane × 512 × 32b，addr={row[5:0],pair[2:0]} | `panel_engine_2047.v:g_fb` |
 | 实占 | 54 行 × 6 pair = **324 / 512** | 同上 |
 | 行周期 | 195 拍 (1 取指 + 1 装载 + 192 移位 + LWAIT + 1 显示) | `icnd2047_panel_core.v` |
