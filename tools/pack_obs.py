@@ -19,7 +19,16 @@ plane 内布局 (DDR 镜像契约, 1-bit 时代起就没变过):
   bpp=1 (默认): 一片 = 一个 plane = 0x3000, 与历史逐字节一致。
   bpp=3       : 每通道 3 bit (码值 0..7), 行内 BCM。
                 一片 = 3 个 plane 顺序排列, **plane p 在 slice_base + p*0x3000**,
-                plane0 = LSB(权重 1) / plane1(权重 2) / plane2 = MSB(权重 4)。
+                **plane0 = MSB(权重 4) / plane1(权重 2) / plane2 = LSB(权重 1)**
+                🔴 2026-08-20 上板实测定的位序, 不是随便排的:
+                硬件 `LWAIT = max(0, oe-111)` 里的 111 来自"OE 结束后还要等
+                行驱推进 80 拍", 而 **plane 边界不推进行驱** ⇒ 只有最后一个
+                plane(plane2) 受 111 限制, plane0/plane1 的 OE 上限是移位窗 192。
+                把最大权重放在不受限的 plane0 上, 权重取 184/92/46 (4:2:1):
+                占空比 0.5504 vs 1-bit 的 0.5692 = **96.7%, 亮度几乎无损**,
+                且 frame_period 一拍不涨 (实测 31590 恒定)。
+                反过来排(LSB 在 plane0)则 4W 落在受限的 plane2, W≤27,
+                占空比只有 0.3231 = 1-bit 的 57%。
                 每个 plane 内部沿用上面那套 lane-major 布局, 一个 bit 都没动。
                 片步长 SLICE_STRIDE_3BIT = 0x9000 = 36864。
                 硬件 OE 权重 27/54/108 沿 = 1:2:4 ⇒ **码值与发光时间成正比,
@@ -113,7 +122,7 @@ def pack_slice(img, bpp=1, pad=False):
            返回 SLICE_DATA=11664B; pad=True 时补到 PLANE_STRIDE=12288B。
            ⚠ 这条路径与 2026-08-20 之前**逐字节相同**, 是 3-bit 改造的回归判据。
     bpp=3: img 是 uint8 码值 0..7 (0=灭, 7=全亮, 与发光时间成正比)。
-           按位切成 plane0(LSB)/plane1/plane2(MSB), 每个 plane 各走一遍
+           按位切成 plane0(MSB)/plane1/plane2(LSB), 每个 plane 各走一遍
            pack_plane 并各自补到 0x3000 → 返回 SLICE_STRIDE_3BIT=36864B。
            plane 之间的 624B padding 是片内布局契约的一部分, 因此 3-bit
            **恒定带 padding**, pad 参数被忽略。
@@ -129,7 +138,8 @@ def pack_slice(img, bpp=1, pad=False):
     code = a.astype(np.uint8, copy=False)
     if code.size and int(code.max()) > 7:
         raise ValueError(f'3-bit 码值须在 0..7, 实得 max={int(code.max())}')
-    return b''.join(pack_plane(((code >> p) & 1).astype(np.bool_)) + PLANE_PAD
+    # plane p 装 bit (PLANES[3]-1-p) —— MSB 先行, 见文件头位序说明
+    return b''.join(pack_plane(((code >> (2 - p)) & 1).astype(np.bool_)) + PLANE_PAD
                     for p in range(3))
 
 
@@ -147,7 +157,7 @@ def unpack_slice(buf, bpp=1):
     img = np.zeros((H, W, 3), np.uint8)
     for p in range(3):
         off = p * PLANE_STRIDE
-        img |= unpack_plane(b[off:off + SLICE_DATA]).astype(np.uint8) << p
+        img |= unpack_plane(b[off:off + SLICE_DATA]).astype(np.uint8) << (2 - p)
     return img
 
 

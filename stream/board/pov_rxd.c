@@ -15,13 +15,13 @@
  *                             本程序**不假设它存在**, 见 bcm_apply 的被动探测)
  *   0x0C W  CFG_MISC     [31:30]=subcmd。本程序只用 **subcmd=01** (v3.4 新增,
  *                        以前顶层未实现的那个槽):
- *                          [7:0]=oe_w1  BCM 中位平面的 OE 沿数 (默认 54)
- *                          [15:8]=oe_w2 BCM 高位平面的 OE 沿数 (默认 108)
+ *                          [7:0]=oe_w1  plane1 的 OE 沿数 (默认 92)
+ *                          [15:8]=oe_w2 plane2 的 OE 沿数 (默认 46)
  *                          [16]=bpp_mode 0=1-bit(兼容旧内容) 1=3-bit 行内 BCM
- *                        ⚠ oe_w0 (低位平面, 默认 27) **不在这里** —— 它复用
- *                        subcmd=10 的 oe_window[15:8]。而 1-bit 的亮度上限也是
- *                        同一个 oe_window (现固化成 111), 所以切 3-bit 必须连
- *                        oe_window 一起改成 27, 否则 BCM 的 1:2:4 比例变成
+ *                        ⚠ oe_w0 (plane0 = **MSB**, 默认 184) **不在这里** ——
+ *                        它复用 subcmd=10 的 oe_window[15:8]。而 1-bit 的亮度上限
+ *                        也是同一个 oe_window (现固化成 111), 所以切 3-bit 必须连
+ *                        oe_window 一起改成 184, 否则 4:2:1 比例变成
  *                        111:54:108 = 乱的。**subcmd=10 由 pov_boot.sh 固化,
  *                        本守护进程一个字都不写** (那个字里还带着 dclk_fast /
  *                        overlap_en / au_rows_max / oe_set_pulse, 从这里 RMW
@@ -262,9 +262,19 @@
 #define STATUS_BPP_MODE    (1u << 17)           /* STATUS[17] bpp_mode 回读 (可选) */
 /* BCM 三个权重 27/54/108 沿 = 1:2:4, 全部 <= 111 ⇒ 不插 LWAIT ⇒ 时间上免费
  * (05_3bit_bcm.md §1)。oe_w0=27 走 subcmd=10 的 oe_window, 本进程不写, 见文件头。*/
-#define OE_W0_3BIT_HINT    27u                  /* 仅用于日志提醒, 不写寄存器 */
-#define OE_W1_DEFAULT      54u
-#define OE_W2_DEFAULT      108u
+/* 🔴 2026-08-20 上板实测改的权重与位序 —— 不是随便排的, 改之前先读 05_3bit_bcm.md:
+ *   硬件 LWAIT = max(0, oe-111) 里的 111 来自"OE 结束后还要等行驱推进 80 拍",
+ *   而 **plane 边界不推进行驱** ⇒ 只有最后一个 plane(plane2) 受 111 限制,
+ *   plane0/plane1 的 OE 上限是移位窗的 192。实测: w0=187 / w1=187 都不加拍,
+ *   只有 w2=187 让 frame_period 31590 -> 35694。
+ *   ⇒ 把最大权重放在不受限的 plane0 上, 于是 host 侧 plane0 装 **MSB**,
+ *      权重 184/92/46 (精确 4:2:1)。占空比 0.550 vs 1-bit 的 0.569 = 96.7%,
+ *      **亮度几乎无损**, 且 frame_period 一拍不涨。
+ *   ⚠ 旧值 27/54/108 是 LSB-first 时代的, 与现在的位序**搭配即非单调**
+ *     (码值1=108沿 会比 码值2=54沿 还亮)。两者必须同时改, 改一个就是坏的。 */
+#define OE_W0_3BIT_HINT    184u                 /* 仅用于日志提醒, 不写寄存器 */
+#define OE_W1_DEFAULT      92u
+#define OE_W2_DEFAULT      46u
 #define OE_W_MIN           2u                   /* RTL 内箝 [2,187] */
 #define OE_W_MAX           187u
 /* 影子每这么多次 apply 强制重写一次: 防的是"别人(JTAG/引导脚本)动过 0x0C 而

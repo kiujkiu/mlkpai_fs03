@@ -169,6 +169,43 @@ def build_grid64():
     return code
 
 
+
+def build_bw(cell=40):
+    """纯黑白粗棋盘 (只用码值 0 和 7), 但走 3-bit 路径。
+
+    诊断用: 把"灰度"和"3-bit 时序"分开 ——
+      · 这张图还糊  => 问题在 3-bit 的时序/锁存, 与灰度级无关
+      · 这张图很锐  => 3-bit 通路是好的, 糊来自中间灰度级本身
+                       (或笔画太细 / 抖动 / 面板本身的点扩散)
+    格子取 40x45 (4x4), 远大于笔画宽度, 排除"太细看不清"的干扰。
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    ch = H // 4
+    for cy in range(4):
+        for cx in range(W // cell):
+            if (cx + cy) % 2 == 0:
+                code[cy * ch:(cy + 1) * ch, cx * cell:(cx + 1) * cell, :] = LEVELS - 1
+    return code
+
+
+
+def build_levels():
+    """最干净的灰阶判据: 8 条纯白色块横排, 码值 0..7, 无数字/无棋盘/无彩色。
+
+    专门用来回答"到底有没有 8 级"这一个问题 —— grid64 里的数字和棋盘
+    会严重干扰相邻块的亮度比较, 高亮端尤其容易糊成一片。
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    for cx in range(8):
+        code[:, cx * (W // 8):(cx + 1) * (W // 8), :] = cx
+    return code
+
+
+def build_full():
+    """全屏码值 7 —— 用来看物理点亮区域到底覆盖到哪, 确认有没有额外黑边。"""
+    return np.full((H, W, 3), LEVELS - 1, np.uint8)
+
+
 def build_codes(pattern):
     """→ (H,W,3) uint8 码值图 0..7。"""
     code = np.zeros((H, W, 3), np.uint8)
@@ -179,6 +216,12 @@ def build_codes(pattern):
             for c in range(3):
                 if mask[c]:
                     code[:, x0:x1, c] = lvl[:, None]
+    elif pattern == 'levels':
+        return build_levels()
+    elif pattern == 'full':
+        return build_full()
+    elif pattern == 'bw':
+        return build_bw()
     elif pattern == 'grid64':
         return build_grid64()
     elif pattern == 'checker':
@@ -245,7 +288,7 @@ def save_png(code, path, gamma):
 def main():
     ap = argparse.ArgumentParser(description='8 级灰度楔测试图 (3-bit 上板目视)')
     ap.add_argument('--bpp', type=int, choices=sorted(pack_obs.BPP_MODES), default=3)
-    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'rings', 'ramp'], default='flat')
+    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'levels', 'full', 'bw', 'rings', 'ramp'], default='flat')
     ap.add_argument('--n-slices', type=int, default=60,
                     help='帧里的片数 (默认 60 = 3-bit 方案推荐的每面槽数)')
     ap.add_argument('--gamma', type=float, default=DEFAULT_GAMMA,

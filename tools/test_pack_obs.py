@@ -64,7 +64,8 @@ def ref_pack_slice(img, bpp):
                               else np.asarray(img))
     code = np.asarray(img, np.uint8)
     pad = b'\0' * (PLANE_STRIDE - SLICE_DATA)
-    return b''.join(ref_pack_plane((code >> p) & 1 != 0) + pad for p in range(3))
+    # plane p 装 bit (2-p): MSB 先行 (2026-08-20 上板定的位序, 见 pack_obs 文件头)
+    return b''.join(ref_pack_plane((code >> (2 - p)) & 1 != 0) + pad for p in range(3))
 
 
 # ================= 测试 =================
@@ -147,7 +148,7 @@ def test_plane_layout():
     buf = pack_obs.pack_slice(code, bpp=3)
     for p in range(3):
         off = p * PLANE_STRIDE
-        want = pack_obs.pack_slice((code >> p) & 1 != 0)      # 走 1-bit 路径
+        want = pack_obs.pack_slice((code >> (2 - p)) & 1 != 0)  # 走 1-bit 路径 (MSB 先行)
         assert buf[off:off + SLICE_DATA] == want, f'plane {p} 数据不在 {off:#x}'
         assert buf[off + SLICE_DATA:off + PLANE_STRIDE] == b'\0' * 624, \
             f'plane {p} 尾部 624B 未补零'

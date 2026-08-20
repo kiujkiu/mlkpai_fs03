@@ -25,14 +25,15 @@ BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x11000000, 0x870000
 #   2) 引擎每圈片数 0x10[31:16] 换成 3-bit 的槽数 (方案定的是每面 60)
 #   3) PHASE_B(0x1C) 必须 < 每圈片数 —— RTL 只做一次条件减不取模, 写 180 而
 #      引擎只有 60 片 = 屏B 索引越界 = 读野地址。所以这里一律取"半圈"
-#   4) oe_w0 = 0x0C sub10 的 oe_window: 1-bit 用 111 (免费亮度上限), 3-bit 必须
+#   4) oe_w0 = 0x0C sub10 的 oe_window: 1-bit 用 111 (免费亮度上限), 3-bit 用 184
+#      (plane0 = MSB; 只有 plane2 受 111 限制, 见 05_3bit_bcm.md §5), 必须
 #      降到 27, 否则 BCM 三个平面的权重变成 111:54:108, 1:2:4 的比例全乱
 BPP3 = 0                                  # ← 唯一的开关: 1 = 冷启动进 3-bit
-N_SLICES = 60 if BPP3 else 360            # 引擎每圈片数 (每面)
+N_SLICES = 50 if BPP3 else 360            # 引擎每圈片数 (每面); 3-bit 实测每圈 53 个角度
 STRIDE   = 0x9000 if BPP3 else 0x3000     # 片距 = 3 个位平面 / 1 个位平面
 DEFAULT_BIN = ('/home/uisrc/anime_dual3b120.bin' if BPP3      # 60+60 片 3-bit
                else '/home/uisrc/anime_dual720.bin')          # 360+360 片 1-bit
-OE_W0 = 27 if BPP3 else 111               # 低位平面 / 1-bit 亮度 (0x0C sub10)
+OE_W0 = 184 if BPP3 else 111              # plane0=MSB(权重4) / 1-bit 亮度 (0x0C sub10)
 OE_W1, OE_W2 = 54, 108                    # 中/高位平面 (0x0C sub01), 27:54:108 = 1:2:4
 # ===========================================================================
 
