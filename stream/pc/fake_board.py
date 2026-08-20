@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
 sys.path.insert(0, HERE)
 import pack_obs
 from povstream import (MAGIC, HDR, FRAME_RAW, N_SLICES, ACK, NAK,
-                       FLAG_DELTA, decompress_frame, xor_frames)
+                       FLAG_DELTA, FLAG_3BIT, decompress_frame, xor_frames)
 
 
 def recv_exact(conn, n):
@@ -40,11 +40,15 @@ def recv_exact(conn, n):
     return bytes(buf)
 
 
-def save_slice0_png(raw, path):
+def save_slice0_png(raw, path, bpp=1):
     from PIL import Image
     import numpy as np
-    img = pack_obs.unpack_slice(raw[:pack_obs.SLICE_DATA]).astype(np.uint8) * 255
-    Image.fromarray(img).resize((pack_obs.W * 3, pack_obs.H * 3), Image.NEAREST).save(path)
+    if bpp == 3:                                    # 码值 0..7 → 0..252 目视
+        img = pack_obs.unpack_slice(raw[:pack_obs.SLICE_STRIDE_3BIT], bpp=3) * 36
+    else:
+        img = pack_obs.unpack_slice(raw[:pack_obs.SLICE_DATA]).astype(np.uint8) * 255
+    Image.fromarray(img.astype(np.uint8)).resize(
+        (pack_obs.W * 3, pack_obs.H * 3), Image.NEAREST).save(path)
 
 
 def handle(conn, args, ref_md5=None):
@@ -61,10 +65,14 @@ def handle(conn, args, ref_md5=None):
         magic, comp_len, raw_len, n_slices, flags = HDR.unpack(hdr)
         # 2026-07-31: 帧长不再是常量 (v3.1 偏心屏可能是 180/360/540/720 片),
         # 跟板端 pov_rxd 一样按 n_slices 校验, 不再硬比 FRAME_RAW/N_SLICES。
-        if (magic != MAGIC or not (1 <= n_slices <= 720)
-                or raw_len != n_slices * 0x3000):
+        # 2026-08-20 v3.4: **片距也从 flags 推** (protocol.h PVS_STRIDE),
+        # 3-bit 一片 0x9000 ⇒ 片数上限 240 (帧字节上限 8847360 不变)。
+        bpp = 3 if (flags & FLAG_3BIT) else 1
+        stride = pack_obs.slice_stride(bpp)
+        if (magic != MAGIC or not (1 <= n_slices <= 8847360 // stride)
+                or raw_len != n_slices * stride):
             print(f'[fake_board] BAD HDR magic={magic!r} raw_len={raw_len} '
-                  f'n_slices={n_slices}', flush=True)
+                  f'n_slices={n_slices} bpp={bpp}', flush=True)
             conn.sendall(bytes([NAK]))
             return False
         payload = recv_exact(conn, comp_len)
@@ -98,7 +106,8 @@ def handle(conn, args, ref_md5=None):
               f'{raw_len / comp_len:.1f}x, sha256={sha[:16]}{md5s}', flush=True)
         if args.save_png:
             os.makedirs(args.save_png, exist_ok=True)
-            save_slice0_png(raw, os.path.join(args.save_png, f'frame_{n:04d}_slice0.png'))
+            save_slice0_png(raw, os.path.join(args.save_png, f'frame_{n:04d}_slice0.png'),
+                            bpp=bpp)
         if getattr(args, 'dec_ms', 0) > 0:
             time.sleep(args.dec_ms / 1000.0)   # 模拟板端解码耗时
         conn.sendall(bytes([ACK]))

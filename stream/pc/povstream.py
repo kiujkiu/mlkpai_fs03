@@ -3,11 +3,15 @@
 """
 povstream.py — PC 侧 POV 体显示推流器 (PVS1 协议, 见 protocol.md / ../protocol.h).
 
-frame = n_slices × 0x3000 (pack_obs 硬件实测映射, 不可改), 传统单面 360 片
-= 4,423,680B。**帧长不再是常量** (2026-07-31 v3.1 偏心屏): 头里的 n_slices
-才是权威, raw_len = n_slices × 0x3000, 见下面 --dual-face / --fold-a。
-管线: 动画源 → 逐帧点云变换 → 体素化 → 切片渲染 → 1-bit Bayer 抖动
-(相位随 slice+frame 双变化, 时间抖动平滑) → pack → 压缩 → TCP → 板 ACK.
+frame = n_slices × 片距 (pack_obs 硬件实测映射, 不可改), 传统单面 360 片
+1-bit = 4,423,680B。**帧长不再是常量** (2026-07-31 v3.1 偏心屏): 头里的
+n_slices 才是权威, raw_len = n_slices × 片距, 见下面 --dual-face / --fold-a。
+**片距也不再是常量** (2026-08-20 v3.4 3-bit): --bpp 1 → 0x3000 (默认, 老行为
+逐字节不变) / --bpp 3 → 0x9000 = 一片里 3 个位平面 (行内 BCM, 权重 27/54/108
+沿 = 1:2:4), 帧头置 PVS_FLAG_3BIT, 板端按 flags 推片距。见 05_3bit_bcm.md。
+管线: 动画源 → 逐帧点云变换 → 体素化 → 切片渲染 → 量化抖动
+(1-bit: Bayer 阈值 / 3-bit: gamma 解码 + 8 级 + 残差 Bayer; 相位都随
+slice+frame 双变化, 时间抖动平滑) → pack → 压缩 → TCP → 板 ACK.
 压缩用 --codec 选: zlib (默认, 老行为逐字节不变) / lz4 (LZ4 raw block,
 压缩比几乎相同, 板端 A9 解压快 4 倍 → 48 fps, 见 protocol.h PVS_FLAG_LZ4)。
 --stream-split balanced 再把载荷按板端两核的**工作量**切成多条独立流
@@ -21,6 +25,11 @@ numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
   python3 povstream.py stream --dir frames_spinpulse --host <board> --fps 10 --loop
   python3 povstream.py stream --anim globe --frames 60 --loop   # 现渲直推 (慢)
   python3 povstream.py bench                                    # 压缩测量
+
+3-bit 色深 (v3.4, 每通道 0..7, 行内 BCM):
+  python3 povstream.py render --anim spin --bpp 3 --n-slices 60  # 60 片 = 2.2MB/帧
+  python3 povstream.py stream --dir frames_spin --host <board>   # bpp 从 meta.json 读
+  python3 tools/gen_wedge.py --bpp 3 --out wedge.bin             # 8 级灰度楔 (上板目视)
 
 v3.1 偏心屏 (两面垂距 0 / 13.4mm, 不再对称 ⇒ 不能共用一份数据):
   python3 povstream.py render --anim spin --dual-face           # 720 片 = 8.8MB/帧
@@ -75,10 +84,33 @@ import gen_anime_slices as gas
 # ---- PVS1 协议常量 (= stream/protocol.h) ----
 MAGIC = b'PVS1'
 N_SLICES = 360                                        # 传统单面帧片数 (默认值)
-FRAME_RAW = N_SLICES * pack_obs.SLICE_STRIDE          # 4423680 (传统单面帧长)
-N_SLICES_MAX = 720                                    # 双面上限 (面A 360 + 面B 360)
+# ---- 色深 (2026-08-20 v3.4, docs/design_icnd2047/05_3bit_bcm.md) ----
+# BPP=1: 一片 = 0x3000, 与历史逐字节一致 (默认, 空闲动画/板上默认内容都靠它)。
+# BPP=3: 每通道 3 bit, 一片 = 三个位平面 = 0x9000 (plane p 在 slice_base+p*0x3000)。
+# 🔴 片距不再是常量: **凡是算帧长/片数的地方一律用模块全局 SLICE_STRIDE**,
+#    别再写 pack_obs.SLICE_STRIDE (那是 1-bit 的兼容常量)。板端同款约定 =
+#    protocol.h 的 PVS_STRIDE(flags)。
+BPP = 1
+SLICE_STRIDE = pack_obs.slice_stride(BPP)             # 0x3000 / 0x9000
+FRAME_RAW = N_SLICES * SLICE_STRIDE                   # 4423680 (传统单面帧长)
+# 🔴 硬上限是**字节数** (板端 staging 缓冲/DDR bank 间距), 不是片数:
+#    1-bit 720 片 × 0x3000 = 3-bit 240 片 × 0x9000 = 8847360B。
+FRAME_RAW_MAX = 8847360                               # = PVS_FRAME_RAW_MAX
+N_SLICES_MAX = FRAME_RAW_MAX // SLICE_STRIDE          # 1-bit 720 / 3-bit 240
 N_SLICES_FOLD = 180                                   # --fold-a 折叠后的面A 片数
-FRAME_RAW_MAX = N_SLICES_MAX * pack_obs.SLICE_STRIDE  # 8847360
+
+
+def _apply_bpp(bpp):
+    """把色深落到模块全局。**必须在 _apply_slot_count 和任何渲染/打包之前调用。**
+
+    只改「一片有多大」和「码值有几级」两件事: 面拆分、MSTREAM 流表、DELTA、
+    压缩位、槽↔角度映射全部与 1-bit 一模一样 (protocol.h §v3.4)。
+    bpp=1 时本函数是恒等变换 ⇒ 1-bit 输出逐字节不变。"""
+    global BPP, SLICE_STRIDE, N_SLICES_MAX, FRAME_RAW
+    BPP = bpp
+    SLICE_STRIDE = pack_obs.slice_stride(bpp)
+    N_SLICES_MAX = FRAME_RAW_MAX // SLICE_STRIDE
+    FRAME_RAW = N_SLICES * SLICE_STRIDE
 
 
 def _apply_slot_count(ns):
@@ -92,13 +124,17 @@ def _apply_slot_count(ns):
     """
     global N_SLICES, FRAME_RAW, N_SLICES_FOLD
     N_SLICES = ns
-    FRAME_RAW = N_SLICES * pack_obs.SLICE_STRIDE
+    FRAME_RAW = N_SLICES * SLICE_STRIDE
     N_SLICES_FOLD = N_SLICES // 2      # --fold-a: 穿心面只渲半圈
 FLAG_RLE, FLAG_ZLIB, FLAG_DELTA = 0x0001, 0x0002, 0x0004
 FLAG_DUAL_FACE, FLAG_FOLD_A = 0x0008, 0x0010          # v3.1 偏心屏 (protocol.h)
 FLAG_LZ4 = 0x0020                                     # v3.3 LZ4 raw block (与 ZLIB 互斥)
 FLAG_MSTREAM = 0x0040                                 # v3.3 多流流表 (取代双面 4B 前缀)
-FLAG_GEOM = FLAG_DUAL_FACE | FLAG_FOLD_A              # 描述载荷排布的位
+FLAG_3BIT = 0x0080                                    # v3.4 每通道 3-bit (片距 0x9000)
+FLAG_GEOM = FLAG_DUAL_FACE | FLAG_FOLD_A              # 描述载荷**几何**排布的位
+# 每帧 flags 恒 OR 上的"这一帧长什么样"的位 = 几何 + 色深 (与压缩位正交)。
+# 🔴 3BIT 必须在这里面: 板端 PVS_STRIDE(flags) 靠它推片距, 漏了就整帧错位。
+FLAG_LAYOUT = FLAG_GEOM | FLAG_3BIT
 # 能做 DELTA 的编解码 (板端 face_decode 先解码再 XOR, 与压缩位正交)
 DELTA_CODECS = ('zlib', 'lz4')
 # LZ4_compress_HC 级别。默认 12: 同一份 anime_dual720.bin 整帧单流实测
@@ -113,7 +149,7 @@ ACK, NAK = 0x06, 0x15
 #   里的 n_slices 字段不是一回事 —— 显示引擎每转仍然扫 360 片, 折叠面的
 #   180..359 是 PL 用 idx-180 + 镜像置换现补出来的。
 HDR = struct.Struct('<4sIIHH')                        # 16B
-PAD = b'\0' * (pack_obs.SLICE_STRIDE - pack_obs.SLICE_DATA)
+PAD = pack_obs.PLANE_PAD                              # 624B: 每个 plane 尾部补零
 DEFAULT_PORT = 9500
 DEFAULT_KEYINT = 26                                   # 关键帧周期 (发送端策略, 不进协议)
 DEFAULT_WINDOW = 2                                    # 发送窗口 (帧在途上限), 见 --window
@@ -226,7 +262,7 @@ def lz4_compress(data, level=DEFAULT_LZ4_LEVEL):
 
 def lz4_decompress(data, max_out):
     """LZ4 raw block → 原数据。raw block 里**不带原长**, dstCapacity 必须由
-    调用方给 (线上是 hdr.raw_len / 各面的 nX*0x3000)。"""
+    调用方给 (线上是 hdr.raw_len / 各面的 nX*片距)。"""
     import ctypes
     lib = _lz4()
     dst = ctypes.create_string_buffer(int(max_out))
@@ -330,7 +366,7 @@ def compress_frame(raw, codec, zlevel, split=None, lz4_level=DEFAULT_LZ4_LEVEL,
     if streams:
         parts, off, fl = [], 0, 0
         for ns in streams:
-            nb = ns * pack_obs.SLICE_STRIDE
+            nb = ns * SLICE_STRIDE
             c, fl = _encode(raw[off:off + nb], codec, zlevel, lz4_level)
             parts.append((c, ns))
             off += nb
@@ -349,7 +385,12 @@ def compress_frame(raw, codec, zlevel, split=None, lz4_level=DEFAULT_LZ4_LEVEL,
 def decompress_frame(payload, flags):
     """线上 payload → raw。多流时按流表/u32 前缀拆开分别解再拼回 —— 解出来
     与拆流前的同一帧逐字节相同 (板端各个核各解各的, 直接写进 staging 缓冲的
-    对应偏移, 连拼接都省了)。"""
+    对应偏移, 连拼接都省了)。
+
+    🔴 这是**接收侧**: 片距一律从 flags 推 (= protocol.h 的 PVS_STRIDE(flags)),
+    不看模块全局 BPP —— 收帧的进程 (fake_board / 测试) 根本没调过 _apply_bpp,
+    拿全局会把 3-bit 帧的 lz4 输出缓冲算小 3 倍。"""
+    stride = pack_obs.slice_stride(3 if flags & FLAG_3BIT else 1)
     if flags & FLAG_MSTREAM:
         (n,) = MSTR_N.unpack_from(payload)
         if not 1 <= n <= MAX_STREAMS:
@@ -362,7 +403,7 @@ def decompress_frame(payload, flags):
         out = []
         for clen, nsl in tbl:
             out.append(_decode(payload[off:off + clen], flags,
-                               nsl * pack_obs.SLICE_STRIDE))
+                               nsl * stride))
             off += clen
         return b''.join(out)
     if flags & FLAG_DUAL_FACE:
@@ -380,14 +421,16 @@ def xor_frames(a, b):
 
 
 def slices_of(nbytes, where=''):
-    """帧字节数 → n_slices, 顺带校验协议约束 (0x3000 整数倍 且 ≤ 720 片)。
+    """帧字节数 → n_slices, 顺带校验协议约束 (片距整数倍 且 ≤ 帧长上限)。
+    片距随 --bpp 变 (1-bit 0x3000 / 3-bit 0x9000), 上限恒是 8847360B。
 
     v3.1 起帧长不再是常量 (单面 360 / 双面 720 / 双面折叠 540 …), 凡是过去
     硬比 FRAME_RAW 的地方都改走这里。"""
-    st = pack_obs.SLICE_STRIDE
+    st = SLICE_STRIDE
     if nbytes <= 0 or nbytes % st or nbytes > FRAME_RAW_MAX:
         raise ValueError(f'{where}{nbytes}B 不是合法帧长 '
-                         f'(须为 0x{st:X} 的整数倍且 ≤ {FRAME_RAW_MAX})')
+                         f'(bpp={BPP} 片距 0x{st:X}: 须为它的整数倍且 ≤ '
+                         f'{FRAME_RAW_MAX})')
     return nbytes // st
 
 
@@ -397,7 +440,7 @@ def face_split_bytes(geom_flags):
     if not (geom_flags & FLAG_DUAL_FACE):
         return None
     n_a = N_SLICES_FOLD if geom_flags & FLAG_FOLD_A else N_SLICES
-    return n_a * pack_obs.SLICE_STRIDE
+    return n_a * SLICE_STRIDE
 
 
 # ================= 预压缩缓存 (26fps: 推流热路径零压缩开销) =================
@@ -409,8 +452,15 @@ FrameEntry = collections.namedtuple(
 
 def _precomp_job(job):
     """进程池 worker: 读帧 (+前帧), 出 (key payload, delta payload|None, raw_len).
-    split 非 None (DUAL_FACE) 时出的是双流 payload, 与现场压缩路径同一套编码。"""
-    path, prev_path, zlevel, split, codec, lz4_level, streams = job
+    split 非 None (DUAL_FACE) 时出的是双流 payload, 与现场压缩路径同一套编码。
+
+    🔴 bpp 必须随 job 传进来再落一次全局: py3.14 起 Linux 的默认 start method
+    是 forkserver, 子进程是**重新 import** 本模块, 父进程 _apply_bpp/_apply_slot_count
+    改的全局一个都不继承 ⇒ 子进程里 SLICE_STRIDE 会退回 0x3000, 3-bit 的流表
+    片数×片距当场对不上帧长 (fork 时代碰巧不炸, 别指望)。"""
+    path, prev_path, zlevel, split, codec, lz4_level, streams, bpp = job
+    if bpp != BPP:
+        _apply_bpp(bpp)
     raw = open(path, 'rb').read()
     slices_of(len(raw), f'{path}: ')
     key, _ = compress_frame(raw, codec, zlevel, split, lz4_level, streams)
@@ -451,7 +501,7 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
         print(f'[precomp] 多流切分 {streams} 片 (MSTREAM), 板端 {DEC_WORKERS} 核'
               f'连续分组后每核 ≈{sum(streams) // DEC_WORKERS} 片', flush=True)
     jl = [(f, files[(i - 1) % n] if delta else None, zlevel, split,
-           codec, lz4_level, streams)
+           codec, lz4_level, streams, BPP)
           for i, f in enumerate(files)]
     t0 = time.time()
     if jobs == 1 or n == 1:
@@ -467,7 +517,7 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
                           delta_flags=cflag | FLAG_DELTA,
                           raw_len=rl)
                for k, dl, rl in results]
-    n_sl = {e.raw_len // pack_obs.SLICE_STRIDE for e in entries}
+    n_sl = {e.raw_len // SLICE_STRIDE for e in entries}
     if n_sl != {N_SLICES}:
         print(f'[precomp] 帧片数 {sorted(n_sl)} (非传统 360) — '
               f'头里的 n_slices 按实际帧长写', flush=True)
@@ -488,8 +538,15 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
 
 def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
                         freeze_phase=False, axis_off=0.0, mirror_u=True, gain=None,
-                        n_out=N_SLICES):
-    """体素格 → 单面 n_out×0x3000 数据块 (默认 n_out=360 = 完整一面).
+                        n_out=N_SLICES, led_gamma=gas.LED_GAMMA):
+    """体素格 → 单面 n_out×SLICE_STRIDE 数据块 (默认 n_out=360 = 完整一面).
+
+    色深走模块全局 BPP (见 _apply_bpp):
+      BPP=1 → gas.to_1bit + pack_slice(bpp=1, pad=True)  (逐字节等于老代码:
+              老代码是 pack_slice(on) 再手工接 624B PAD, pad=True 就是它)
+      BPP=3 → gas.to_3bit (gamma 解码 + 8 级量化 + 残差 Bayer 抖动) +
+              pack_slice(bpp=3), 一片 3 个位平面 = 0x9000。
+              抖动相位 phase 与 1-bit 完全同一套 (逐槽 + 逐帧), 时域平滑不退化。
     render_slices < 360 时每个渲染角复制填
     360/render_slices 个槽 (布局不变, 省渲染时间); Bayer 相位仍逐槽+逐帧变.
     freeze_phase=True: 相位只随 slot 不随 frame_idx (时域抖动冻结) —
@@ -522,9 +579,11 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
             slot = k * dup + j
             # 7 与 16 互素, 逐帧遍历相位; freeze 时只随 slot
             phase = slot if freeze_phase else slot + frame_idx * 7
-            on = gas.to_1bit(img, thresh, dither, phase)
-            parts.append(pack_obs.pack_slice(on))
-            parts.append(PAD)
+            if BPP == 1:
+                q = gas.to_1bit(img, thresh, dither, phase)
+            else:
+                q = gas.to_3bit(img, thresh, dither, phase, gamma=led_gamma)
+            parts.append(pack_obs.pack_slice(q, bpp=BPP, pad=True))
     return b''.join(parts)
 
 
@@ -878,7 +937,7 @@ ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
 
 # ---- 帧布局: 单面 / 双面 / 面A 折叠 (v3.1 偏心屏, 2026-07-31) ----
 # Face.n_slices 是该面在载荷里占的槽数; 载荷 = 各面按顺序拼接 (A 在前),
-# 帧头 n_slices = 各面之和, raw_len = n_slices × 0x3000。
+# 帧头 n_slices = 各面之和, raw_len = n_slices × 片距 (bpp 1→0x3000 / 3→0x9000)。
 Face = collections.namedtuple('Face', 'name axis_off n_slices how')
 
 
@@ -913,11 +972,16 @@ def face_plan(args):
                      f'180 槽必须是复制因子 360/render_slices 的整数倍')
         faces[0] = a._replace(n_slices=N_SLICES_FOLD)
         flags |= FLAG_FOLD_A
-    return faces, flags
+    return faces, flags | bpp_flag()
+
+
+def bpp_flag():
+    """色深位: 板端靠它推片距 (protocol.h PVS_STRIDE(flags)), 与几何位正交。"""
+    return FLAG_3BIT if BPP == 3 else 0
 
 
 def frame_raw_len(faces):
-    return sum(f.n_slices for f in faces) * pack_obs.SLICE_STRIDE
+    return sum(f.n_slices for f in faces) * SLICE_STRIDE
 
 
 def expected_n_slices(geom_flags):
@@ -945,10 +1009,11 @@ def check_layout(n_slices, geom_flags, where=''):
 def describe_faces(faces, geom_flags):
     n = sum(f.n_slices for f in faces)
     detail = ' + '.join(f'{f.name}:{f.n_slices}' for f in faces)
-    return (f'{len(faces)} 面 [{detail}] = {n} 片 = {n * pack_obs.SLICE_STRIDE}B, '
-            f'flags=0x{geom_flags:04x}'
+    return (f'{len(faces)} 面 [{detail}] = {n} 片 × 0x{SLICE_STRIDE:X} = '
+            f'{n * SLICE_STRIDE}B, bpp={BPP}, flags=0x{geom_flags:04x}'
             + (' DUAL_FACE' if geom_flags & FLAG_DUAL_FACE else '')
-            + (' FOLD_A' if geom_flags & FLAG_FOLD_A else ''))
+            + (' FOLD_A' if geom_flags & FLAG_FOLD_A else '')
+            + (' 3BIT' if geom_flags & FLAG_3BIT else ''))
 
 
 def verify_fold_a(vox, face, args):
@@ -1007,7 +1072,8 @@ def gen_packed_frames(args):
                                 freeze_phase=args.freeze_phase,
                                 axis_off=f.axis_off,
                                 mirror_u=args.mirror_u,
-                                n_out=f.n_slices, gain=gains[f.name])
+                                n_out=f.n_slices, gain=gains[f.name],
+                                led_gamma=getattr(args, 'led_gamma', gas.LED_GAMMA))
             for f in faces)
         print(f'[render] frame {i}/{args.frames} {time.time() - t0:.1f}s', flush=True)
         yield raw
@@ -1029,8 +1095,13 @@ def cmd_render(args):
             f.write(raw)
     # geom_flags/faces 写进 meta: stream --dir 时要靠它还原帧头 flags
     # (老目录没有这两个键 → 读成 0 = 传统单面, 逐字节兼容)
+    # bpp 与 geom_flags 同等重要: stream --dir 光看字节数分不清 "360 片 1-bit"
+    # 和 "120 片 3-bit" (都是 4423680B) —— 片距推错整帧就错位。
     meta = {'anim': args.anim, 'frames': args.frames, 'render_slices': args.render_slices,
             'frame_raw': expect, 'freeze_phase': bool(args.freeze_phase),
+            'bpp': BPP,
+            'led_gamma': (getattr(args, 'led_gamma', gas.LED_GAMMA)
+                          if BPP == 3 else None),
             'n_slices': sum(f.n_slices for f in faces), 'geom_flags': geom_flags,
             'faces': [{'name': f.name, 'axis_off_px': round(f.axis_off, 4),
                        'n_slices': f.n_slices} for f in faces],
@@ -1051,7 +1122,7 @@ class Streamer:
 
     make_iter: 无参可调用, 返回逐帧迭代器 (loop 时反复调用), 每项是
     raw 字节 (现场压缩) 或 FrameEntry (预压缩缓存, 热路径零压缩).
-    帧头的 raw_len/n_slices 按每帧**实际长度**算 (n_slices = len//0x3000),
+    帧头的 raw_len/n_slices 按每帧**实际长度**算 (n_slices = len//片距),
     不再假定 360 片 —— v3.1 双面帧 720 片 / 折叠双面 540 片都直接支持.
     geom_flags: 每帧 flags 恒 OR 上的几何位 (PVS_FLAG_DUAL_FACE/FOLD_A),
     描述载荷排布, 与压缩位正交; 由渲染参数或预渲染目录 meta.json 给出.
@@ -1090,7 +1161,7 @@ class Streamer:
         self.reconnect, self.retry_interval = reconnect, retry_interval
         self.ack_timeout = ack_timeout
         self.delta, self.keyint = delta, max(int(keyint), 1)
-        self.geom_flags = int(geom_flags) & FLAG_GEOM
+        self.geom_flags = int(geom_flags) & FLAG_LAYOUT
         self.link_mbps = link_mbps
         self.stats_interval = stats_interval
         self.max_frames = max_frames    # >0: ACK 满 N 帧自动停 (测试用)
@@ -1140,7 +1211,7 @@ class Streamer:
             return item.delta, item.delta_flags, True, None
         raw = item                       # 现场压缩路径 (bytes)
         split = face_split_bytes(self.geom_flags)   # DUAL_FACE → 两条独立流
-        streams = stream_plan(len(raw) // pack_obs.SLICE_STRIDE,
+        streams = stream_plan(len(raw) // SLICE_STRIDE,
                               self.geom_flags, self.stream_split)
         if (self.delta and not want_key and self._prev_raw is not None
                 and len(self._prev_raw) == len(raw)
@@ -1161,7 +1232,7 @@ class Streamer:
         # 帧长按 item 实际字节算 (v3.1: 360/540/720 片都可能); n_slices 是
         # 接收方算长度的权威字段, 必须与 raw_len 自洽。
         raw_len = item.raw_len if isinstance(item, FrameEntry) else len(item)
-        n_slices = raw_len // pack_obs.SLICE_STRIDE
+        n_slices = raw_len // SLICE_STRIDE
         # ---- 几何变化 ⇒ 强制关键帧 (2026-07-31) ----
         # DELTA = 与上一帧逐字节 XOR。n_slices 或面布局 flags 一变, 参考帧长度/
         # 语义就对不上 (XOR 直接越界), 板端的行为是 NAK + 关连接。协议里
@@ -1407,13 +1478,35 @@ def geom_flags_from_dir(d):
     return fl
 
 
+def bpp_from_dir(d, cli_bpp):
+    """预渲染目录 → 色深, 取自 cmd_render 写的 meta.json (与几何 flags 同理:
+    数据已经渲好了, 目录说了算)。老目录没这个键 → 1 = 1-bit, 行为不变。
+
+    ⚠ 必须落回全局: 片距一错, slices_of / 面拆分 / MSTREAM 全线错位, 而且
+    "360 片 1-bit" 与 "120 片 3-bit" 的字节数一模一样, 光看长度查不出来。"""
+    try:
+        with open(os.path.join(d, 'meta.json')) as f:
+            bpp = int(json.load(f).get('bpp', 1))
+    except (OSError, ValueError, TypeError):
+        bpp = 1
+    if bpp not in pack_obs.BPP_MODES:
+        sys.exit(f'{d}/meta.json: bpp={bpp} 非法 (只有 {pack_obs.BPP_MODES})')
+    if bpp != cli_bpp:
+        print(f'[meta] {d}: bpp={bpp} (命令行给的是 {cli_bpp}) — 以目录为准, '
+              f'片距 0x{pack_obs.slice_stride(bpp):X}', flush=True)
+    _apply_bpp(bpp)
+    _apply_slot_count(N_SLICES)          # 片距变了, 重算 FRAME_RAW
+    return bpp
+
+
 def cmd_stream(args):
     if args.delta and args.codec not in DELTA_CODECS:
         sys.exit(f'--delta 需要 --codec {"/".join(DELTA_CODECS)} '
                  f'(协议 DELTA 与压缩位正交, 但 raw/rle 侧没实现)')
     # 几何 flags: --dir 走目录 meta.json, 现渲走 CLI (face_plan 同时做合法性检查)
     if args.dir:
-        geom_flags = geom_flags_from_dir(args.dir)
+        bpp_from_dir(args.dir, args.bpp)          # 片距: 目录 meta 说了算
+        geom_flags = geom_flags_from_dir(args.dir) | bpp_flag()
         if args.dual_face or args.fold_a:
             print('[net] ⚠ --dir 模式下 --dual-face/--fold-a 不生效, '
                   '几何以目录 meta.json 为准 (帧数据已经渲好了)', flush=True)
@@ -1527,7 +1620,26 @@ def add_render_opts(ap):
                     help='一圈的槽数 (=帧里的 n_slices, 1..720)。默认 360 保持原行为; '
                          '90 ≈ 面板 1340Hz @15rps 的真实能力, 载荷/解码/memcpy 全线 ÷4')
     ap.add_argument('--sub', type=int, default=3)
-    ap.add_argument('--thresh', type=float, default=128)
+    # 🔴 2026-08-20 v3.4: 每通道色深。默认 1 = 今天在跑的一切 (空闲动画、板上
+    # 默认内容、30+ 套 frames_* 目录) 逐字节不变; 3 = 行内 BCM 8 级,
+    # 一片 0x3000 → 0x9000, 帧头置 PVS_FLAG_3BIT。见 05_3bit_bcm.md。
+    ap.add_argument('--bpp', type=int, choices=sorted(pack_obs.BPP_MODES), default=1,
+                    help='每通道位深: 1 = 老行为 (逐字节兼容, 默认); '
+                         '3 = 每通道 8 级 (行内 BCM, 片距 0x9000, 帧头 PVS_FLAG_3BIT)。'
+                         '⚠ 3-bit 时片数上限 240 (帧长上限 8847360B 是硬的), '
+                         '方案推荐每面 60 槽')
+    # LED 是线性发光 (BCM 权重 27/54/108 = 1:2:4), 人眼与素材都是 ~2.2 次方的
+    # 感知域 ⇒ 量化前必须先解码到线性光。取值理由见 gas.to_3bit / 下面 help。
+    ap.add_argument('--led-gamma', type=float, default=gas.LED_GAMMA,
+                    help=f'[--bpp 3] 量化前的 gamma 解码指数 (默认 {gas.LED_GAMMA}): '
+                         'code = 7·(v/255)^gamma。素材是 sRGB (γ≈2.2) 编码而 LED '
+                         '码值与发光时间成正比 ⇒ 2.2 是「测出来的光 = 素材的意图」'
+                         '的那个值, 也让线性灰度楔看起来是均匀的 8 阶。'
+                         '嫌暗部被压掉太多可调到 1.8~2.0 (提亮暗部, 高光变平)。'
+                         '1.0 = 不做解码 (整幅偏亮, 中灰会亮成两倍多)')
+    ap.add_argument('--thresh', type=float, default=128,
+                    help='1-bit: Bayer 阈值均值; 3-bit: 曝光倍数 = 128/thresh '
+                         '(默认 128 ⇒ 1.0 = 满量程 0..255), 方向与 1-bit 一致 (小=亮)')
     ap.add_argument('--no-dither', action='store_true')
     ap.add_argument('--freeze-phase', action='store_true',
                     help='Bayer 抖动相位只随 slot 不随 frame (时域抖动冻结, '
@@ -1672,10 +1784,18 @@ def main():
     args = ap.parse_args()
 
     # 🔴 顺序要紧: 槽数必须在任何渲染/打包之前落到全局 (FRAME_RAW 等按它算)。
+    # 🔴 色深要排在槽数前面: 片距变了槽数上限和 FRAME_RAW 都跟着变。
+    bpp = getattr(args, 'bpp', 1)
+    if bpp != 1:
+        _apply_bpp(bpp)
+        print(f'[bpp] 每通道 {bpp} bit: 片距 0x{SLICE_STRIDE:X}, 片数上限 '
+              f'{N_SLICES_MAX}, 帧头置 PVS_FLAG_3BIT(0x{FLAG_3BIT:04x}), '
+              f'--led-gamma {getattr(args, "led_gamma", gas.LED_GAMMA)}', flush=True)
     ns = getattr(args, 'n_slices', None)
     if ns is not None:
         if not 1 <= ns <= N_SLICES_MAX:
-            sys.exit(f'--n-slices 须在 1..{N_SLICES_MAX} (给的是 {ns})')
+            sys.exit(f'--n-slices 须在 1..{N_SLICES_MAX} '
+                     f'(bpp={BPP} 片距 0x{SLICE_STRIDE:X} 下的上限; 给的是 {ns})')
         _apply_slot_count(ns)
     # --render-slices 0 = 每槽一个真实角度 (不复制填充)
     if not getattr(args, 'render_slices', 0):

@@ -335,6 +335,46 @@ def to_1bit(img, thresh, dither, phase):
     return img > np.clip(tm, 1.0, 255.0)[:, :, None]
 
 
+# ---- 3-bit (每通道 8 级) 量化 + 残差抖动 (2026-08-20, feature/3bit-color) ----
+# 🔴 gamma 的必要性: 硬件行内 BCM 的三个位平面 OE 权重 27/54/108 沿 = 1:2:4,
+#    ⇒ **码值 0..7 与发光时间(线性光)严格成正比**。而 vox 里的颜色是 sRGB 编码
+#    (贴图/GLB 顶点色, 约 γ=2.2 的感知域)。直接把 sRGB 值均匀量化成 0..7 再线性
+#    点亮 = 整幅图被拉出一次 2.2 次方的亮度失真 (中灰 0.5 会亮成 0.5 而不是 0.22)。
+#    所以量化前必须先**解码到线性光**: L = v^γ, 再乘 7 取整。
+# 默认 γ=2.2 的理由见 povstream --led-gamma 的 help。
+LED_GAMMA = 2.2
+CODES_3BIT = 8          # 0..7
+
+
+def to_3bit(img, thresh, dither, phase, gamma=LED_GAMMA, levels=CODES_3BIT):
+    """float 图 (H,W,3) 0..255 → uint8 码值图 0..7 (pack_obs.pack_slice bpp=3 的输入)。
+
+    三步: ① 曝光标度 ② gamma 解码到线性光 ③ 量化 + 残差有序抖动。
+
+    ① thresh 沿用 1-bit 的语义方向 (小 = 亮): 曝光倍数 = 128/thresh,
+       默认 thresh=128 ⇒ 倍数 1.0 ⇒ 满量程就是 0..255, 不引入额外增益。
+    ② L = v^gamma ∈[0,1] 是**想要的线性光**; x = 7·L 是想要的码值 (带小数)。
+    ③ 抖动的是 x 的**小数残差**, 不是"阈值":
+         code = floor(x + d),  d = 抖动矩阵 ∈(0,1) 均值 0.5
+       对 x = n+f: 当 d > 1-f 时进位 ⇒ E[code] = n+f = x (无偏), 即
+       **一片区域的平均线性光正好等于目标线性光**, 量化只被打散成噪声。
+       这正是 1-bit 那条 `img > 抖动阈值` 的推广: levels=2 时两者在统计上等价
+       (只差一个 d ↔ 1-d 的镜像), 只不过 8 级下残差幅度只有 1/7, 抖动噪声比
+       1-bit 小 7 倍 —— 这是 3-bit 相对 1-bit 观感提升的主要来源。
+       d 用与 1-bit 同一张 BAYER4, 同一套 `phase` 滚动 ⇒ **逐槽 + 逐帧变相位的
+       时域平滑设计原封不动地继承下来** (旋转时空间抖动 → 时间抖动, 眼睛做低通)。
+    dither=False 时退化成就近取整 (灰度楔/上板目视 8 阶用, 会看到真实的跳阶)。
+    """
+    v = np.clip(np.asarray(img, np.float32) * (128.0 / float(thresh)) / 255.0, 0.0, 1.0)
+    x = (levels - 1) * np.power(v, gamma, dtype=np.float32)
+    if not dither:
+        return np.clip(np.rint(x), 0, levels - 1).astype(np.uint8)
+    d = (BAYER4 + 0.5) / 16.0                       # 0..1, 均值 0.5, 16 个不同值
+    d = np.roll(np.roll(d, phase % 4, axis=0), (phase // 4) % 4, axis=1)
+    dm = np.tile(d, (H // 4 + 1, W // 4 + 1))[:H, :W]
+    return np.clip(np.floor(x + dm[:, :, None]), 0, levels - 1).astype(np.uint8)
+
+
 def draw_num(px, x0, y0, text, fg):
     for ch in text:
         for ry, row in enumerate(DIGITS[ch]):

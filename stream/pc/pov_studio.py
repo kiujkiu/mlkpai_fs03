@@ -329,12 +329,30 @@ def first_frame_bin(d):
     return files[0] if files else None
 
 
-def preview_image(bin_path, slice_idx=0, scale=1):
-    """packed bin → unpack slice → PIL RGB 图 (W*scale, H*scale)."""
+def bpp_of_dir(d):
+    """预渲染目录 → bpp (meta.json 的 bpp 键; 老目录没有 → 1 = 1-bit)。
+    片距随 bpp 变 (0x3000 / 0x9000), 预览取片必须用对, 否则取到的是别的位平面。"""
+    try:
+        with open(os.path.join(d, 'meta.json')) as f:
+            bpp = int(json.load(f).get('bpp', 1))
+    except (OSError, ValueError, TypeError):
+        return 1
+    return bpp if bpp in pack_obs.BPP_MODES else 1
+
+
+def preview_image(bin_path, slice_idx=0, scale=1, bpp=None):
+    """packed bin → unpack slice → PIL RGB 图 (W*scale, H*scale).
+    bpp=None 时从同目录 meta.json 推 (3-bit 片距 0x9000, 码值 0..7 拉到 0..252)。"""
+    if bpp is None:
+        bpp = bpp_of_dir(os.path.dirname(os.path.abspath(bin_path)))
+    stride = pack_obs.slice_stride(bpp)
     with open(bin_path, 'rb') as f:
-        f.seek(slice_idx * pack_obs.SLICE_STRIDE)
-        buf = f.read(pack_obs.SLICE_DATA)
-    img = pack_obs.unpack_slice(buf).astype(np.uint8) * 255
+        f.seek(slice_idx * stride)
+        buf = f.read(stride)
+    if bpp == 3:
+        img = pack_obs.unpack_slice(buf, bpp=3) * 36
+    else:
+        img = pack_obs.unpack_slice(buf).astype(np.uint8) * 255
     im = Image.fromarray(img)
     if scale != 1:
         im = im.resize((pack_obs.W * scale, pack_obs.H * scale), Image.NEAREST)
