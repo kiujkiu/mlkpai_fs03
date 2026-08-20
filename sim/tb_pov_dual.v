@@ -745,6 +745,55 @@ module tb_pov_dual;
         repeat (10) @(posedge clk);
 
         //==================================================================
+        //==== ⑥ R 0x28 = frame_period (引擎 A 整屏 aclk 拍数)
+        //     这是定 aclk 真实频率的钥匙: 本值是纯 PL 侧计数, 不含任何频率假设;
+        //     用已验证正确的 CPU 时基测同一整屏的墙钟秒数, 两者相除 = aclk 真频率。
+        //==================================================================
+        k = errors;
+        // 本 TB 从 [0] 起就在跑 auto (0x0C 写的是 B836_3001 = ddr_slow(dclk_fast)=1,
+        // rows=54, oe=48) ⇒ 此刻 R0x28 应当已经反映**降级态**的整屏拍数
+        // 54 x 387 = 20898 (slow 每 bit 2 拍 ⇒ 行周期 195+192=387)。
+        axi_read(16'h0028, rd);
+        if (rd !== 32'd20898) begin
+            fail("[6] R0x28 frame_period != 20898 (ddr_slow, 54 x 387)");
+            $display("        got %0d", rd);
+        end else
+            $display("PASS [6a] R0x28 = %0d aclk (ddr_slow=1: 54 rows x 387)", rd);
+        // 0x0C sub10: rows=54, oe_window=48, cfg_we=1, dclk_fast=0(fast), oe_set_val=1(消隐)
+        axi_write(16'h000C, 32'h8836_3001);
+        // 0x0C sub11: auto_en=1
+        axi_write(16'h000C, 32'hC000_0001);
+        repeat (2*54*195 + 2000) @(posedge clk);
+        axi_read(16'h0028, rd);
+        if (rd !== 32'd10530) begin
+            fail("[6] R0x28 frame_period != 10530 (1-bit fast, 54 x 195)");
+            $display("        got %0d", rd);
+        end else
+            $display("PASS [6b] R0x28 = %0d aclk after ddr_slow->fast (1-bit: 54 x 195)", rd);
+
+        // 0x0C sub01: oe_w1=54, oe_w2=108, bpp_mode=1 → 3-bit 行内 BCM
+        axi_write(16'h000C, 32'h4001_6C36);
+        repeat (2*54*3*195 + 2000) @(posedge clk);
+        axi_read(16'h0028, rd);
+        if (rd !== 32'd31590) begin
+            fail("[6] R0x28 frame_period != 31590 (3-bit, 54 x 3 x 195)");
+            $display("        got %0d", rd);
+        end else
+            $display("PASS [6c] R0x28 = %0d aclk (3-bit BCM: 54 rows x 3 planes x 195)", rd);
+
+        // 运行时切回 1-bit (沿数写 0 = 保持原值)
+        axi_write(16'h000C, 32'h4000_0000);
+        repeat (2*54*195 + 2000) @(posedge clk);
+        axi_read(16'h0028, rd);
+        if (rd !== 32'd10530) begin
+            fail("[6] R0x28 not back to 10530 after bpp_mode=0");
+            $display("        got %0d", rd);
+        end else if (errors == k)
+            $display("PASS [6d] runtime 3-bit <-> 1-bit via 0x0C sub01, R0x28 tracks (31590 -> 10530)");
+        axi_write(16'h000C, 32'hC000_0000);          // auto_en=0
+        repeat (500) @(posedge clk);
+
+        //==================================================================
         //==== 总结 (④ 带宽账数字)
         //==================================================================
         if (max_arlen_all !== 255) begin

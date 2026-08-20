@@ -17,7 +17,13 @@
 // 寄存器 (awaddr[5:2] 解码; 0x0C/0x10/0x14/0x18 v5 原样兼容):
 //   W 0x0C 杂项: v5 原样 (subcmd 00=sdi_mask / 10=oe+rows+cfg_we{dclk_fast,
 //         overlap_en,oe_window} / 11=auto_en,use_fb,pattern,disp 窗).
-//         subcmd 01 (per-chain 预载) 属引擎手动命令路径, 顶层暂不接 (见遗留).
+//         subcmd 01 (2026-08-20 起) = 3-bit 行内 BCM 配置:
+//           [7:0]=oe_w1 (plane1 沿数, 0=不变) [15:8]=oe_w2 (plane2, 0=不变)
+//           [16]=bpp_mode 0=1-bit(旧行为) 1=3-bit BCM
+//           [17]=le_plane_mode plane1/2 的 LE 沿数: 0=3 沿(datasheet 默认)
+//                1=与 plane0 同 4/5 沿 (上板逃生门, 免一次重综合)
+//           oe_w0 = 复用 subcmd10 的 oe_window[15:8]; 默认 27/54/108 沿.
+//           (原先规划给 per-chain 预载的编码作废, 见 05_3bit_bcm.md)
 //   W 0x10 POV_CTRL: [0]=pov_en [1]=fake_en [31:16]=n_slices (v5 原样);
 //         新 [2]=dual_en (0=纯单屏, B 引擎静默消隐, 行为=v5)
 //         新 [3]=fb_sel_b (AXI fb 窗 awaddr[15]=1 的写落 fb_B, pov_en=0 调试直灌;
@@ -55,8 +61,17 @@
 //         己维护的陈旧影子做 read-modify-write, 会误伤 pov_en/fake_en — 尤其当
 //         JTAG 调试脚本也在并发写 0x10 时。有了 0x24 读口, 任何软件都能
 //         "读 0x24 → 改位 → 写 0x10" 安全 RMW, 不必维护影子也不怕抢写。
-//         (写 0x24 仍是 row_cfg_r, 读写不同义, 有意为之: 读口地址已经很紧张;
-//          R 0x28 特意留空不占 — 规划给 panel_engine_2047 的 frame_period_o)
+//         (写 0x24 仍是 row_cfg_r, 读写不同义, 有意为之: 读口地址已经很紧张)
+//   R 0x28 FRAME_PERIOD: [31:0] 引擎 A 最近**一整屏**的 aclk 拍数 (2026-08-20 接通,
+//         这个地址当初就是给它留的)。1-bit = rows×195 (54 行 ⇒ 10530);
+//         3-bit = rows×3×195 (54 行 ⇒ 31590); oe>111 的 LWAIT 和 q_gap 死区都计入。
+//         ⚠ 写 0x28 仍是 SLICE_BASE_B, 读写不同义 (与 0x24 同套路)。
+//         用途 (aclk 悬案): 本值是**纯 PL 侧计数**, 不含任何频率假设; 用已验证
+//         正确的 CPU 时基测同一整屏的墙钟秒数, 两者相除 = aclk 真实频率。
+//         BD/SLCR/约束 五条证据说 50MHz、实测行周期 7.805µs 反推 25MHz —— 这
+//         一个寄存器就能判谁对, 不用示波器。给的是引擎 A 的; 引擎 B 扫描节拍
+//         与 A 同 (同时钟/同 rows/同 row_cfg), 只有 oe_window_b>111 时才会因
+//         LWAIT 不同而分叉, 那种配置下这个读数只代表 A。
 //   R 0x1C {locked, 6'b0, idx_B[8:0], pair_miss[15:0]} — idx_B 实时算 (核相位),
 //         pair_miss = pair_busy 期间 slice_idx 变化 (整对丢弃) 的饱和计数
 //
@@ -184,6 +199,9 @@ module pov_dual_top #(
     reg  [7:0]  oe_window_b_r;   // 0x20, 0 = 跟随 A
     reg  [31:0] row_cfg_r;       // 0x24 行驱时序/极性
     reg  [31:0] slice_base_b_r;  // 0x28 屏 B 独立数据基址, 0 = 回落 slice_base_r
+    reg  [7:0]  oe_w1_r, oe_w2_r; // 0x0C sub01 3-bit BCM plane1/2 OE 沿数
+    reg         bpp3_r;           // 0x0C sub01 [16] 1 = 3-bit 行内 BCM
+    reg         le_pl_r;          // 0x0C sub01 [17] plane1/2 LE 沿数选择
 
     //---------- 前向声明 ----------
     wire [15:0] at_slice_idx;
@@ -191,6 +209,7 @@ module pov_dual_top #(
     wire        at_locked;
     wire        df_busy_w, df_done_w;
     wire        eng_a_busy, eng_b_busy;
+    wire [31:0] eng_a_frame_period;      // R 0x28: 引擎 A 整屏 aclk 拍数
     wire        oe_a_w;
     wire        oe_a_state;
     reg         locked_ever;
@@ -253,6 +272,10 @@ module pov_dual_top #(
             oe_window_b_r <= 8'd0;       // 0 = 跟随屏 A
             row_cfg_r     <= 32'h0;      // 全默认
             slice_base_b_r <= 32'h0;     // 0 = 屏 B 回落用 slice_base_r (旧行为)
+            oe_w1_r       <= 8'd54;      // 3-bit BCM 权重 2 (默认 54 沿)
+            oe_w2_r       <= 8'd108;     // 3-bit BCM 权重 4 (默认 108 沿)
+            bpp3_r        <= 1'b0;       // 复位 = 1-bit, 旧内容/空闲动画照跑
+            le_pl_r       <= 1'b0;       // 复位 = plane1/2 用 LE 3 沿 (datasheet)
         end else begin
             oe_set_pulse <= 1'b0;
             fb_we        <= 1'b0;
@@ -282,6 +305,13 @@ module pov_dual_top #(
                                 if (s_axi_wdata[15:8] != 8'd0)
                                     oe_window <= s_axi_wdata[15:8];
                             end
+                        end else if (s_axi_wdata[31:30] == 2'b01) begin
+                            // 3-bit 行内 BCM cfg (05_3bit_bcm.md 契约 v1)
+                            // 沿数写 0 = 保持原值 (与本寄存器 oe_window 同惯例)
+                            if (s_axi_wdata[7:0]  != 8'd0) oe_w1_r <= s_axi_wdata[7:0];
+                            if (s_axi_wdata[15:8] != 8'd0) oe_w2_r <= s_axi_wdata[15:8];
+                            bpp3_r  <= s_axi_wdata[16];
+                            le_pl_r <= s_axi_wdata[17];
                         end else if (s_axi_wdata[31:30] == 2'b11) begin
                             auto_en       <= s_axi_wdata[0];
                             use_fb        <= s_axi_wdata[1];
@@ -289,7 +319,6 @@ module pov_dual_top #(
                             auto_disp_cyc <= (s_axi_wdata[29:24] == 6'd0) ? 20'd3072
                                              : {4'b0, s_axi_wdata[29:24], 10'b0};
                         end
-                        // subcmd 01 per-chain 预载: 引擎手动路径, 顶层不实现 (遗留)
                     end
                     4'd4: begin                                  // 0x10 POV_CTRL
                         pov_en    <= s_axi_wdata[0];
@@ -409,6 +438,10 @@ module pov_dual_top #(
                     // 0x24 R: POV_CTRL 影子回读 (0x10 是只写的, 读 0x10 已被
                     // {locked,idx} 占死不能动) — 把 0x10 那组寄存器的当前值原样拼
                     // 回去, 位序与写口逐位对齐, 软件可直接 RMW 后写回 0x10。
+                    // 0x28 R: 引擎 A 最近一整屏 aclk 拍数 (纯 PL 计数, 无频率假设)
+                    // —— 与 CPU 墙钟测的整屏耗时相除即得 aclk 真频率。
+                    // 写 0x28 是 SLICE_BASE_B, 读写不同义 (同 0x24 套路)。
+                    4'd10:   s_axi_rdata <= eng_a_frame_period;                 // 0x28
                     4'd9:    s_axi_rdata <= {n_slices_r, 9'b0, fold_a_en,        // 0x24
                                              mirror_a, mirror_b, fb_sel_b,
                                              dual_en, fake_en_r, pov_en};
@@ -460,6 +493,7 @@ module pov_dual_top #(
     wire        df_fb_wtgt;
     wire [3:0]  df_fb_wlane;
     wire [8:0]  df_fb_waddr;
+    wire [1:0]  df_fb_wplane;
     wire [31:0] df_fb_wdata;
 
     // A/B 两次 fetch 是**串行**复用同一个 u_fetch (P_A → P_B), 所以基址按当前 pair
@@ -488,6 +522,7 @@ module pov_dual_top #(
         .m_axi_rvalid  (m_axi_rvalid),
         .m_axi_rready  (m_axi_rready),
         .slice_base    (base_lat_sel),
+        .bpp3          (bpp3_r),
         .slice_idx     (df_idx),
         .fetch_target  (df_tgt),
         .fetch_go      (df_go),
@@ -497,6 +532,7 @@ module pov_dual_top #(
         .fb_wtarget    (df_fb_wtgt),
         .fb_wlane      (df_fb_wlane),
         .fb_waddr      (df_fb_waddr),
+        .fb_wplane     (df_fb_wplane),
         .fb_wdata      (df_fb_wdata)
     );
 
@@ -505,6 +541,10 @@ module pov_dual_top #(
     wire        fbw_tgt  = pov_en ? df_fb_wtgt  : fb_wtgt;
     wire [3:0]  fbw_lane = pov_en ? df_fb_wlane : fb_wlane;
     wire [8:0]  fbw_addr = pov_en ? df_fb_waddr : fb_waddr;
+    // 3-bit BCM 的位平面号只有取帧引擎会给; AXI fb 窗 (调试/空闲动画路径) 地址位
+    // 只有 9 bit ({row,word}), 够不着 plane 字段 ⇒ 恒写 plane0。
+    // ⇒ bpp_mode=1 时 AXI fb 窗只能改 plane0, 完整 3-bit 内容走 DDR 取帧。
+    wire [1:0]  fbw_plane = pov_en ? df_fb_wplane : 2'd0;
     wire [31:0] fbw_data = pov_en ? df_fb_wdata : fb_wdata;
     wire        fbA_we   = fbw_we & ~fbw_tgt;
     wire        fbB_we   = fbw_we &  fbw_tgt;
@@ -559,6 +599,27 @@ module pov_dual_top #(
     wire [3:0] fbA_lane = mirror_a_eff ? mb_lane2            : fbw_lane;
     wire [8:0] fbA_addr = mirror_a_eff ? {mb_row2, mb_word}  : fbw_addr;
 
+    //---------- 3-bit BCM: {row,word}+plane → 片内紧凑地址 (2026-08-20) ----------
+    // 引擎读侧是纯递增计数器, 要求 raddr = row*18 + plane*6 + pair (0..971)。
+    // 换算放在**镜像置换之后**: 置换只动 (lane,row), 与 plane 正交 ⇒ 镜像/折叠
+    // 逻辑一个字都不用改, 三个平面各自被同样地置换。
+    // row*18 = row<<4 + row<<1; plane*6 = plane<<2 + plane<<1 (无乘法器)。
+    // bpp3_r=0 时直接零扩展旧地址 ⇒ 老路径逐 bit 不变。
+    function [9:0] pack_addr;
+        input [8:0] a9;
+        input [1:0] pl;
+        reg   [5:0] rw;
+        reg   [2:0] wd;
+        begin
+            rw = a9[8:3];
+            wd = a9[2:0];
+            pack_addr = {rw, 4'b0} + {3'b0, rw, 1'b0}
+                      + {6'b0, pl, 2'b0} + {7'b0, pl, 1'b0} + {7'b0, wd};
+        end
+    endfunction
+    wire [9:0] fbA_waddr = bpp3_r ? pack_addr(fbA_addr, fbw_plane) : {1'b0, fbA_addr};
+    wire [9:0] fbB_waddr = bpp3_r ? pack_addr(fbB_addr, fbw_plane) : {1'b0, fbB_addr};
+
     //---------- 双引擎 (黑盒; xsim 用 panel_engine_stub.v) ----------
     wire [7:0] oe_window_b_eff = (oe_window_b_r == 8'd0) ? oe_window
                                                          : oe_window_b_r;
@@ -571,7 +632,7 @@ module pov_dual_top #(
         .enable        (1'b1),
         .fb_we         (fbA_we),
         .fb_wlane      (fbA_lane),
-        .fb_waddr      (fbA_addr),
+        .fb_waddr      (fbA_waddr),
         .fb_wdata      (fbw_data),
         .auto_en       (auto_en),
         .use_fb        (use_fb),
@@ -581,11 +642,16 @@ module pov_dual_top #(
         .dclk_fast     (dclk_fast),
         .overlap_en    (overlap_en),
         .oe_window     (oe_window),
+        .oe_w1         (oe_w1_r),
+        .oe_w2         (oe_w2_r),
+        .bpp_mode      (bpp3_r),
+        .le_plane_mode (le_pl_r),
         .sdi_mask      (sdi_mask),
         .oe_set_pulse  (oe_set_pulse),
         .oe_set_val    (oe_set_val),
         .row_cfg       (row_cfg_r),
         .engine_busy   (eng_a_busy),
+        .frame_period  (eng_a_frame_period),
         .dclk_out      (dclk_out),
         .le_out        (le_out),
         .oe_out        (oe_a_w),
@@ -603,7 +669,7 @@ module pov_dual_top #(
         .enable        (eng_b_en),
         .fb_we         (fbB_we),
         .fb_wlane      (fbB_lane),
-        .fb_waddr      (fbB_addr),
+        .fb_waddr      (fbB_waddr),
         .fb_wdata      (fbw_data),
         .auto_en       (auto_en),
         .use_fb        (use_fb),
@@ -613,11 +679,16 @@ module pov_dual_top #(
         .dclk_fast     (dclk_fast),
         .overlap_en    (overlap_en),
         .oe_window     (oe_window_b_eff),
+        .oe_w1         (oe_w1_r),
+        .oe_w2         (oe_w2_r),
+        .bpp_mode      (bpp3_r),
+        .le_plane_mode (le_pl_r),
         .sdi_mask      (sdi_mask),
         .oe_set_pulse  (oe_set_pulse),
         .oe_set_val    (oe_set_val),
         .row_cfg       (row_cfg_r),
         .engine_busy   (eng_b_busy),
+        .frame_period  (),
         .dclk_out      (dclk_out_2),
         .le_out        (le_out_2),
         .oe_out        (oe_out_2),
@@ -637,6 +708,14 @@ endmodule
 //   * 加 1-bit fetch_target, go 拍锁存, 随 fb 写口透传 (顶层按它路由 fb_A/fb_B).
 //   其余 (单 outstanding / arvalid hold / INCR / RRESP 容忍 / lane-major
 //   换算) 与 v5 逐行一致.
+//
+// [2026-08-20 feature/3bit-color] bpp3=1 时一次取**三个位平面**:
+//   片内布局 = plane p 在 slice_base + idx*0x9000 + p*0x3000, 每 plane 内部沿用
+//   现有 0x3000 布局 (lane-major, 2916 word 实占 / 3072 word 跨度)。
+//   ⇒ 每 plane 一轮 TOTAL_WORDS 的突发序列, 跨 plane 时把 cur_addr 跳到下一个
+//   0x3000 边界 (中间 624 B 空隙不读), lane/row/word 计数器归零重来。
+//   fb_wplane 随写口透传, 顶层再折成片内紧凑地址。
+//   bpp3=0 时全部逻辑退化成原来的单 plane 版本, 逐拍等价。
 //==============================================================================
 module ddr_slice_fetch256 #(
     parameter [31:0] SLICE_STRIDE = 32'h0000_3000,  // 每 slice 字节跨度
@@ -662,6 +741,7 @@ module ddr_slice_fetch256 #(
     output wire        m_axi_rready,
 
     input  wire [31:0] slice_base,      // pair 级快照后的基址
+    input  wire        bpp3,            // 1 = 3-bit BCM (每片 3 个位平面), go 拍锁存
     input  wire [8:0]  slice_idx,       // 0..359, fetch_go 时锁存
     input  wire        fetch_target,    // 0=fb_A 1=fb_B, fetch_go 时锁存
     input  wire        fetch_go,        // 1 拍脉冲
@@ -671,7 +751,8 @@ module ddr_slice_fetch256 #(
     output reg         fb_we,
     output reg         fb_wtarget,
     output reg  [3:0]  fb_wlane,
-    output reg  [8:0]  fb_waddr,        // {row[5:0], word[2:0]}
+    output reg  [8:0]  fb_waddr,        // {row[5:0], word[2:0]} (plane 内偏移)
+    output reg  [1:0]  fb_wplane,       // 位平面号 (bpp3=0 时恒 0)
     output reg  [31:0] fb_wdata
 );
 
@@ -695,12 +776,19 @@ module ddr_slice_fetch256 #(
     reg [2:0]  word;            // 0..5
     reg [3:0]  err_cnt;
     reg        tgt_r;
+    reg [1:0]  plane;           // 0..2 (bpp3=0 时恒 0)
+    reg        bpp3_l;          // fetch_go 拍锁存
+    reg [31:0] plane_base;      // 当前 plane 的 0x3000 块基址
 
     assign m_axi_araddr = cur_addr;
     assign m_axi_rready = (state == F_R);
     assign fetch_busy   = (state != F_IDLE);
 
     wire beat = m_axi_rvalid && m_axi_rready;
+
+    // 片跨度: 1-bit = idx*0x3000, 3-bit = idx*0x9000 (三个平面顺序排列)
+    wire [31:0] slice_off = bpp3 ? ({8'b0,  slice_idx, 15'b0} + {11'b0, slice_idx, 12'b0})
+                                 : ({10'b0, slice_idx, 13'b0} + {11'b0, slice_idx, 12'b0});
 
     // burst 长度: min(256, words_left, 到下一 4KB 边界的 beat 数)
     wire [10:0] beats_to_4k = 11'd1024 - {1'b0, cur_addr[11:2]};
@@ -725,7 +813,11 @@ module ddr_slice_fetch256 #(
             fb_wtarget    <= 1'b0;
             fb_wlane      <= 4'd0;
             fb_waddr      <= 9'd0;
+            fb_wplane     <= 2'd0;
             fb_wdata      <= 32'd0;
+            plane         <= 2'd0;
+            bpp3_l        <= 1'b0;
+            plane_base    <= 32'd0;
         end else begin
             fetch_done <= 1'b0;
             fb_we      <= 1'b0;
@@ -736,14 +828,16 @@ module ddr_slice_fetch256 #(
             case (state)
                 F_IDLE: begin
                     if (fetch_go) begin
-                        // 起始地址 = slice_base + slice_idx*0x3000 (<<13 + <<12)
-                        cur_addr   <= slice_base
-                                      + {10'b0, slice_idx, 13'b0}
-                                      + {11'b0, slice_idx, 12'b0};
+                        // 1-bit: slice_base + idx*0x3000 (<<13 + <<12)
+                        // 3-bit: slice_base + idx*0x9000 (<<15 + <<12), 3 个平面顺排
+                        cur_addr   <= slice_base + slice_off;
+                        plane_base <= slice_base + slice_off;
                         words_left <= TOTAL_WORDS;
                         lane       <= 4'd0;
                         row        <= 6'd0;
                         word       <= 3'd0;
+                        plane      <= 2'd0;
+                        bpp3_l     <= bpp3;
                         tgt_r      <= fetch_target;
                         state      <= F_CALC;
                     end
@@ -769,6 +863,7 @@ module ddr_slice_fetch256 #(
                         fb_wtarget <= tgt_r;
                         fb_wlane   <= lane;
                         fb_waddr   <= {row, word};
+                        fb_wplane  <= plane;
                         fb_wdata   <= m_axi_rdata;
 
                         if (word == 3'd5) begin
@@ -788,8 +883,21 @@ module ddr_slice_fetch256 #(
 
                         if (m_axi_rlast) begin
                             if (words_left == 12'd1) begin
-                                fetch_done <= 1'b1;
-                                state      <= F_IDLE;
+                                if (bpp3_l && plane != 2'd2) begin
+                                    // 下一个位平面: 跳到 +0x3000 的块首重来
+                                    // (这几条覆盖上面的 cur_addr/words_left/计数器)
+                                    plane      <= plane + 2'd1;
+                                    plane_base <= plane_base + 32'h0000_3000;
+                                    cur_addr   <= plane_base + 32'h0000_3000;
+                                    words_left <= TOTAL_WORDS;
+                                    lane       <= 4'd0;
+                                    row        <= 6'd0;
+                                    word       <= 3'd0;
+                                    state      <= F_CALC;
+                                end else begin
+                                    fetch_done <= 1'b1;
+                                    state      <= F_IDLE;
+                                end
                             end else begin
                                 state <= F_CALC;
                             end

@@ -8,8 +8,10 @@
 //
 //   enable        : 0 = 静默消隐 (oe=1, 所有输出静止). 顶层给 B 屏接
 //                   dual_en|fb_sel_b, A 屏恒 1.
-//   fb 写口       : 9 lane × 512 × 32bit 私有 BRAM, {row[5:0],word[2:0]} 编址,
-//                   与 ddr_slice_fetch fb 口/v5 AXI fb 窗完全同构.
+//   fb 写口       : 9 lane × 1024 × 32bit 私有 BRAM. 1-bit 时 {row[5:0],word[2:0]}
+//                   编址 (与 ddr_slice_fetch fb 口/v5 AXI fb 窗同构); 3-bit BCM 时
+//                   row*18+plane*6+pair 紧凑编址 (顶层写侧换算, 2026-08-20).
+//   oe_w1/oe_w2/bpp_mode : 0x0C subcmd01 (3-bit 行内 BCM, stub 忽略)
 //   auto_en/use_fb/auto_pattern/auto_disp_cyc/au_rows_max : v5 0x0C subcmd11
 //   dclk_fast/overlap_en/oe_window : v5 0x0C subcmd10 cfg_we 组
 //                   (2047 引擎可自行忽略不适用位, 如 dclk_fast)
@@ -34,7 +36,7 @@ module panel_engine #(
     // fb 写口 (取帧引擎 / AXI fb 窗经顶层仲裁后灌入)
     input  wire        fb_we,
     input  wire [3:0]  fb_wlane,
-    input  wire [8:0]  fb_waddr,
+    input  wire [9:0]  fb_waddr,
     input  wire [31:0] fb_wdata,
 
     // 控制口 (v5 语义)
@@ -46,12 +48,17 @@ module panel_engine #(
     input  wire        dclk_fast,
     input  wire        overlap_en,
     input  wire [7:0]  oe_window,
+    input  wire [7:0]  oe_w1,           // 3-bit BCM plane1 沿数 (stub 忽略)
+    input  wire [7:0]  oe_w2,           // 3-bit BCM plane2 沿数 (stub 忽略)
+    input  wire        bpp_mode,        // 0=1bit 1=3bit BCM      (stub 忽略)
+    input  wire        le_plane_mode,   // plane1/2 LE 沿数选择    (stub 忽略)
     input  wire [8:0]  sdi_mask,
     input  wire        oe_set_pulse,
     input  wire        oe_set_val,
     input  wire [31:0] row_cfg,
     output wire        engine_busy,
     output wire        oe_state,
+    output wire [31:0] frame_period,    // 真引擎给整屏 aclk 拍数; stub 恒 0
 
     // 屏引脚
     output reg         dclk_out,
@@ -66,12 +73,13 @@ module panel_engine #(
     //---------- 私有 fb: 9 lane × 512 × 32bit (真引擎同构) ----------
     genvar gi;
     generate for (gi = 0; gi < 9; gi = gi + 1) begin: g_fb
-        reg [31:0] mem [0:511];
+        reg [31:0] mem [0:1023];
         always @(posedge clk)
             if (fb_we && fb_wlane == gi[3:0]) mem[fb_waddr] <= fb_wdata;
     end endgenerate
 
     assign oe_state = oe_out;
+    assign frame_period = 32'd0;        // stub 无真实扫描节拍
     wire run = enable && auto_en;
     assign engine_busy = run;
 

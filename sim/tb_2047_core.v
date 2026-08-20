@@ -14,6 +14,16 @@
 //       0x24 adv_high=200 拉长 T_adv → LWAIT 出现且数据无错; 行 DCLK 宽度可调
 //  [T5] ddr_slow 降级: 行周期 387 拍 / DCLK 沿距 40ns / OE 宽 96 拍 (占空守恒) /
 //       数据逐 bit 仍对 / LE 5,4,4... / 帧周期 20898
+//  [T6] 3-bit 行内 BCM (bpp_mode=1, 2026-08-20 feature/3bit-color):
+//       plane 周期仍 195 拍 / OE 宽循环 27,54,108 (oe_w0/w1/w2) /
+//       LE 序列 5,3,3, 4,3,3, ... (同行多次锁存: 首次 4/5 + 后续 3=普通锁存);
+//       le_plane_mode=1 逃生门下改成 5,5,5, 4,4,4, ... /
+//       rows=60 在 3-bit 下箝到 56 (紧凑地址不许绕回), fb_raddr 恒 <1024 /
+//       行驱 row_go **只在 plane0 的移位窗里发**, 每整屏恰 54 次 (不是 162) /
+//       fb 紧凑地址 row*18+plane*6+pair 逐 bit 对 / frame_period = 31590 /
+//       运行时切回 bpp_mode=0 立刻恢复 195/10530
+//  [R0] bpp_mode=0 逐拍等价: T1..T5 全部数字与改动前完全一致 (另有
+//       独立签名 TB 对全 pad 做逐拍 CRC 比对, 见结论)
 //
 // 跑法: sim/run_tb_2047.sh (cmd.exe + settings64.bat + xvlog/xelab/xsim,
 //       ODDR 用 unisims_ver + glbl)
@@ -113,7 +123,11 @@ module tb_2047_core;
     // ---------------- DUT 配置输入 ----------------
     reg         auto_en   = 1'b0;
     reg  [8:0]  rows      = ROWS;
-    reg  [7:0]  oe_window = 8'd48;      // 00_overview 裁决默认
+    reg  [7:0]  oe_window = 8'd48;      // 00_overview 裁决默认 (= BCM oe_w0)
+    reg  [7:0]  oe_w1     = 8'd54;      // BCM plane1 (权重 2)
+    reg  [7:0]  oe_w2     = 8'd108;     // BCM plane2 (权重 4)
+    reg         bpp_mode  = 1'b0;       // 0=1-bit 1=3-bit 行内 BCM
+    reg         le_plane_mode = 1'b0;   // plane1/2 的 LE: 0=3 沿 1=同 plane0(4/5)
     reg         ddr_slow  = 1'b0;
     reg         oe_set_pulse = 1'b0;
     reg         oe_set_val   = 1'b1;
@@ -131,8 +145,8 @@ module tb_2047_core;
     reg  [31:0] row_cfg = 32'd0;
 
     // ---------------- fb 模型 (v5 g_fb 语义: 9×512×32, 同步读 1 拍) ----------------
-    wire [8:0]  fb_raddr;
-    reg  [31:0] fbmem [0:8][0:511];
+    wire [9:0]  fb_raddr;
+    reg  [31:0] fbmem [0:8][0:1023];
     reg  [31:0] fb_dout_r [0:8];
     wire [287:0] fb_dout_flat;
     genvar gf;
@@ -142,8 +156,8 @@ module tb_2047_core;
     integer fi, fj, ftmp;
     initial begin
         for (fi = 0; fi < 9; fi = fi + 1)
-            for (fj = 0; fj < 512; fj = fj + 1) begin
-                ftmp = fi*512 + fj;
+            for (fj = 0; fj < 1024; fj = fj + 1) begin
+                ftmp = fi*512 + fj;     // 0..511 的内容与改动前完全一致
                 fbmem[fi][fj] = (ftmp * 32'h9E37_79B1) ^ (ftmp << 13) ^ 32'h5A5A_A5A5;
             end
     end
@@ -155,6 +169,7 @@ module tb_2047_core;
     wire        busy, cmd_pending_o, row_busy_o, oe_done_o, adv_fired_o;
     wire [2:0]  eg_state_o;
     wire [8:0]  shift_row_o;
+    wire [1:0]  plane_o;
     wire [15:0] frame_count_o;
     wire [31:0] frame_period_o;
     wire        dclk_pad, le_pad, oe_pad;
@@ -164,6 +179,8 @@ module tb_2047_core;
     icnd2047_panel_core dut (
         .aclk(clk), .aresetn(rstn),
         .auto_en(auto_en), .rows(rows), .oe_window(oe_window),
+        .oe_w1(oe_w1), .oe_w2(oe_w2), .bpp_mode(bpp_mode),
+        .le_plane_mode(le_plane_mode),
         .ddr_slow(ddr_slow), .oe_set_pulse(oe_set_pulse), .oe_set_val(oe_set_val),
         .sdi_mask(sdi_mask),
         .fb_raddr(fb_raddr), .fb_dout_flat(fb_dout_flat),
@@ -174,7 +191,7 @@ module tb_2047_core;
         .row_man_sdi(row_man_sdi), .row_man_reg(row_man_reg),
         .row_cfg(row_cfg),
         .busy(busy), .cmd_pending_o(cmd_pending_o), .row_busy_o(row_busy_o),
-        .eg_state_o(eg_state_o), .shift_row_o(shift_row_o),
+        .eg_state_o(eg_state_o), .shift_row_o(shift_row_o), .plane_o(plane_o),
         .frame_count_o(frame_count_o), .frame_period_o(frame_period_o),
         .oe_done_o(oe_done_o), .adv_fired_o(adv_fired_o),
         .dclk_pad(dclk_pad), .le_pad(le_pad), .oe_pad(oe_pad), .sdi_pad(sdi_pad),
@@ -211,40 +228,81 @@ module tb_2047_core;
     endtask
 
     // ---------------- 金样: fb → 192b 行流 (与 BFM 同向拼接) ----------------
-    function [191:0] golden_row(input integer lane, input integer row);
+    function [191:0] golden_at(input integer lane, input integer base);
         integer p, b;
         reg [31:0] pr;
         reg [191:0] g;
         begin
             g = 192'd0;
             for (p = 0; p < 6; p = p + 1) begin
-                pr = fbmem[lane][row*8 + p];
+                pr = fbmem[lane][base + p];
                 for (b = 15; b >= 0; b = b - 1) g = {g[190:0], pr[b]};      // word 2p
                 for (b = 15; b >= 0; b = b - 1) g = {g[190:0], pr[16+b]};   // word 2p+1
             end
-            golden_row = g;
+            golden_at = g;
         end
+    endfunction
+    // 1-bit: {row,pair} = row*8 + pair; 3-bit: 紧凑 row*18 + plane*6 + pair
+    function [191:0] golden_row(input integer lane, input integer row);
+        begin golden_row = golden_at(lane, row*8); end
     endfunction
 
     // ---------------- 监视器: OE↓ 逐行 reg2 vs 金样 (9 lane 全查) ----------------
     reg     cmp_en = 1'b0;
+    reg     cmp3   = 1'b0;      // 1 = 3-bit 紧凑地址期望值
     integer disp_n = 0, data_err = 0, data_ok = 0;
-    integer m_ln, m_row;
+    integer m_ln, m_row, m_base, m_unit;
     reg [191:0] m_got, m_exp;
     always @(negedge oe_pad) if (cmp_en) begin
         #1;
-        m_row = disp_n % ROWS;
+        // disp_n 从整屏起点计数 ⇒ 1-bit 每屏 ROWS 次, 3-bit 每屏 ROWS*3 次
+        if (cmp3) begin
+            m_unit = disp_n % (ROWS*3);          // = row*3 + plane
+            m_row  = m_unit / 3;
+            m_base = m_unit * 6;                 // row*18 + plane*6
+        end else begin
+            m_unit = disp_n % ROWS;
+            m_row  = m_unit;
+            m_base = m_unit * 8;
+        end
         for (m_ln = 0; m_ln < 9; m_ln = m_ln + 1) begin
             m_got = bfm_reg2_f[m_ln*192 +: 192];
-            m_exp = golden_row(m_ln, m_row);
+            m_exp = golden_at(m_ln, m_base);
             if (m_got !== m_exp) begin
                 data_err = data_err + 1;
                 if (data_err <= 5)
-                    $display("[%0t] FAIL data: disp %0d row %0d lane %0d\n  got %048x\n  exp %048x",
-                             $time, disp_n, m_row, m_ln, m_got, m_exp);
+                    $display("[%0t] FAIL data: disp %0d unit %0d base %0d lane %0d\n  got %048x\n  exp %048x",
+                             $time, disp_n, m_unit, m_base, m_ln, m_got, m_exp);
             end else data_ok = data_ok + 1;
         end
         disp_n = disp_n + 1;
+    end
+
+    //---------- 监视器: OE 低宽逐次记录 (BCM 权重序列用) ----------
+    reg      oew_en = 1'b0;
+    integer  oew_n = 0;
+    integer  oew [0:1023];
+    realtime t_oel;
+    always @(negedge oe_pad) if (oew_en) t_oel = $realtime;
+    always @(posedge oe_pad) if (oew_en && oew_n < 1024) begin
+        oew[oew_n] = ($realtime - t_oel) / 20.0;
+        oew_n = oew_n + 1;
+    end
+
+    //---------- 监视器: fb 读地址不许越界 (rows 箝位的判据) ----------
+    integer max_raddr = 0, raddr_err = 0;
+    always @(posedge clk) if (rstn) begin
+        if (fb_raddr > max_raddr) max_raddr = fb_raddr;
+        if (fb_raddr > 10'd1023) raddr_err = raddr_err + 1;   // 位宽所限, 只会是绕回
+    end
+
+    //---------- 监视器: 行驱推进只允许发生在 plane0 (plane 边界不是行边界) ----------
+    integer padv_err = 0;
+    always @(posedge clk) if (rstn && bpp_mode && dut.row_go_r && plane_o !== 2'd0) begin
+        padv_err = padv_err + 1;
+        if (padv_err <= 3)
+            $display("[%0t] FAIL: row_go fired at plane=%0d (row advance inside a row!)",
+                     $time, plane_o);
     end
 
     // ---------------- 监视器: row_busy ⇒ OE 消隐 ----------------
@@ -323,6 +381,34 @@ module tb_2047_core;
         end
     endtask
 
+    // 3-bit: 每 unit 一次锁存, 期望 plane0 = (row0?5:4), plane1/2 = 3
+    task check_le_hist3(input integer n_expect, input lpm);
+        integer k, u, pl, rw;
+        reg [7:0] ex;
+        reg bad;
+        begin
+            bad = 0;
+            if (u_bfm0.le_hist_n < n_expect) begin
+                fail("le_hist3 too short");
+                $display("        got %0d entries expect >=%0d", u_bfm0.le_hist_n, n_expect);
+            end else begin
+                for (k = 0; k < n_expect; k = k + 1) begin
+                    u  = k % (ROWS*3);
+                    pl = u % 3;
+                    rw = u / 3;
+                    ex = (pl != 0 && !lpm) ? 8'd3 : ((rw == 0) ? 8'd5 : 8'd4);
+                    if (u_bfm0.le_hist[k] !== ex) begin
+                        if (!bad) $display("        le_hist[%0d]=%0d exp %0d (row %0d plane %0d)",
+                                           k, u_bfm0.le_hist[k], ex, rw, pl);
+                        bad = 1;
+                    end
+                end
+                if (bad) fail(lpm ? "3-bit LE sequence != 5,5,5,4,4,4,... (le_plane_mode=1)"
+                                  : "3-bit LE sequence != 5,3,3,4,3,3,... (le_plane_mode=0)");
+            end
+        end
+    endtask
+
     task check_le_hist(input integer n_expect);
         integer k;
         reg bad;
@@ -345,7 +431,7 @@ module tb_2047_core;
 
     // ---------------- 主流程 ----------------
     integer k0, e_row, e_ovl, base_err, idle_e;
-    integer fc0;
+    integer fc0, rf0, rf1, adv_exp, w_exp, wbad;
     real    p1, p2, w1;
     reg [191:0] casc_exp, tmp192;
     reg [15:0]  tmpw;
@@ -669,6 +755,203 @@ module tb_2047_core;
         auto_en = 1'b0;
         repeat (600) @(posedge clk);
         cmp_en = 1'b0;
+
+        //==================================================================
+        // T6: 3-bit 行内 BCM (05_3bit_bcm.md 契约 v1)
+        //   plane0=LSB(oe_w0=27) / plane1(54) / plane2=MSB(108)
+        //   扫描序 row0/p0 → row0/p1 → row0/p2 → row1/p0 → ...
+        //   fb 紧凑地址 raddr = row*18 + plane*6 + pair
+        //==================================================================
+        $display("---- T6: 3-bit inline BCM ----");
+        ddr_slow  = 1'b0;
+        oe_window = 8'd27;              // = oe_w0 (权重 1)
+        oe_w1     = 8'd54;              // 权重 2
+        oe_w2     = 8'd108;             // 权重 4
+        bpp_mode  = 1'b1;
+        row_cfg   = 32'd0;
+        repeat (20) @(posedge clk);
+        if (eg_state_o != 3'd0) fail("T6 engine not idle before 3-bit run");
+
+        u_bfm0.le_hist_n = 0;
+        disp_n = 0; data_err = 0; data_ok = 0; oew_n = 0;
+        blank_err = 0; padv_err = 0;
+        cmp3 = 1'b1; cmp_en = 1'b1; oew_en = 1'b1;
+        fc0 = frame_count_o;
+        auto_en = 1'b1;
+
+        // --- T6a: 每个 plane 仍是一个完整 195 拍行周期 (oe_w* 全 <=111 ⇒ LWAIT=0)
+        while (frame_count_o != fc0 + 1) @(posedge clk);
+        rf0 = rf_total_n;
+        for (k0 = 0; k0 < 6; k0 = k0 + 1) begin
+            measure_period(r_period);
+            if (r_period != 195.0) begin
+                fail("T6 plane cycle != 195 aclk");
+                $display("        got %0.1f (k=%0d)", r_period, k0);
+            end
+        end
+        $display("PASS T6a: plane cycle = 195 aclk (6x = 2 rows x 3 planes, LWAIT=0)");
+
+        while (frame_count_o != fc0 + 3) @(posedge clk);
+        rf1 = rf_total_n;
+
+        // --- T6b: frame_period 仍是"整屏"语义 = 54*3*195 = 31590
+        if (frame_period_o != 32'd31590) begin
+            fail("T6 frame_period != 31590 (54 rows x 3 planes x 195)");
+            $display("        got %0d", frame_period_o);
+        end else
+            $display("PASS T6b: frame_period = %0d aclk -> %0.2f kHz (2D refresh)",
+                     frame_period_o, 50000.0/frame_period_o);
+
+        // --- T6c: 行驱每整屏只推进 ROWS 次 (不是 ROWS*3), 且只在 plane0 发
+        adv_exp = 2*ROWS;
+        if (rf1 - rf0 < adv_exp - 1 || rf1 - rf0 > adv_exp + 1) begin
+            fail("T6 row advances per frame wrong (plane boundary advanced the row?)");
+            $display("        got %0d over 2 frames, exp %0d (3x would be %0d)",
+                     rf1 - rf0, adv_exp, 3*adv_exp);
+        end else
+            $display("PASS T6c: %0d row advances over 2 frames (= 2 x %0d rows, NOT %0d)",
+                     rf1 - rf0, ROWS, 3*adv_exp);
+        if (padv_err != 0) fail("T6 row_go fired at plane != 0");
+        else $display("PASS T6d: every row_go fired inside a plane0 shift window");
+
+        // --- T6e: OE 低宽循环 27 / 54 / 108
+        wbad = 0;
+        if (oew_n < 60) begin
+            fail("T6 not enough OE windows recorded");
+            $display("        oew_n=%0d", oew_n);
+        end else begin
+            for (k0 = 0; k0 < 300 && k0 < oew_n; k0 = k0 + 1) begin
+                w_exp = (k0 % 3 == 0) ? 27 : ((k0 % 3 == 1) ? 54 : 108);
+                if (oew[k0] !== w_exp) begin
+                    if (wbad < 3)
+                        $display("        oew[%0d]=%0d exp %0d (plane %0d)",
+                                 k0, oew[k0], w_exp, k0 % 3);
+                    wbad = wbad + 1;
+                end
+            end
+            if (wbad != 0) fail("T6 OE window weight sequence != 27/54/108");
+            else $display("PASS T6e: OE low widths cycle 27,54,108 aclk over %0d windows (1:2:4)",
+                          (oew_n > 300) ? 300 : oew_n);
+        end
+        oew_en = 1'b0;
+
+        // --- T6f: LE 序列 = 5,3,3 / 4,3,3 (同行多次锁存: 首次 4/5 + 后续 3)
+        base_err = errors;
+        check_le_hist3(2*ROWS*3, 1'b0);
+        if (errors == base_err)
+            $display("PASS T6f: LE sequence 5,3,3,4,3,3,... (plane boundary = LE 3 = row unchanged)");
+
+        // --- T6g: fb 紧凑地址逐 bit 对
+        if (disp_n < 2*ROWS*3) begin
+            fail("T6 not enough OE falls compared");
+            $display("        disp_n=%0d exp >=%0d", disp_n, 2*ROWS*3);
+        end
+        if (data_err != 0) fail("T6 data mismatch vs compact fb golden (row*18+plane*6+pair)");
+        else $display("PASS T6g: %0d row-compares bit-exact (9 lane x %0d plane-disp)",
+                      data_ok, disp_n);
+        if (blank_err != 0) fail("T6 row_busy while OE low");
+        else $display("PASS T6h: row_busy=1 => OE=1 held in 3-bit mode");
+        if (viol_sum(0) != 0) fail("T6 setup/hold or zero-LE violations in 3-bit mode");
+        else $display("PASS T6i: 0 setup/hold + 0 zero-edge-LE in 3-bit mode");
+
+        // --- T6k: q_gap 行边界静默区在 3-bit 下**逐 plane 生效**
+        //     (plane 边界的 OE/LCK 电流阶跃密度是 1-bit 的 3 倍, 死区照插 = 保守做法)
+        //     每个 plane 周期 = 195 + q_gap(FETCH) + q_gap+1(LWAIT) = 195+9 = 204
+        row_cfg = 32'h0800_0000;        // [30:25] = q_gap = 4
+        repeat (3) @(negedge oe_pad);
+        measure_period(r_period);
+        if (r_period != 204.0) begin
+            fail("T6 q_gap=4: plane cycle != 204 (q_gap not applied per plane?)");
+            $display("        got %0.1f", r_period);
+        end else
+            $display("PASS T6k: q_gap=4 -> plane cycle 204 aclk (dead zone on every plane boundary)");
+        fc0 = frame_count_o;
+        while (frame_count_o != fc0 + 2) @(posedge clk);
+        if (frame_period_o != 32'd33048) begin
+            fail("T6 q_gap=4: frame_period != 54*3*204 = 33048");
+            $display("        got %0d", frame_period_o);
+        end else $display("PASS T6l: frame_period with q_gap=4 = %0d (54 x 3 x 204)", frame_period_o);
+        row_cfg = 32'd0;
+        repeat (3) @(negedge oe_pad);
+
+        // --- T6m: le_plane_mode=1 逃生门 —— plane1/2 改发和 plane0 一样的 4/5 沿
+        //     (LE=3 "普通锁存/行不变" 是 datasheet 纸面语义, 没上板验过;
+        //      这一位让上板当场能切另一种, 省一次重综合)
+        auto_en = 1'b0;
+        k0 = 0;
+        while (eg_state_o != 3'd0 && k0 < 2000) begin @(posedge clk); k0 = k0 + 1; end
+        cmp_en = 1'b0;
+        le_plane_mode = 1'b1;
+        repeat (20) @(posedge clk);
+        u_bfm0.le_hist_n = 0;
+        disp_n = 0; data_err = 0; data_ok = 0;
+        cmp3 = 1'b1; cmp_en = 1'b1;
+        auto_en = 1'b1;
+        k0 = 0;
+        while (u_bfm0.le_hist_n < 2*ROWS*3 && k0 < 400000) begin @(posedge clk); k0 = k0 + 1; end
+        base_err = errors;
+        check_le_hist3(2*ROWS*3, 1'b1);
+        if (errors == base_err)
+            $display("PASS T6m: le_plane_mode=1 -> LE 5,5,5,4,4,4,... (plane1/2 same as plane0)");
+        if (data_err != 0) fail("T6 data mismatch with le_plane_mode=1");
+        else $display("PASS T6n: %0d row-compares still bit-exact with le_plane_mode=1", data_ok);
+        if (viol_sum(0) != 0) fail("T6 setup/hold or zero-LE violations with le_plane_mode=1");
+        auto_en = 1'b0;
+        k0 = 0;
+        while (eg_state_o != 3'd0 && k0 < 2000) begin @(posedge clk); k0 = k0 + 1; end
+        cmp_en = 1'b0;
+        le_plane_mode = 1'b0;
+
+        // --- T6o: rows 箝位 —— 3-bit 下 rows=60 必须被箝到 56, 紧凑地址不许绕回
+        //     (0x0C sub10 [24:16] 运行时可写, 不箝就是静默错帧)
+        rows = 9'd60;
+        max_raddr = 0; raddr_err = 0;
+        repeat (20) @(posedge clk);
+        fc0 = frame_count_o;
+        auto_en = 1'b1;
+        while (frame_count_o != fc0 + 2) @(posedge clk);
+        if (frame_period_o != 32'd32760) begin
+            fail("T6 rows=60 not clamped to 56 (expect 56*3*195 = 32760)");
+            $display("        got %0d (60 rows would be %0d)", frame_period_o, 60*3*195);
+        end else
+            $display("PASS T6o: rows=60 clamped to 56 -> frame_period %0d (56 x 3 x 195)",
+                     frame_period_o);
+        if (shift_row_o > 9'd55) fail("T6 shift_row exceeded clamped row_max");
+        if (raddr_err != 0) fail("T6 fb_raddr out of range with rows=60");
+        else $display("PASS T6p: max fb_raddr = %0d < 1024 (no compact-address wrap)", max_raddr);
+        auto_en = 1'b0;
+        k0 = 0;
+        while (eg_state_o != 3'd0 && k0 < 2000) begin @(posedge clk); k0 = k0 + 1; end
+        rows = 9'd54;
+        repeat (20) @(posedge clk);
+
+        // --- T6j: 运行时切回 1-bit, 立刻恢复 195 / 10530 / 旧 fb 布局
+        auto_en = 1'b0;
+        k0 = 0;
+        while (eg_state_o != 3'd0 && k0 < 1000) begin @(posedge clk); k0 = k0 + 1; end
+        cmp_en = 1'b0;
+        bpp_mode  = 1'b0;
+        oe_window = 8'd48;
+        repeat (20) @(posedge clk);
+        disp_n = 0; data_err = 0; cmp3 = 1'b0; cmp_en = 1'b1;
+        fc0 = frame_count_o;
+        auto_en = 1'b1;
+        while (frame_count_o != fc0 + 2) @(posedge clk);
+        measure_period(r_period);
+        if (r_period != 195.0) begin
+            fail("T6 back to 1-bit: row period != 195");
+            $display("        got %0.1f", r_period);
+        end
+        if (frame_period_o != 32'd10530) begin
+            fail("T6 back to 1-bit: frame_period != 10530");
+            $display("        got %0d", frame_period_o);
+        end
+        if (data_err != 0) fail("T6 back to 1-bit: data mismatch (old {row,pair} layout)");
+        else $display("PASS T6j: runtime switch back to 1-bit -> 195 / 10530 / old fb layout OK");
+
+        auto_en = 1'b0;
+        repeat (600) @(posedge clk);
+        cmp_en = 1'b0;
         if (blank_err != 0) fail("final: row_busy/OE blanking violations");
         if (rf_err != 0)    fail("final: row_first violations");
 
@@ -682,7 +965,7 @@ module tb_2047_core;
 
     // 看门狗
     initial begin
-        #8_000_000;     // 8 ms
+        #16_000_000;    // 16 ms (3-bit 用例整屏 631µs, 需要更长)
         fail("watchdog timeout");
         $display("        eg_state=%0d disp_n=%0d frame_count=%0d",
                  eg_state_o, disp_n, frame_count_o);

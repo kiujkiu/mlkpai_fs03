@@ -25,6 +25,33 @@
 //   latch1→reg2 两种转移语义等价); 行推进藏尾 P2 照 v4.1 adv_fired 结构。
 // 行驱: row_drv_icnd1028 子模块 (ICND3019 同族时序克隆, 0x24 cfg 运行时参数)。
 // 手动路径 (01 §2.7): word=16 bit=16 拍; le_count 单位改沿; marker_LE 带沿。
+//
+// [2026-08-20 feature/3bit-color] 行内 BCM 3-bit 扩展 (05_3bit_bcm.md):
+//   * bpp_mode=1 时每行连着发 3 个位平面 plane0(权重1)/1(2)/2(4) 再进下一行
+//     (**行内** BCM: 三平面在 3×195 拍 = 11.7µs 内完成, POV 角度差 0.06°;
+//      屏级 BCM 会把三平面摊到 12° 上 → 颜色分离拖尾, 见文档 §2)。
+//   * plane 计数器在行循环**内层**: EG_DISP 后 plane<2 则 plane++ 且**不推进**
+//     shift_row / 不清 adv_fired (行驱只在 plane2 之后推进一次, plane 边界不是
+//     行边界); plane==2 才归零并推进行。
+//   * OE 权重按 plane 选: plane0=oe_window(=oe_w0) / plane1=oe_w1 / plane2=oe_w2
+//     (默认 27/54/108 沿, 全 ≤111 ⇒ 全部藏在下一 plane 的 192 拍移位里, 零 LWAIT)。
+//   * LE 沿数按 01 §2.4 的 BCM 预案: 同行多次锁存 = 首次 4/5, 后续 3 (普通锁存,
+//     行不变) ⇒ plane0: shift_row==0?5:4; plane1/2: 3。
+//     ⚠ "LE=3 = 普通锁存/行不变" 是 datasheet 纸面语义, **未上板验证过**。
+//     le_plane_mode (0x0C sub01 [17]) 给一个运行时逃生门: =1 时 plane1/2 也发
+//     和 plane0 一样的 4/5 沿。上板若发现 LE=3 不对, 当场翻这一位即可, 不必
+//     重综合。默认 0 = 按 datasheet。
+//   * fb 深度 512→1024, 地址改**紧凑递增**: raddr = row*18 + plane*6 + pair
+//     (0..971)。扫描序天然地址递增 ⇒ 读侧只是一个 +1 计数器 (整屏结束归零),
+//     不做乘法。bpp_mode=0 时 EG_DISP 仍写回 {row,3'd0}, 与旧式 {row,pair} 逐拍等价。
+//   * frame_period_o 保持"整屏"语义: 3-bit 下 = 54×3×195 = 31590 拍。
+//   * rows 在 3-bit 下**箝到 56**: 紧凑地址 max = rows*18-1 必须 ≤ 1023 ⇒
+//     rows ≤ 56。0x0C sub10 [24:16] 运行时可写, 写大了地址会静默绕回错帧,
+//     所以在核里硬箝 (1-bit 下不箝, 维持原行为)。
+//   * q_gap 行边界静默区: FSM 里它挂在**每个 plane 的行周期**上 (FETCH 前 /
+//     LWAIT 里各一次), 所以 3-bit 下 plane 边界也照插死区 —— 电流阶跃密度翻 3 倍,
+//     这是保守且想要的行为 (文档 §8 风险项)。
+//   * bpp_mode=0 必须与改动前逐拍等价 (旧内容/空闲动画/pov_boot.sh 依赖)。
 //-----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -36,13 +63,22 @@ module icnd2047_panel_core (
     input  wire         auto_en,        // 0x0C sub11 [0]
     input  wire [8:0]   rows,           // 0x0C sub10 [24:16] 扫描行数 (54); 0 当 54
     input  wire [7:0]   oe_window,      // 0x0C sub10 [15:8], 单位=沿, 内箝 [2,187]
+                                        //   = BCM 的 oe_w0 (plane0, 权重 1)
+    input  wire [7:0]   oe_w1,          // 0x0C sub01 [7:0]  plane1 (权重 2) 沿数
+    input  wire [7:0]   oe_w2,          // 0x0C sub01 [15:8] plane2 (权重 4) 沿数
+    input  wire         bpp_mode,       // 0x0C sub01 [16]: 0=1-bit(旧) 1=3-bit BCM
+    input  wire         le_plane_mode,  // 0x0C sub01 [17]: plane1/2 的 LE 沿数
+                                        //   0 = 3 沿 (普通锁存/行不变, datasheet 默认)
+                                        //   1 = 与 plane0 同 (4/5 沿) —— 上板逃生门
     input  wire         ddr_slow,       // 0x0C sub10 [29] (原 dclk_fast 改义)
     input  wire         oe_set_pulse,   // 0x0C sub10 手动 OE (auto_en=0 时有效)
     input  wire         oe_set_val,
     input  wire [8:0]   sdi_mask,       // 0x0C sub00
 
     // ---- fb 读口 (v5 g_fb BRAM 语义: 同步读 1 拍延迟) ----
-    output reg  [8:0]   fb_raddr,       // {row[5:0], pair[2:0]}
+    // bpp_mode=0: {row[5:0], pair[2:0]} (旧布局, 逐 bit 兼容)
+    // bpp_mode=1: row*18 + plane*6 + pair (紧凑序, 0..971)
+    output reg  [9:0]   fb_raddr,
     input  wire [287:0] fb_dout_flat,   // 9 lane × 32b, lane i = [i*32 +: 32]
 
     // ---- 手动命令 (v5 0x00/0x04 语义, le_count 单位=沿) ----
@@ -66,8 +102,14 @@ module icnd2047_panel_core (
     output wire         row_busy_o,     // R0x00[13]
     output wire [2:0]   eg_state_o,     // 0x24R [31:29]
     output wire [8:0]   shift_row_o,
+    output wire [1:0]   plane_o,        // 当前位平面 (bpp_mode=0 时恒 0)
     output wire [15:0]  frame_count_o,
-    output wire [31:0]  frame_period_o, // 0x28R: 最近一整屏 aclk 数 (期望 ~10530)
+    output wire [31:0]  frame_period_o, // 0x28R: 最近**一整屏**的 aclk 拍数。
+                                        //   1-bit: rows × 195      (54 行 ⇒ 10530)
+                                        //   3-bit: rows × 3 × 195  (54 行 ⇒ 31590)
+                                        //   (oe>111 的 LWAIT 与 q_gap 死区都算在内)
+                                        //   纯 PL 侧计数, 不含任何时钟频率假设 ⇒
+                                        //   与 CPU 墙钟测出的整屏秒数相除 = aclk 真频率
     output wire         oe_done_o,      // R0x00[11]
     output wire         oe_state_o,     // OE fabric 镜像 (pad 是 ODDR, 不可回采)
     output wire         adv_fired_o,    // R0x00[12]
@@ -91,11 +133,21 @@ module icnd2047_panel_core (
     end endgenerate
 
     // ---------------- 箝位 / 派生 ----------------
-    wire [7:0] win_c    = (oe_window < 8'd2)   ? 8'd2   :
-                          (oe_window > 8'd187) ? 8'd187 : oe_window;
+    reg  [1:0] plane;               // 行内 BCM 位平面 (bpp_mode=0 时恒 0)
+    // OE 权重按 plane 选; plane 恒 0 ⇒ 表达式退化成 oe_window, 与旧核逐拍等价
+    wire [7:0] oe_sel   = (plane == 2'd1) ? oe_w1 :
+                          (plane == 2'd2) ? oe_w2 : oe_window;
+    wire [7:0] win_c    = (oe_sel < 8'd2)   ? 8'd2   :
+                          (oe_sel > 8'd187) ? 8'd187 : oe_sel;
     // OE 低宽单位=沿; ddr_slow 时 1 沿 = 2 aclk (占空比守恒, LE-after-OE 关系守恒)
     wire [8:0] win_aclk = ddr_slow ? {win_c, 1'b0} : {1'b0, win_c};
-    wire [8:0] row_max  = (rows == 9'd0) ? 9'd53 : (rows - 9'd1);
+    wire       bpp3     = bpp_mode;
+    // rows 箝位: 3-bit 紧凑地址 (rows-1)*18+17 ≤ 1023 ⇒ rows ≤ 56。
+    // 超了就静默绕回错帧 ⇒ 这里硬箝。bpp3=0 时表达式退化成原式, 逐拍等价。
+    wire [8:0] rows_c   = (rows == 9'd0)            ? 9'd54 :
+                          (bpp3 && rows > 9'd56)    ? 9'd56 : rows;
+    wire [8:0] row_max  = rows_c - 9'd1;
+    wire       plane_last = ~bpp3 | (plane == 2'd2);   // 本 plane 是行内最后一个
 
     // ---------------- 状态 ----------------
     localparam EG_IDLE  = 3'd0;
@@ -123,9 +175,16 @@ module icnd2047_panel_core (
     reg  [15:0] frame_count_r;
 
     wire tick = ~ddr_slow | slow_ph;            // bit 推进节拍
+    // 预取脉冲: sh_cnt[4:0]==29 的**第一拍**才发 (slow 时该 bit 占 2 拍)。
+    // 旧核写的是绝对地址 {row, pair+1}, 连发两拍幂等; 新核改成 +1 递增, 必须去重。
+    // fast 时 pf_now 恒 1 ⇒ 与旧核同一拍发同一值, 逐拍等价。
+    wire       pf_now = ~ddr_slow | ~slow_ph;
     wire [7:0] nc = sh_cnt + 8'd1;              // 下一 bit 序号
     wire [8:0] next_row = (shift_row == row_max) ? 9'd0 : (shift_row + 9'd1);
-    wire [2:0] le_len   = (shift_row == 9'd0) ? 3'd5 : 3'd4;   // 首行5/换行4
+    // LE 沿数 (01 §2.4): 1-bit = 首行5/换行4; 3-bit 同行多次锁存 = 首次 4/5 +
+    // 后续 3 (=普通锁存"行不变", 正是 plane 边界要的语义)
+    wire [2:0] le_len   = (plane != 2'd0 && !le_plane_mode) ? 3'd3 :
+                          ((shift_row == 9'd0) ? 3'd5 : 3'd4);
     wire [7:0] le_start = 8'd192 - {5'd0, le_len};
     // 行边界静默区 (0x24[30:25], 拍): LE尾→OE落 与 OE落→下行突发 各插死区,
     // 隔离 OE/LCK 电流阶跃与 CLK 沿 (2026-07-17 行边界串扰案)。0=关=原行为
@@ -198,9 +257,10 @@ module icnd2047_panel_core (
             oe_done     <= 1'b1;
             adv_fired   <= 1'b0;
             shift_row   <= 9'd0;
+            plane       <= 2'd0;
             row_go_r    <= 1'b0;
             row_first_r <= 1'b0;
-            fb_raddr    <= 9'd0;
+            fb_raddr    <= 10'd0;
             per_cnt     <= 32'd0;
             frame_period_r <= 32'd0;
             frame_count_r  <= 16'd0;
@@ -296,8 +356,9 @@ module icnd2047_panel_core (
                         state <= EG_MAN;
                     end else if (auto_en && !busy_r && !rd_busy) begin
                         shift_row <= 9'd0;
+                        plane     <= 2'd0;
                         adv_fired <= 1'b0;
-                        fb_raddr  <= 9'd0;         // {row0, pair0}
+                        fb_raddr  <= 10'd0;        // {row0, pair0} = 紧凑序 0
                         state     <= EG_FETCH;
                     end
                 end
@@ -339,9 +400,12 @@ module icnd2047_panel_core (
 
                 //--------------------------------------------------------
                 EG_SHIFT: begin
-                    // 流水预取: bit29 窗口发下一 pair 地址 (pair=5 时读 {row,6} 无害)
-                    if (sh_cnt[4:0] == 5'd29)
-                        fb_raddr <= {shift_row[5:0], sh_cnt[7:5] + 3'd1};
+                    // 流水预取: bit29 窗口发下一 pair 地址 (递增计数器)。
+                    // 1-bit: 行首 fb_raddr={row,0}, pair 0..5 加一不进位 ⇒ 与旧核的
+                    //   {row, pair+1} 完全同值 (pair=5 时得 {row,6}, 同样无害)。
+                    // 3-bit: 紧凑序天然连续, 末次得到的就是下一 plane/行的基址。
+                    if (sh_cnt[4:0] == 5'd29 && pf_now)
+                        fb_raddr <= fb_raddr + 10'd1;
                     if (tick) begin
                         slow_ph <= 1'b0;
                         if (sh_cnt == 8'd191) begin
@@ -393,19 +457,32 @@ module icnd2047_panel_core (
                 end
 
                 //--------------------------------------------------------
-                EG_DISP: begin         // OE↓: reg2←latch1, 显示 shift_row; 1 拍
+                // OE↓: reg2←latch1, 显示 shift_row 的当前 plane; 1 拍
+                // win_aclk 组合于本拍的 plane ⇒ 权重取的正是刚移完那个平面的。
+                EG_DISP: begin
                     oe_r      <= 1'b0;
                     oe_cnt    <= win_aclk - 9'd1;
                     oe_done   <= 1'b0;
-                    adv_fired <= 1'b0;
-                    fb_raddr  <= {next_row[5:0], 3'd0};
-                    if (shift_row == row_max) begin
-                        shift_row      <= 9'd0;
-                        frame_period_r <= per_cnt + 32'd1;   // 含本拍
-                        per_cnt        <= 32'd0;
-                        frame_count_r  <= frame_count_r + 16'd1;
-                    end else
-                        shift_row <= shift_row + 9'd1;
+                    if (!plane_last) begin
+                        // ---- plane 边界 (不是行边界) ----
+                        // shift_row 不动 / adv_fired 保持 1 ⇒ P2 不会再发 row_go,
+                        // 行驱在 3 个 plane 之间一步都不走; fb_raddr 已被预取推到
+                        // 下一 plane 的基址 (base+6), 原样留着。
+                        plane <= plane + 2'd1;
+                    end else begin
+                        plane     <= 2'd0;
+                        adv_fired <= 1'b0;      // 只有真换行才放行 P2 藏尾推进
+                        if (shift_row == row_max) begin
+                            shift_row      <= 9'd0;
+                            frame_period_r <= per_cnt + 32'd1;   // 含本拍 (整屏语义)
+                            per_cnt        <= 32'd0;
+                            frame_count_r  <= frame_count_r + 16'd1;
+                            if (bpp3) fb_raddr <= 10'd0;         // 整屏结束归零
+                        end else
+                            shift_row <= shift_row + 9'd1;
+                        // 1-bit: 旧式稀疏地址, 逐拍等价; 3-bit: 预取已到位, 不动
+                        if (!bpp3) fb_raddr <= {1'b0, next_row[5:0], 3'd0};
+                    end
                     state <= EG_FETCH;
                 end
 
@@ -530,6 +607,7 @@ module icnd2047_panel_core (
     assign row_busy_o     = rd_busy;
     assign eg_state_o     = state;
     assign shift_row_o    = shift_row;
+    assign plane_o        = plane;
     assign frame_count_o  = frame_count_r;
     assign frame_period_o = frame_period_r;
     assign oe_done_o      = oe_done;
