@@ -17,3 +17,5 @@ sim_diag/
 stream/board/anim.pvs
 stream/board/anime_dual720.bin
 stream/board/pov_rxd_sw
+stream/board/anime_dual3b100.bin
+tools/boot3b_preview.png
