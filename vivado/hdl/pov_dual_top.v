@@ -272,8 +272,8 @@ module pov_dual_top #(
             oe_window_b_r <= 8'd0;       // 0 = 跟随屏 A
             row_cfg_r     <= 32'h0;      // 全默认
             slice_base_b_r <= 32'h0;     // 0 = 屏 B 回落用 slice_base_r (旧行为)
-            oe_w1_r       <= 8'd54;      // 3-bit BCM 权重 2 (默认 54 沿)
-            oe_w2_r       <= 8'd108;     // 3-bit BCM 权重 4 (默认 108 沿)
+            oe_w1_r       <= 8'd92;      // BCM 权重 2 (plane1); 184/92/46 = 4:2:1
+            oe_w2_r       <= 8'd46;      // BCM 权重 1 (plane2 = LSB, 唯一受 ≤111 约束的)
             bpp3_r        <= 1'b0;       // 复位 = 1-bit, 旧内容/空闲动画照跑
             le_pl_r       <= 1'b0;       // 复位 = plane1/2 用 LE 3 沿 (datasheet)
         end else begin

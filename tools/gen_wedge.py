@@ -17,10 +17,10 @@ gen_wedge.py — 8 级灰度楔测试图 (3-bit 色深上板目视用, 05_3bit_b
   可选 --png                预览图 (需要 PIL), 按 sRGB 反 gamma 显示, 近似肉眼所见
 
 用法:
-  python3 tools/gen_wedge.py --bpp 3 --n-slices 60 \\
+  python3 tools/gen_wedge.py --bpp 3 --n-slices 50 \\
       --out-dir stream/pc/frames_wedge3 --png /tmp/wedge.png
   python3 stream/pc/povstream.py stream --dir stream/pc/frames_wedge3 \\
-      --n-slices 60 --host <board> --fps 5 --loop
+      --n-slices 50 --host <board> --fps 5 --loop
   # 1-bit 对照组 (同样的目标灰度, 走 Bayer 抖动) —— A/B 看 3-bit 到底赢在哪:
   python3 tools/gen_wedge.py --bpp 1 --n-slices 360 --out-dir stream/pc/frames_wedge1
 
@@ -289,7 +289,7 @@ def main():
     ap = argparse.ArgumentParser(description='8 级灰度楔测试图 (3-bit 上板目视)')
     ap.add_argument('--bpp', type=int, choices=sorted(pack_obs.BPP_MODES), default=3)
     ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'levels', 'full', 'bw', 'rings', 'ramp'], default='flat')
-    ap.add_argument('--n-slices', type=int, default=60,
+    ap.add_argument("--n-slices", type=int, default=50,
                     help='帧里的片数 (默认 60 = 3-bit 方案推荐的每面槽数)')
     ap.add_argument('--gamma', type=float, default=DEFAULT_GAMMA,
                     help=f'反 gamma (默认 {DEFAULT_GAMMA}), 只影响 1-bit 对照组/预览/ramp; '
