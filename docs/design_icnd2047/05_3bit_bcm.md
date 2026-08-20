@@ -52,7 +52,9 @@
 
 已固化进 `stream/board/pov_boot.sh` 的 `CFG_MISC = 0x98366F01`。
 
-### 3.2 🔴 `aclk` 实测 ≈ 25 MHz，不是 50 MHz
+### 3.2 🔴 `aclk` 频率：实测与硬件证据直接冲突，**未解**
+
+⚠ **先前版本在这里写"aclk = 25 MHz，悬案结案"—— 那个结论下早了，现已撤回。**
 
 `oe_window` 扫 48/111/149/187，用 `duty × 行周期 ÷ oe` 反算单沿时长：
 
@@ -63,20 +65,41 @@
 | 149 | 9.02 µs | 0.639 | 38.7 |
 | 187 | 11.13 µs | 0.690 | 41.1 |
 
-四点一致落在 **~40 ns/沿**。fast 模式 1 沿 = 1 aclk 拍 ⇒ **aclk ≈ 25 MHz**。
-代入模型：oe=111 行周期 195 拍 × 40 ns = **7.80 µs**，实测 7.805 µs ——
-吻合到 **0.06%**。
+四点一致落在 **~40 ns/沿**。fast 模式 1 沿 = 1 aclk 拍 ⇒ 指向 **aclk ≈ 25 MHz**。
+行周期通式 `195 + max(0, oe−111)` 四点全中，所以 **195 拍/行的 RTL 模型本身是对的**。
 
-⇒ **`project_pov3d_refresh_vs_rpm` 里"模型比实测短 1.79×，原因未定位"的悬案就是这个**：
-模型按 50 MHz 算，实际是 25 MHz。RTL 的 195 拍/行模型本身完全正确。
+**但硬件侧五条独立证据全部指向 50 MHz**：
 
-⚠ 但 BD 里 `PCW_FPGA0_PERIPHERAL_FREQMHZ {50}`，SLCR `0xF8000170 = 0x00400500`
-(IO PLL 1000 / 5 / 4) 回读也是 **50 MHz**。**两者矛盾，尚未定位**
-—— 可能是 BD 里 panel 分支上有一级分频，或引擎接的不是 FCLK0。
+| 证据 | 出处 |
+|---|---|
+| BD 里 `ps7_0_FCLK_CLK0` **直连** `panel_0/s_axi_aclk`，全 BD 只有 5 个 cell，无 `clk_wiz` | `build_panel/.../system.bd` |
+| 实现后 `BUFGCTRL 1 / BUFH 0 / BUFR 0 / MMCM 0 / PLL 0`，单时钟域，constraint **20.000 ns** | `impl_1/..._clock_utilization_routed.rpt` |
+| 时序约束 Clock Summary 只有 `clk_fpga_0 period 20.000 freq 50.000` | `impl_1/..._timing_summary_routed.rpt` |
+| `ps7_init` 写 `0xF8000170 = 0x00400500` = 1000/5/4 = 50 MHz；与 100 MHz 老工程的 `0x00200500` 互为校验 | `mlkpai_panel.xsa` |
+| RTL 里所有时序块都是 `posedge s_axi_aclk`，三个历史版本逐字相同，从来没有过 /2 | `pov_dual_top.v` |
 
-🎯 **顺带的推论：`fast` 的实际线速率是 25 Mbps，不是设计注释写的 50 Mbps。**
-设计目标从来没跑到过。如果查明并把 aclk 提到 50 MHz，刷新率**再翻一倍**
-—— 见 §9。
+**我另外亲手排除了两个最可能的"测量侧"解释**：
+
+1. **不是 oeprobe 的时基错**：板上 `/proc/uptime`（`CLOCK_MONOTONIC` 同源）增量 20.05 s
+   对 PC 墙钟 23.07 s（差额是 ssh 开销）。时基快/慢 2× 都会立刻暴露，没有。
+2. **不是跑了别的 bit**：SD 卡 live `BOOT.bin` md5 `2678fe69…` 与本地
+   `stream/boot/BOOT.bin` **逐位相同** —— 就是上表那个 BD 出来的。
+
+⇒ 两组证据互相排斥，且不存在"中间解"（FSM 层面的拖慢会压低占空比，而占空比四点精确吻合）。
+**在定案之前，不要把任何一方当结论用。**
+
+### 🎯 定案方法：读 `frame_period` (R 0x28)
+
+`icnd2047_panel_core` 有 `frame_period_o` = "最近一整屏走了多少个 aclk 拍"，
+但 `panel_engine_2047.v` 目前 `.frame_period_o ()` 悬空，`pov_dual_top.v` 的
+`R 0x28` 也特意留空等着它。**接上这条线，矛盾当场可判**：
+
+```
+aclk_Hz = frame_period(纯 PL 拍数) / 整屏墙钟秒数(oeprobe, CPU 时基已验证正确)
+```
+
+不依赖任何一方的假设。这个寄存器当初加进设计就是为了"免示波器测刷新率"。
+（已交给 RTL agent 实现，随三平面改造一起上板。）
 
 ### 3.3 3-bit 的时间代价 = 精确 3.00×
 
@@ -165,16 +188,31 @@ LED 平均电流下降在这里是**副作用为正**。若需补回，可在 ho
 - ⚠ 角分辨率 89 → 59 是真实降质，需实拍确认可接受
 - ⚠ 8 级灰度在 1-bit Bayer 之上是**减少**抖动噪声，但量化跳阶可能更显眼
 
-## 9. 🎯 下一个杠杆：aclk 25 → 50 MHz
+## 9. ⏸ 待定案：aclk 到底是 25 还是 50 MHz
 
-§3.2 实测 aclk ≈ 25 MHz，而 BD 与 SLCR 都说 FCLK0 = 50 MHz。查明这一级
-分频从哪来并去掉，收益是**整条链再翻一倍**：
+取决于 §3.2 的定案结果，两种走向完全不同：
 
-- 1-bit: 2373 → 4746 Hz
-- **3-bit: 每圈 53 → 105 个角度，比今天的 1-bit (80) 还细**
-- 代价: DCLK 12.5 → 25 MHz，线速率 25 → 50 Mbps ——
-  **这才是设计注释里写的那个 50 Mbps，也才是真正的 SI 考验**
+- **若实测对（25 MHz）**：说明有一级还没找到的 /2，`fast` 的实际线速率是 25 Mbps
+  而非设计注释写的 50 Mbps —— 设计目标从来没跑到过。查明并去掉那一级，
+  3-bit 每圈角度从 53 涨到 105，比今天的 1-bit（80）还细，色深等于白拿。
+- **若硬件证据对（50 MHz）**：面板本来就在 4746 Hz，`oeprobe` 的绝对刻度要修，
+  本文档所有"实测"绝对时间都要除以 2（比值和占空比不受影响），
+  §3.3 的角度数要翻倍重算。
 
-查法: `get_bd_nets -of_objects [get_bd_pins ps7_0/FCLK_CLK0]` 跟到 panel 分支，
-看中间有没有 `clk_wiz` / BUFR / 手写分频器。若确实是 BD 里的一级 /2，
-改完要重综合 + 重新做 §7 的全套验证。
+⚠ 两种走向都**不改变 3-bit 的 3.00× 结构性代价**，也不改变 §4 的带宽账
+（那本账只跟槽数和字节数有关）。所以 3-bit 的实现工作不必等这个结论，
+但**上板前必须定案**，否则槽数（60 还是 105）会选错。
+
+### 如果最终要提 FCLK0 50 → 100 MHz（独立议题）
+
+- 改 `vivado/create_panel_proj_v6.tcl:60` 的 `PCW_FPGA0_PERIPHERAL_FREQMHZ`
+- 要重跑：BD → 综合 → 实现 → 重导 XSA → **重建 FSBL**（ps7_init 才是真正写
+  `0xF8000170` 的地方）→ 重打 `BOOT.BIN` → 冷启动
+- 🔴 **时序上会挂**：最差 setup 路径 data path delay **11.987 ns**
+  （logic 0.58 / route 11.41），slack 6.888 @ 20 ns ⇒ **fmax ≈ 76 MHz**。
+  最差路径的源是复位大扇出网 `rst_ps7_0_50M/… → u_core/g_oddr_sdi[2]/R`，
+  95% 是布线 ⇒ 复位打拍/复制是第一件该做的事
+- 🔴 **hold 余量只有 0.036 ns**，任何重新布局布线都可能翻车，重建后必须盯 WHS
+- 🔴 **XDC 里一条 `create_clock` / `set_output_delay` 都没有** —— SDI/DCLK/LE/OE 的
+  ODDR→pad 路径**从来没被工具分析过**（时序报告 Unconstrained Path Table 明写
+  `clk_fpga_0 → (none)`）。提频等于没有任何工具侧安全网，应先补虚拟时钟 + 输出约束
