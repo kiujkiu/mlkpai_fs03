@@ -46,16 +46,31 @@ static uint32_t sent_crc[MAX_FRAMES];
 static int n_sent = 0;
 
 /* deterministic frame: mostly zeros (like real slice data) + seeded noise */
-static void gen_frame(uint8_t *f, uint32_t seed)
+static void gen_frame_n(uint8_t *f, uint32_t seed, uint32_t len)
 {
-    memset(f, 0, PVS_FRAME_RAW);
+    memset(f, 0, len);
     uint32_t s = seed * 2654435761u + 1;
     for (int i = 0; i < 40000; i++) {
         s = s * 1664525u + 1013904223u;
-        uint32_t pos = (s >> 8) % PVS_FRAME_RAW;
+        uint32_t pos = (s >> 8) % len;
         uint8_t val = (uint8_t)(s & 0xff);
         f[pos] = val ? val : 0x5a;   /* keep literals nonzero for RLE */
     }
+}
+
+static void gen_frame(uint8_t *f, uint32_t seed) { gen_frame_n(f, seed, PVS_FRAME_RAW); }
+
+/* v3.4: 期望的 (面A 字节数, 面B 字节数) 集合。板端把 nA 从 n_slices 推出来
+ * (FOLD_A ? n/3 : n/2), 推错了整帧 crc 照样对得上 —— 只有 SIM 的 bankcrc 行
+ * 里的两个 len 会露馅, 所以这里把每一帧的期望面长记下来, 收尾时逐行核对。 */
+#define MAX_PAIRS 64
+static uint32_t exp_pair[MAX_PAIRS][2];
+static int n_pairs = 0;
+static void want_faces(uint32_t la, uint32_t lb)
+{
+    for (int i = 0; i < n_pairs; i++)
+        if (exp_pair[i][0] == la && exp_pair[i][1] == lb) return;
+    if (n_pairs < MAX_PAIRS) { exp_pair[n_pairs][0] = la; exp_pair[n_pairs][1] = lb; n_pairs++; }
 }
 
 /* zero-run RLE per protocol.md: 0x00 escape + run:u16le zeros; literals raw */
@@ -89,19 +104,21 @@ static int send_all(int fd, const void *buf, size_t len)
 
 /* send one frame; `prev` != NULL + DELTA flag -> payload = zlib(prev^raw)
  * (or bare prev^raw). Records crc of RAW (what the daemon must rebuild). */
-static int send_frame(int fd, const uint8_t *raw, const uint8_t *prev,
-                      uint16_t flags, uint8_t *xbuf, uint8_t *scratch)
+static int send_frame_n(int fd, const uint8_t *raw, const uint8_t *prev,
+                        uint16_t flags, uint32_t n_slices,
+                        uint8_t *xbuf, uint8_t *scratch)
 {
     pvs_hdr_t h;
+    uint32_t raw_len = n_slices * PVS_STRIDE(flags);   /* v3.4: 片距随色深 */
     memcpy(h.magic, PVS_MAGIC, 4);
-    h.raw_len = PVS_FRAME_RAW;
-    h.n_slices = PVS_N_SLICES;
+    h.raw_len = raw_len;
+    h.n_slices = (uint16_t)n_slices;
     h.flags = flags;
 
     const uint8_t *body = raw;               /* what the codec layer sees */
     if (flags & PVS_FLAG_DELTA) {
         if (!prev) { fprintf(stderr, "test bug: DELTA without prev\n"); return -1; }
-        for (size_t i = 0; i < PVS_FRAME_RAW; i++)
+        for (size_t i = 0; i < raw_len; i++)
             xbuf[i] = raw[i] ^ prev[i];
         body = xbuf;
     }
@@ -111,29 +128,69 @@ static int send_frame(int fd, const uint8_t *raw, const uint8_t *prev,
         /* 🔴 raw block (LZ4_compress_HC), **不是** .lz4 帧格式 —— 板端的
          * LZ4_decompress_safe 只认 raw block, 见 protocol.h。 */
         int clen = LZ4_compress_HC((const char *)body, (char *)scratch,
-                                   PVS_FRAME_RAW,
-                                   LZ4_compressBound(PVS_FRAME_RAW),
+                                   (int)raw_len,
+                                   LZ4_compressBound((int)raw_len),
                                    LZ4_HC_LEVEL);
         if (clen <= 0) { fprintf(stderr, "LZ4_compress_HC rc=%d\n", clen); return -1; }
         h.comp_len = (uint32_t)clen;
         payload = scratch;
     } else if (flags & PVS_FLAG_ZLIB) {
-        uLongf clen = compressBound(PVS_FRAME_RAW);
-        if (compress2(scratch, &clen, body, PVS_FRAME_RAW, 6) != Z_OK) return -1;
+        uLongf clen = compressBound(raw_len);
+        if (compress2(scratch, &clen, body, raw_len, 6) != Z_OK) return -1;
         h.comp_len = (uint32_t)clen;
         payload = scratch;
     } else if (flags & PVS_FLAG_RLE) {
-        h.comp_len = (uint32_t)rle_encode(body, PVS_FRAME_RAW, scratch);
+        h.comp_len = (uint32_t)rle_encode(body, raw_len, scratch);
         payload = scratch;
     } else {
-        h.comp_len = PVS_FRAME_RAW;
+        h.comp_len = raw_len;
     }
 
     if (send_all(fd, &h, sizeof h) || send_all(fd, payload, h.comp_len))
         return -1;
-    sent_crc[n_sent++] = crc32(0L, raw, PVS_FRAME_RAW);
-    printf("test: sent frame %d flags=0x%x comp=%u crc=%08x\n",
-           n_sent - 1, flags, h.comp_len, sent_crc[n_sent - 1]);
+    want_faces(raw_len, 0);
+    sent_crc[n_sent++] = crc32(0L, raw, raw_len);
+    printf("test: sent frame %d flags=0x%x n=%u raw=%u comp=%u crc=%08x\n",
+           n_sent - 1, flags, n_slices, raw_len, h.comp_len, sent_crc[n_sent - 1]);
+    return 0;
+}
+
+static int send_frame(int fd, const uint8_t *raw, const uint8_t *prev,
+                      uint16_t flags, uint8_t *xbuf, uint8_t *scratch)
+{
+    return send_frame_n(fd, raw, prev, flags, PVS_N_SLICES, xbuf, scratch);
+}
+
+/* DUAL_FACE: [u32 LE comp_len_A][面A 流][面B 流] —— 板端必须把 nA 从 n_slices
+ * 推出来 (FOLD_A ? n/3 : n/2), 面边界 = nA*stride。 */
+static int send_dual(int fd, const uint8_t *raw, uint16_t flags,
+                     uint32_t n_slices, uint8_t *scratch)
+{
+    pvs_hdr_t h;
+    uint32_t stride  = PVS_STRIDE(flags);
+    uint32_t raw_len = n_slices * stride;
+    uint32_t n_a     = (flags & PVS_FLAG_FOLD_A) ? n_slices / 3u : n_slices / 2u;
+    uint32_t la      = n_a * stride, lb = raw_len - la;
+    flags |= PVS_FLAG_DUAL_FACE | PVS_FLAG_ZLIB;
+
+    uLongf ca = compressBound(la), cb = compressBound(lb);
+    uint8_t *pa = scratch, *pb = scratch + ca;
+    if (compress2(pa, &ca, raw, la, 6) != Z_OK ||
+        compress2(pb, &cb, raw + la, lb, 6) != Z_OK) return -1;
+
+    memcpy(h.magic, PVS_MAGIC, 4);
+    h.raw_len = raw_len;
+    h.n_slices = (uint16_t)n_slices;
+    h.flags = flags;
+    h.comp_len = 4u + (uint32_t)ca + (uint32_t)cb;
+    uint8_t pfx[4] = { (uint8_t)ca, (uint8_t)(ca >> 8), (uint8_t)(ca >> 16),
+                       (uint8_t)(ca >> 24) };
+    if (send_all(fd, &h, sizeof h) || send_all(fd, pfx, 4) ||
+        send_all(fd, pa, ca) || send_all(fd, pb, cb)) return -1;
+    want_faces(la, lb);
+    sent_crc[n_sent++] = crc32(0L, raw, raw_len);
+    printf("test: sent frame %d DUAL flags=0x%x n=%u nA=%u faces %u+%u crc=%08x\n",
+           n_sent - 1, flags, n_slices, n_a, la, lb, sent_crc[n_sent - 1]);
     return 0;
 }
 
@@ -145,15 +202,19 @@ static int send_mstream(int fd, const uint8_t *raw, const uint8_t *prev,
                         uint8_t *xbuf, uint8_t *scratch)
 {
     pvs_hdr_t h;
+    uint32_t stride = PVS_STRIDE(flags);      /* v3.4: 3-bit 时每片 0x9000 */
+    uint32_t n_slices = 0;
+    for (int i = 0; i < nseg; i++) n_slices += (uint32_t)seg[i];
+    uint32_t raw_len = n_slices * stride;
     memcpy(h.magic, PVS_MAGIC, 4);
-    h.raw_len = PVS_FRAME_RAW;
-    h.n_slices = PVS_N_SLICES;
+    h.raw_len = raw_len;
+    h.n_slices = (uint16_t)n_slices;
     h.flags = (uint16_t)(flags | PVS_FLAG_MSTREAM);
 
     const uint8_t *body = raw;
     if (flags & PVS_FLAG_DELTA) {
         if (!prev) { fprintf(stderr, "test bug: DELTA without prev\n"); return -1; }
-        for (size_t i = 0; i < PVS_FRAME_RAW; i++) xbuf[i] = raw[i] ^ prev[i];
+        for (size_t i = 0; i < raw_len; i++) xbuf[i] = raw[i] ^ prev[i];
         body = xbuf;
     }
     uint32_t tbl_len = 4u + (uint32_t)nseg * 8u;
@@ -161,7 +222,7 @@ static int send_mstream(int fd, const uint8_t *raw, const uint8_t *prev,
     uint32_t clen[16];
     uint32_t soff = 0;
     for (int i = 0; i < nseg; i++) {
-        uint32_t nb = (uint32_t)seg[i] * PVS_SLICE_STRIDE;
+        uint32_t nb = (uint32_t)seg[i] * stride;
         int c;
         if (flags & PVS_FLAG_ZLIB) {          /* 压缩位说什么就压什么 */
             uLongf zc = compressBound(nb);
@@ -177,15 +238,16 @@ static int send_mstream(int fd, const uint8_t *raw, const uint8_t *prev,
         clen[i] = (uint32_t)c;
         p += c; soff += nb;
     }
-    if (soff != PVS_FRAME_RAW) { fprintf(stderr, "test bug: seg sum != frame\n"); return -1; }
+    if (soff != raw_len) { fprintf(stderr, "test bug: seg sum != frame\n"); return -1; }
     uint32_t *t = (uint32_t *)scratch;      /* 小端机, 直接写 u32 */
     t[0] = (uint32_t)nseg;
     for (int i = 0; i < nseg; i++) { t[1 + i * 2] = clen[i]; t[2 + i * 2] = (uint32_t)seg[i]; }
     h.comp_len = (uint32_t)(p - scratch);
     if (send_all(fd, &h, sizeof h) || send_all(fd, scratch, h.comp_len)) return -1;
-    sent_crc[n_sent++] = crc32(0L, raw, PVS_FRAME_RAW);
-    printf("test: sent frame %d MSTREAM n=%d flags=0x%x comp=%u crc=%08x\n",
-           n_sent - 1, nseg, h.flags, h.comp_len, sent_crc[n_sent - 1]);
+    want_faces(raw_len, 0);
+    sent_crc[n_sent++] = crc32(0L, raw, raw_len);
+    printf("test: sent frame %d MSTREAM n=%d flags=0x%x slices=%u comp=%u crc=%08x\n",
+           n_sent - 1, nseg, h.flags, n_slices, h.comp_len, sent_crc[n_sent - 1]);
     return 0;
 }
 
@@ -266,10 +328,12 @@ int main(void)
     int fd = connect_retry(TEST_PORT);
     if (fd < 0) { fprintf(stderr, "FAIL: cannot connect to sim daemon\n"); kill(pid, SIGKILL); return 1; }
 
-    uint8_t *raw  = malloc(PVS_FRAME_RAW);
-    uint8_t *raw2 = malloc(PVS_FRAME_RAW);
-    uint8_t *xbuf = malloc(PVS_FRAME_RAW);
-    uint8_t *scratch = malloc(compressBound(PVS_FRAME_RAW) + PVS_FRAME_RAW);
+    /* v3.1/v3.4: 帧长可变 (720 片 1-bit 与 240 片 3-bit 都是 8847360 B 上限),
+     * 一律按最大帧分配; scratch 还要装下 send_dual 的两条流。 */
+    uint8_t *raw  = malloc(PVS_FRAME_RAW_MAX);
+    uint8_t *raw2 = malloc(PVS_FRAME_RAW_MAX);
+    uint8_t *xbuf = malloc(PVS_FRAME_RAW_MAX);
+    uint8_t *scratch = malloc(2 * compressBound(PVS_FRAME_RAW_MAX) + PVS_FRAME_RAW_MAX);
     if (!raw || !raw2 || !xbuf || !scratch) { perror("malloc"); return 1; }
 
     int rc = 1;
@@ -348,6 +412,45 @@ int main(void)
         if (recv_ack(fd) || recv_ack(fd)) goto out;
     }
 
+    /* ---- v3.4 3-bit + 非 360 槽几何 --------------------------------------
+     * 这一组守的是两件事:
+     *  (1) 片距从 flag 推 (3-bit = 0x9000), 不是常量;
+     *  (2) 双面帧的 nA 从 n_slices 推 (FOLD_A ? n/3 : n/2), **不是写死 360/180**
+     *      —— 老代码那两行会把 60 槽的 3-bit 双面帧直接 NAK 掉。
+     * 整帧 crc 对不出 nA 拆错 (面A/面B 连在一起), 所以还额外核对 SIM 的
+     * bankcrc 行给出的两个面长, 见收尾处的 exp_pair 检查。 */
+    {
+        const uint32_t n3 = 60;                       /* 05_3bit_bcm.md 的每面 60 槽 */
+        uint32_t raw3 = n3 * PVS_SLICE_STRIDE_3BIT;   /* 2211840 */
+        /* 3-bit 单面 60 片: zlib 关键帧 + LZ4|DELTA 跟一帧 */
+        gen_frame_n(raw, 30, raw3);
+        if (send_frame_n(fd, raw, NULL, PVS_FLAG_3BIT | PVS_FLAG_ZLIB, n3,
+                         xbuf, scratch) || recv_ack(fd)) goto out;
+        memcpy(raw2, raw, raw3);
+        gen_frame_n(raw, 31, raw3);
+        if (send_frame_n(fd, raw, raw2, PVS_FLAG_3BIT | PVS_FLAG_LZ4 | PVS_FLAG_DELTA,
+                         n3, xbuf, scratch) || recv_ack(fd)) goto out;
+        /* 3-bit + MSTREAM: 流表里的 n_slices_i 仍是**片数**, 解压长度按 0x9000 算 */
+        {
+            static const int s2[] = { 30, 30 };
+            gen_frame_n(raw, 32, raw3);
+            if (send_mstream(fd, raw, NULL, PVS_FLAG_3BIT | PVS_FLAG_LZ4, s2, 2,
+                             xbuf, scratch) || recv_ack(fd)) goto out;
+        }
+        /* 3-bit 双面 120 片 -> nA = 60 (老代码在这里 NAK: 120 != 360+360) */
+        gen_frame_n(raw, 33, 2 * raw3);
+        if (send_dual(fd, raw, PVS_FLAG_3BIT, 2 * n3, scratch) || recv_ack(fd)) goto out;
+        usleep(300000);                       /* 让 flip 线程把它翻上去 (查面长) */
+        /* 1-bit 双面 720 -> nA = 360, 与写死时同值 (回归) */
+        gen_frame_n(raw, 34, PVS_FRAME_RAW_MAX);
+        if (send_dual(fd, raw, 0, PVS_N_SLICES_MAX, scratch) || recv_ack(fd)) goto out;
+        usleep(300000);
+        /* 1-bit 双面 + FOLD_A 540 -> nA = 180, 与写死时同值 (回归) */
+        gen_frame_n(raw, 35, 540u * PVS_SLICE_STRIDE);
+        if (send_dual(fd, raw, PVS_FLAG_FOLD_A, 540, scratch) || recv_ack(fd)) goto out;
+        usleep(300000);
+    }
+
     /* 9: one more paced frame to confirm daemon is still healthy */
     gen_frame(raw, 6);
     if (send_frame(fd, raw, NULL, PVS_FLAG_ZLIB, xbuf, scratch) || recv_ack(fd)) goto out;
@@ -367,18 +470,59 @@ int main(void)
         close(fd);
     }
 
-    /* NAK 2: unknown flag bit (bit7) -> mask check must reject.
-     * 注意别用 bit3/bit4: v3.1 起它们是 PVS_FLAG_DUAL_FACE / PVS_FLAG_FOLD_A,
-     * 已进 PVS_FLAGS_KNOWN。用它们这个用例照样 NAK (被 dual-face 的
-     * n_slices 一致性检查拦下), 但测的就不是「未知 flag 位」了。 */
+    /* NAK 2: unknown flag bit (**bit8**) -> mask check must reject.
+     * 注意别用已分配的位: bit3/bit4 = DUAL_FACE/FOLD_A (v3.1), bit7 = 3BIT
+     * (v3.4)。用它们这个用例照样 NAK (被几何/长度校验拦下), 但测的就不是
+     * 「未知 flag 位」了 —— 这条 2026-08-20 从 bit7 挪到 bit8。 */
     {
         pvs_hdr_t bad;
         memcpy(bad.magic, PVS_MAGIC, 4);
         bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
-        bad.n_slices = PVS_N_SLICES; bad.flags = (1u << 7);
+        bad.n_slices = PVS_N_SLICES; bad.flags = (1u << 8);
         fd = connect_retry(TEST_PORT);
         if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
         if (expect_nak_close(fd, &bad, "unknown flag bit")) goto out;
+        close(fd);
+    }
+
+    /* NAK 2e: 3-bit 帧但 raw_len 按 1-bit 片距算 -> 长度自洽性必须拦下。
+     * 这条守的是「片距从 flag 推」这件事本身: 用常量 0x3000 的老代码会放行。 */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024;
+        bad.raw_len = 60u * PVS_SLICE_STRIDE;         /* 应该是 60*0x9000 */
+        bad.n_slices = 60; bad.flags = PVS_FLAG_3BIT | PVS_FLAG_ZLIB;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "3BIT raw_len 按 1-bit 片距算")) goto out;
+        close(fd);
+    }
+
+    /* NAK 2f: 3-bit 片数越界 (240 片 * 0x9000 已经吃满一个 bank) */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024;
+        bad.n_slices = PVS_N_SLICES_MAX_3BIT + 1;
+        bad.flags = PVS_FLAG_3BIT | PVS_FLAG_ZLIB;
+        bad.raw_len = (uint32_t)bad.n_slices * PVS_SLICE_STRIDE_3BIT;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "3BIT n_slices 越界 (>240)")) goto out;
+        close(fd);
+    }
+
+    /* NAK 2g: 双面帧片数不是 2 的倍数 -> nA 推不出来, 必须 NAK 而不是拆歪 */
+    {
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024; bad.n_slices = 361;
+        bad.flags = PVS_FLAG_DUAL_FACE | PVS_FLAG_ZLIB;
+        bad.raw_len = 361u * PVS_SLICE_STRIDE;
+        fd = connect_retry(TEST_PORT);
+        if (fd < 0) { fprintf(stderr, "FAIL: reconnect failed\n"); goto out; }
+        if (expect_nak_close(fd, &bad, "DUAL_FACE 片数为奇数")) goto out;
         close(fd);
     }
 
@@ -465,7 +609,7 @@ int main(void)
         FILE *lf = fdopen(pfd[0], "r");
         char line[512];
         uint32_t got_crc[MAX_FRAMES];
-        int n_got = 0, n_flips = 0;
+        int n_got = 0, n_flips = 0, n_dualflip = 0, bad_faces = 0;
         while (fgets(line, sizeof line, lf)) {
             fputs(line, stdout);
             char *p = strstr(line, "crc=");
@@ -473,6 +617,24 @@ int main(void)
                 got_crc[n_got++] = (uint32_t)strtoul(p + 4, NULL, 16);
             if (strstr(line, "FLIP "))
                 n_flips++;
+            /* SIM: bankcrc A@0x… len=LA crc=… B@0x… len=LB crc=… —— 真正落进
+             * DDR bank 的面拆分。整帧 crc 看不出 nA 拆错, 这两个长度看得出。 */
+            if ((p = strstr(line, "bankcrc")) != NULL) {
+                unsigned la = 0, lb = 0;
+                char *q1 = strstr(p, "len="), *q2 = q1 ? strstr(q1 + 4, "len=") : NULL;
+                if (q1 && q2 && sscanf(q1 + 4, "%u", &la) == 1 &&
+                    sscanf(q2 + 4, "%u", &lb) == 1) {
+                    int ok = 0;
+                    for (int i = 0; i < n_pairs; i++)
+                        if (exp_pair[i][0] == la && exp_pair[i][1] == lb) ok = 1;
+                    if (!ok) {
+                        fprintf(stderr, "FAIL: 面拆分不对: bank 里 A=%u B=%u "
+                                "不在期望集合里 (nA 是不是又写死了?)\n", la, lb);
+                        bad_faces = 1;
+                    }
+                    if (lb) n_dualflip++;
+                }
+            }
         }
         fclose(lf);
         int status;
@@ -491,6 +653,13 @@ int main(void)
             }
         }
         if (n_flips < 1) { fprintf(stderr, "FAIL: no frame ever flipped\n"); goto out; }
+        if (bad_faces) goto out;
+        if (n_dualflip < 1) {
+            fprintf(stderr, "FAIL: 没有任何双面帧翻上去过, 面拆分没被验到\n");
+            goto out;
+        }
+        printf("test: 面拆分核对通过 (%d 次双面翻页, %d 组期望面长)\n",
+               n_dualflip, n_pairs);
         printf("test: %d frames, all CRCs match (delta rebuilt OK), %d flips\n",
                n_got, n_flips);
     }

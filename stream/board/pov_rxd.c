@@ -11,6 +11,21 @@
  *   0x00 R  STATUS       engine health
  *                        [15]=fold_a_en 回读 (确认 0x10[6] 写进去了)
  *                        [16]=base_b_act 回读 (= slice_base_b != 0)
+ *                        [17]=bpp_mode 回读 (v3.4 3-bit; RTL 若还没实现就恒 0,
+ *                             本程序**不假设它存在**, 见 bcm_apply 的被动探测)
+ *   0x0C W  CFG_MISC     [31:30]=subcmd。本程序只用 **subcmd=01** (v3.4 新增,
+ *                        以前顶层未实现的那个槽):
+ *                          [7:0]=oe_w1  BCM 中位平面的 OE 沿数 (默认 54)
+ *                          [15:8]=oe_w2 BCM 高位平面的 OE 沿数 (默认 108)
+ *                          [16]=bpp_mode 0=1-bit(兼容旧内容) 1=3-bit 行内 BCM
+ *                        ⚠ oe_w0 (低位平面, 默认 27) **不在这里** —— 它复用
+ *                        subcmd=10 的 oe_window[15:8]。而 1-bit 的亮度上限也是
+ *                        同一个 oe_window (现固化成 111), 所以切 3-bit 必须连
+ *                        oe_window 一起改成 27, 否则 BCM 的 1:2:4 比例变成
+ *                        111:54:108 = 乱的。**subcmd=10 由 pov_boot.sh 固化,
+ *                        本守护进程一个字都不写** (那个字里还带着 dclk_fast /
+ *                        overlap_en / au_rows_max / oe_set_pulse, 从这里 RMW
+ *                        就是拿整台机器的时序去赌)。见 pov_boot.sh 的 CFG_MISC。
  *   0x10 W  POV_CTRL     n_slices<<16 | fold_a_en<<6 | fake_en<<1 | pov_en
  *        R               bit31=locked, [15:0]=current slice_idx  (= 只写寄存器,
  *                        读回来的不是写进去的值 -> 软件必须自己留影子)
@@ -53,13 +68,31 @@
  * 第三块是「刚灌完还没轮到」的余量 —— PL 的 base_lat 是 pair 级快照, 双 bank
  * 时最坏情况下刚写完的那块下一轮就要被覆盖, 三块把这个窗口拉开一整轮。
  *
- * bank 内布局 = 解压后载荷原样 (面 A/B 连续), flip 时按面拆基址:
- *   单面 (n_slices 片):  [bank+0 , bank+n_slices*0x3000)
+ * bank 内布局 = 解压后载荷原样 (面 A/B 连续), flip 时按面拆基址
+ * (stride = PVS_STRIDE(flags): 1-bit 0x3000 / 3-bit 0x9000):
+ *   单面 (n_slices 片):  [bank+0 , bank+n_slices*stride)
  *                        0x18 <= bank        0x28 <= 0
- *   PVS_FLAG_DUAL_FACE:  面A [bank+0 , bank+nA*0x3000)
- *                        面B [bank+nA*0x3000 , bank+n_slices*0x3000)
- *                        0x18 <= bank        0x28 <= bank + nA*0x3000
- *   nA = PVS_FLAG_FOLD_A ? 180 : 360 -> 面B 偏移 0x21C000 / 0x438000。
+ *   PVS_FLAG_DUAL_FACE:  面A [bank+0 , bank+nA*stride)
+ *                        面B [bank+nA*stride , bank+n_slices*stride)
+ *                        0x18 <= bank        0x28 <= bank + nA*stride
+ *   nA = FOLD_A ? n_slices/3 : n_slices/2  (**从帧长推, 不是写死的 360/180**;
+ *   老帧 720 -> 360+360 偏移 0x438000, fold540 -> 180+360 偏移 0x21C000, 同旧)。
+ *
+ * ---- v3.4 3-bit 帧放不放得下 (算式, 别再重算一遍) ------------------------
+ * 一个 bank 的容量是 BANK_BYTES = PVS_FRAME_RAW_MAX = 0x870000 = 8847360 B,
+ * 与色深无关 —— 变的只是「一片多大」:
+ *   1-bit: 8847360 / 0x3000 = 720 片  (= PVS_N_SLICES_MAX)
+ *   3-bit: 8847360 / 0x9000 = 240 片  (= PVS_N_SLICES_MAX_3BIT, 整除)
+ * 方案 (05_3bit_bcm.md §4) 要的是**每面 60 槽**: 双面 120 片 * 0x9000
+ *   = 4423680 B = 0x438000 = bank 的 **50%** ⇒ 三缓冲 / povmem 映射窗 /
+ *   staging 缓冲**一个字节都不用改**, 现有 size=0x2900000 够用有余。
+ * 什么时候才需要改: 想跑 3-bit **720 片** (26.5 MB/帧) 的话 ——
+ *   720 * 0x9000 = 0x1950000 = 26542080 B > BANK_STRIDE(0x1000000) ⇒ bank 会
+ *   踩到下一个 bank 头上, 必须 BANK_STRIDE -> 0x2000000 (32 MB),
+ *   FRAME_MAP_LEN = 2*0x2000000 + 0x1950000 = 0x5950000 = 93716480 B (89.4 MiB),
+ *   povmem 要 `size=0x5950000`; 保留区 0x10000000..0x1FFFFFFF (256 MB) 装得下,
+ *   但 Linux 侧 staging 也要跟着涨到 3*26.5+26.6 = 106 MB (mem=256M 下要重新
+ *   算)。**今天没人要这个配置**, 所以只留算式不改代码。
  *   PHASE_B / SLICE_BASE_B / (fold_a_en) / SLICE_BASE 四个寄存器在同一个翻页
  *   窗内背靠背写, RTL 在 idx 变化那一拍同时快照 base_lat/base_lat_b, 所以两面
  *   永远来自同一帧 (不撕裂)。
@@ -207,6 +240,7 @@
 #define REG_PHYS_DEFAULT   0x40010000u
 #define REG_MAP_LEN        0x1000u
 #define REG_STATUS         0x00
+#define REG_CFG_MISC       0x0C                 /* W: [31:30]=subcmd, 见文件头 */
 #define REG_POV_CTRL       0x10
 #define REG_FAKE_PERIOD    0x14
 #define REG_SLICE_BASE     0x18
@@ -219,6 +253,23 @@
 #define CTRL_FOLD_A_EN     (1u << 6)            /* POV_CTRL[6] 面A 半圈折叠 */
 #define STATUS_FOLD_A_EN   (1u << 15)           /* STATUS[15] fold_a_en 回读 */
 #define STATUS_BASE_B_ACT  (1u << 16)           /* STATUS[16] slice_base_b != 0 */
+
+/* ---- v3.4 0x0C subcmd=01: BCM 权重 + bpp_mode ----------------------------
+ * 写口是一个整字, 三个字段一起落 —— 没有 RMW, 也就没有"读到陈旧影子把别人的
+ * 位误伤掉"这条路。 */
+#define CFG_SUB_BCM        (1u << 30)           /* wdata[31:30] = 2'b01 */
+#define BCM_BPP_MODE       (1u << 16)           /* [16] 0=1-bit 1=3-bit */
+#define STATUS_BPP_MODE    (1u << 17)           /* STATUS[17] bpp_mode 回读 (可选) */
+/* BCM 三个权重 27/54/108 沿 = 1:2:4, 全部 <= 111 ⇒ 不插 LWAIT ⇒ 时间上免费
+ * (05_3bit_bcm.md §1)。oe_w0=27 走 subcmd=10 的 oe_window, 本进程不写, 见文件头。*/
+#define OE_W0_3BIT_HINT    27u                  /* 仅用于日志提醒, 不写寄存器 */
+#define OE_W1_DEFAULT      54u
+#define OE_W2_DEFAULT      108u
+#define OE_W_MIN           2u                   /* RTL 内箝 [2,187] */
+#define OE_W_MAX           187u
+/* 影子每这么多次 apply 强制重写一次: 防的是"别人(JTAG/引导脚本)动过 0x0C 而
+ * 影子不知道"这种静默不一致。26 fps 下约每 10 秒一次, 开销 = 一次 AXI 写。 */
+#define BCM_REASSERT_EVERY 256u
 #define PHASE_B_RESET      180u                 /* RTL 复位默认 (老共享数据玩法) */
 /* DUAL_FACE 帧屏B 用的相位。**直觉上该是 0**(两面各有各的数据, idx 就是 idx),
  * 但 2026-08-03 真机实测必须是 180 —— 这是在补偿**渲染侧的一个约定错误**:
@@ -230,6 +281,9 @@
  * 🔴 若将来把渲染侧改成原生正确(面B 渲 −13.4mm 且 mirror_u 取反), **必须把这里改回 0**,
  *    否则两处补偿叠加又错回去。二选一, 不要都做。见 memory
  *    project_pov3d_v31_dualface_geometry_solved。 */
+/* 🔴 v3.4: 代码里不再直接用这个常量 —— 写死的 180 在非 360 槽 (3-bit 每面 60)
+ * 下会越界。flip 线程改成写「引擎每圈片数/2」, 360 槽时算出来就是这个 180。
+ * 常量保留是因为上面那段推导是这个数的唯一出处。 */
 #define PHASE_B_DUAL       180u
 
 /* 帧区布局 —— 完整地址表见文件头。16 MB 一格, 每格实际最多用 0x870000。 */
@@ -260,7 +314,7 @@
  * 是"收包只有 3 MB/s"的真身。详见 g_rcvbuf 的注释。 */
 #define PVS_FLAGS_KNOWN    (PVS_FLAG_RLE | PVS_FLAG_ZLIB | PVS_FLAG_DELTA | \
                             PVS_FLAG_DUAL_FACE | PVS_FLAG_FOLD_A | PVS_FLAG_LZ4 | \
-                            PVS_FLAG_MSTREAM)
+                            PVS_FLAG_MSTREAM | PVS_FLAG_3BIT)
 /* 压缩位集合: 恰好置一位 (或一位都不置 = raw)。多于一位 = 非法帧 -> NAK。 */
 #define PVS_FLAGS_CODEC    (PVS_FLAG_RLE | PVS_FLAG_ZLIB | PVS_FLAG_LZ4)
 
@@ -409,6 +463,12 @@ static void reg_wr(uint32_t off, uint32_t v)
         if (v & CTRL_FOLD_A_EN) g_sim_regs[0] |=  STATUS_FOLD_A_EN;
         else                    g_sim_regs[0] &= ~STATUS_FOLD_A_EN;
         g_sim_regs[REG_POV_CTRL_RB / 4] = v;   /* 0x24 = POV_CTRL 影子回读 */
+    } else if (off == REG_CFG_MISC && (v >> 30) == 1u) {
+        /* v3.4: 模拟 subcmd=01 的 bpp_mode 回读位, 让 bcm_apply 的被动探测
+         * 与一致性告警在 x86 上也走真路径 (真板上 RTL 若还没实现这一位,
+         * 探测拿不到 hi 就永不告警 —— 那条分支同样被这里的用例覆盖)。 */
+        if (v & BCM_BPP_MODE) g_sim_regs[0] |=  STATUS_BPP_MODE;
+        else                  g_sim_regs[0] &= ~STATUS_BPP_MODE;
     }
     logts("SIM: reg[0x%02x] <= 0x%08x", off, v);
 }
@@ -475,6 +535,73 @@ static void engine_check_status(int want_base_b, int want_fold)
               st, got_b, !!want_base_b, got_f, !!want_fold);
 }
 
+/* ---- v3.4 bpp_mode / BCM 权重 (0x0C subcmd=01) ---------------------------
+ * 🔴 本仓库吃过一次「只写寄存器 + 影子跟踪 = 静默不一致」的亏: 0x10 / 0x1C 读
+ * 回来的都不是写进去的值, 影子初值一旦按 RTL 复位值猜错, 之后每次都会因为
+ * 「值没变」而短路掉那次写 —— 硬件从此和软件想的不是一回事, 而日志里一个字都
+ * 没有。0x0C subcmd=01 又是一个纯写口, 所以这里四条一起上:
+ *   1) 影子初值 = **无效**, 不猜 RTL 复位值 —— 连接后的第一帧 (1-bit 也一样)
+ *      无条件写一次, 硬件状态由我们**建立**, 不是**假设**;
+ *   2) 一次写整字 (oe_w1/oe_w2/bpp_mode 同在一个字) ⇒ 根本不存在 RMW, 也就没有
+ *      「拿陈旧影子把别人的位误伤掉」这条路;
+ *   3) 每 BCM_REASSERT_EVERY 次强制重写一次, 防别人 (JTAG/引导脚本) 偷偷动过;
+ *   4) STATUS[17] 若真有回读就核对, 但**被动探测**: 只有当我们亲眼看见这一位
+ *      在我们写 1 时确实读回 1 (g_bcm_rb_hi), 才认定它存在并开始告警。RTL 还没
+ *      实现这一位时它恒 0, 一条假告警都不会有 —— 「没有回读」与「回读说不一致」
+ *      是两件事, 不许混。
+ * 1-bit 路径的代价: 每个连接的第一帧**多一次** 0x0C 写 (bpp=0 + 默认权重, 对
+ * 1-bit 显示没有任何作用 —— 1-bit 只用 oe_window)。逐帧数据通路一个字节不变。 */
+static uint32_t g_oe_w1 = OE_W1_DEFAULT, g_oe_w2 = OE_W2_DEFAULT;
+static uint32_t g_bcm_word;      /* 最近一次真正写进 0x0C sub01 的整字 */
+static int      g_bcm_valid;     /* 0 = 一次都没写过 -> 影子无效 -> 下次必写 */
+static unsigned g_bcm_since;     /* 距上次强制重写过了几次 apply */
+static int      g_bcm_rb_hi;     /* 被动探测: 见过 STATUS[17] 跟着我们变成 1 */
+
+static uint32_t bcm_word(int three_bit)
+{
+    return CFG_SUB_BCM | (g_oe_w1 & 0xffu) | ((g_oe_w2 & 0xffu) << 8)
+         | (three_bit ? BCM_BPP_MODE : 0u);
+}
+
+/* 每帧翻页时调 (与 0x18/0x28/0x10 同一个翻页窗内)。three_bit = 本帧色深。 */
+static void bcm_apply(int three_bit)
+{
+    uint32_t w = bcm_word(three_bit);
+    int force = !g_bcm_valid || g_bcm_since >= BCM_REASSERT_EVERY;
+    if (force || w != g_bcm_word) {
+        int changed = !g_bcm_valid || ((w ^ g_bcm_word) & BCM_BPP_MODE) != 0;
+        reg_wr(REG_CFG_MISC, w);
+        if (changed)                       /* 色深切换才打日志, 重申不刷屏 */
+            logts("bpp_mode -> %d (%s): 0x0C sub01 <= 0x%08x "
+                  "[oe_w1=%u oe_w2=%u]%s", three_bit ? 1 : 0,
+                  three_bit ? "3-bit BCM" : "1-bit", w, g_oe_w1, g_oe_w2,
+                  three_bit ? "; ⚠ oe_w0 = 0x0C sub10 的 oe_window, 由 "
+                              "pov_boot.sh 固化, 3-bit 要 27 而不是 111" : "");
+        g_bcm_word = w;
+        g_bcm_valid = 1;
+        g_bcm_since = 0;
+    } else {
+        g_bcm_since++;
+    }
+    /* 回读核对 (被动探测, 见上面第 4 条) */
+    {
+        static int last_bad = -1;
+        int got = (reg_rd(REG_STATUS) & STATUS_BPP_MODE) ? 1 : 0;
+        int want = three_bit ? 1 : 0;
+        if (got == want) {
+            if (got) g_bcm_rb_hi = 1;      /* 这一位确实存在且跟着我们走 */
+            last_bad = 0;
+            return;
+        }
+        if (!g_bcm_rb_hi) return;          /* 还没证明它存在 -> 不许告警 */
+        if (last_bad == 1) return;
+        last_bad = 1;
+        logts("WARN: STATUS[17] bpp_mode=%d 但本帧要 %d (0x0C sub01 写了 "
+              "0x%08x 却没生效?) —— 3-bit/1-bit 内容会被按错的色深扫出来",
+              got, want, g_bcm_word);
+    }
+}
+
 /* ---- triple-buffer staging + thread handoff ------------------------------
  * 三个 cached staging 缓冲:
  *   g_wr    RX 线程正在解码写入 (仅 RX 访问)
@@ -489,11 +616,13 @@ static void engine_check_status(int want_base_b, int want_fold)
  * raw_len / n_slices / 面B 偏移 (0 = 单面), flip 线程照着拷贝+写基址。
  */
 typedef struct {
-    uint8_t *buf;            /* 容量恒为 PVS_FRAME_RAW_MAX */
-    uint32_t raw_len;        /* 本帧有效字节数 = n_slices*PVS_SLICE_STRIDE */
+    uint8_t *buf;            /* 容量恒为 PVS_FRAME_RAW_MAX (字节数上限与色深无关) */
+    uint32_t raw_len;        /* 本帧有效字节数 = n_slices*stride */
     uint32_t n_slices;
+    uint32_t stride;         /* v3.4: 片距 0x3000 (1-bit) / 0x9000 (3-bit) */
     uint32_t face_b_off;     /* 面B 在 buf 内的字节偏移; 0 = 单面帧 */
     uint32_t fold_a;         /* PVS_FLAG_FOLD_A -> PL 的 POV_CTRL[6] */
+    uint32_t bpp3;           /* v3.4: PVS_FLAG_3BIT -> PL 的 0x0C sub01 bpp_mode */
 } stage_t;
 
 static stage_t g_wr, g_ready, g_disp;
@@ -864,6 +993,10 @@ static void dec_plan(const face_job_t *j, int n, int *first, int *count)
 }
 
 static face_job_t g_job[PVS_MAX_STREAMS];
+/* v3.4: decode plan 日志里把 dst_len 换算成"片"要用本帧片距 (0x3000/0x9000)。
+ * 只给日志用, 且只有 RX 线程 (serve_client / idle_anim_step) 会写它, 提交
+ * dec_run 之前设好即可。 */
+static uint32_t g_log_stride = PVS_SLICE_STRIDE;
 static int        g_wfirst[DEC_WORKERS], g_wcount[DEC_WORKERS];
 static pthread_t  g_dec_tid[DEC_WORKERS];
 static pthread_mutex_t g_dmu = PTHREAD_MUTEX_INITIALIZER;
@@ -968,7 +1101,7 @@ static int dec_run(face_job_t *jobs, int n)
                 for (int w = 0; w < DEC_WORKERS && k + 1 < sizeof line; w++) {
                     uint64_t sl = 0;
                     for (int i = 0; i < g_wcount[w]; i++)
-                        sl += g_job[g_wfirst[w] + i].dst_len / PVS_SLICE_STRIDE;
+                        sl += g_job[g_wfirst[w] + i].dst_len / g_log_stride;
                     if (g_wcount[w] == 0)
                         k += (size_t)snprintf(line + k, sizeof line - k,
                                               "%score%d=空闲", w ? ", " : "", w);
@@ -1046,7 +1179,11 @@ static int idle_anim_load(const char *path)
     const uint32_t *h = (const uint32_t *)(g_anim + 4);
     g_anim_n = h[0]; g_anim_slices = h[1]; g_anim_flags = h[2];
     g_anim_idx = h + 3;
-    if (!g_anim_n || g_anim_slices > PVS_N_SLICES_MAX) { g_anim = NULL; return -1; }
+    if (!g_anim_n || g_anim_slices > PVS_N_SLICES_MAX_F(g_anim_flags)) {
+        logts("idle-anim: n_slices=%u 超过本色深上限 %u (flags=0x%x)",
+              g_anim_slices, PVS_N_SLICES_MAX_F(g_anim_flags), g_anim_flags);
+        g_anim = NULL; return -1;
+    }
     /* 容器格式只覆盖「单流 / DUAL_FACE 两流」这两种排布 (下面 idle_anim_step
      * 就是照着这两种写的)。带 MSTREAM 流表的载荷这里解不了 —— 与其静默解出
      * 半帧垃圾, 不如当场拒掉。要用就重新打一份不带 MSTREAM 的容器。 */
@@ -1068,10 +1205,18 @@ static void idle_anim_step(void)
     if ((size_t)off + len > g_anim_sz) { g_anim_cur = 0; return; }
     g_anim_cur = (g_anim_cur + 1) % g_anim_n;
 
-    uint32_t raw_len = g_anim_slices * PVS_SLICE_STRIDE;
-    uint32_t nA = (g_anim_flags & PVS_FLAG_DUAL_FACE)
-                  ? ((g_anim_flags & PVS_FLAG_FOLD_A) ? PVS_N_SLICES_FOLD : PVS_N_SLICES) : 0;
-    uint32_t fbo = nA ? nA * PVS_SLICE_STRIDE : 0;
+    /* v3.4: 片距与面拆分都从容器的 flags 推, 与网络帧同一套规则 (写死 360/180
+     * 会让 60 槽的 3-bit 容器把面B 的数据当面A 写出去)。 */
+    uint32_t stride  = PVS_STRIDE(g_anim_flags);
+    uint32_t raw_len = g_anim_slices * stride;
+    uint32_t nA = 0;
+    if (g_anim_flags & PVS_FLAG_DUAL_FACE) {
+        uint32_t div = (g_anim_flags & PVS_FLAG_FOLD_A) ? 3u : 2u;
+        if (g_anim_slices % div) { g_anim = NULL; return; }   /* 容器不自洽, 停播 */
+        nA = g_anim_slices / div;
+    }
+    uint32_t fbo = nA ? nA * stride : 0;
+    g_log_stride = stride;
     /* 容器里存的就是 PVS1 payload 原样, 所以走与网络帧同一条双流解码路径。
      * 空闲动画不带 DELTA (每帧都是关键帧), prev 恒为 NULL。 */
     const uint8_t *p0 = g_anim + off;
@@ -1099,7 +1244,9 @@ static void idle_anim_step(void)
     }
 
     g_wr.raw_len = raw_len; g_wr.n_slices = g_anim_slices; g_wr.face_b_off = fbo;
+    g_wr.stride = stride;
     g_wr.fold_a = !!(g_anim_flags & PVS_FLAG_FOLD_A);
+    g_wr.bpp3   = !!(g_anim_flags & PVS_FLAG_3BIT);
     pthread_mutex_lock(&g_mu);
     if (g_ready_gen != g_consumed_gen) g_st_drop++;
     stage_t t = g_wr; g_wr = g_ready; g_ready = t;
@@ -1291,14 +1438,24 @@ static void *flip_thread(void *arg)
         if (g_swap_faces && base_b && !g_disp.fold_a) {
             uint32_t t = base_a; base_a = base_b; base_b = t;
         }
-        /* PHASE_B: 双面帧屏B 有自己那份数据 -> idx 就是 idx -> 必须写 0。
-         * 单面帧回到 RTL 复位默认 180 (老的「屏B ≡ 屏A+180」共享数据玩法);
-         * 纯老流两边都是 180, phase_b_set 直接短路, 一个字都不写。 */
-        phase_b_set(base_b ? PHASE_B_DUAL : PHASE_B_RESET,
-                    base_b ? "DUAL_FACE: 屏B 自己的数据 (180 补偿渲染侧面B 符号/手性)" : "单面: 共享数据默认");
+        /* PHASE_B = **半圈** (两种帧都是):
+         *   单面 = 老的「屏B ≡ 屏A + 半圈」共享数据玩法;
+         *   双面 = 补偿渲染侧面B 的符号/手性 (见 PHASE_B_DUAL 上方那段推导)。
+         * 🔴 半圈 = 引擎每圈片数/2, **不是常数 180** —— RTL 的 idx_b_live 只做
+         * 一次条件减不取模, PHASE_B >= 引擎片数 = 屏B 索引越界 = 读野地址花屏。
+         * n_eng=360 时算出来仍是 180 = RTL 复位值 ⇒ phase_b_set 直接短路, 纯老流
+         * 一个字都不写 (逐位不变); 3-bit 走 60 槽时它必须是 30。 */
+        uint32_t half_eng = n_eng ? n_eng / 2u : PHASE_B_RESET;
+        phase_b_set(half_eng,
+                    base_b ? "DUAL_FACE: 屏B 自己的数据 (半圈补偿渲染侧面B 符号/手性)"
+                           : "单面: 共享数据默认 (半圈)");
         wmb_frame();                       /* frame data globally visible ... */
         reg_wr(REG_SLICE_BASE_B, base_b);
         fold_a_apply((int)g_disp.fold_a);
+        /* 色深: 必须与本帧内容同一个翻页窗内落下去, 否则引擎会拿 1-bit 的布局
+         * 去扫 3-bit 的数据 (或反过来) —— 放在 0x18 之前, 让"切基址"是最后
+         * 一步, 中间态最多持续一个 pair。 */
+        bcm_apply((int)g_disp.bpp3);
         reg_wr(REG_SLICE_BASE, base_a);
         wmb_frame();                       /* ... before + after base update  */
         engine_check_status(base_b != 0, (int)g_disp.fold_a);
@@ -1334,10 +1491,12 @@ static void *flip_thread(void *arg)
             }
             last_flip_us = now_us;
         }
-        if (base_b || g_disp.fold_a)
-            logts("FLIP gen=%u bank=%d win=%d n=%u A=0x%08x B=0x%08x fold=%u%s",
-                  g_consumed_gen, idle, win, g_disp.n_slices, base_a, base_b,
-                  g_disp.fold_a, forced ? " FORCED" : "");
+        if (base_b || g_disp.fold_a || g_disp.bpp3)
+            logts("FLIP gen=%u bank=%d win=%d n=%u stride=0x%x bpp=%u "
+                  "A=0x%08x B=0x%08x fold=%u%s",
+                  g_consumed_gen, idle, win, g_disp.n_slices, g_disp.stride,
+                  g_disp.bpp3 ? 3u : 1u, base_a, base_b, g_disp.fold_a,
+                  forced ? " FORCED" : "");
         else
             logts("FLIP gen=%u bank=%d win=%d%s", g_consumed_gen, idle, win,
                   forced ? " FORCED" : "");
@@ -1370,39 +1529,68 @@ static int serve_client(int fd, uint8_t *cbuf)
          * 改成数位数, 免得以后再加编解码器时漏掉某一对组合。
          * 注意用 uint32_t 算长度: 720*0x3000 = 8847360, u16 会溢出。 */
         uint32_t n_slices = h.n_slices;
-        uint32_t need_raw = n_slices * (uint32_t)PVS_SLICE_STRIDE;
+        /* 🔴 v3.4: 片距**从 flag 推**, 不再是常量 —— 3-bit 一片是 3 个位平面
+         * = 0x9000。片数上限也跟着变 (字节上限 PVS_FRAME_RAW_MAX 才是硬的:
+         * 一个 DDR bank / 一个 staging 缓冲就那么大):
+         *   1-bit 720 片 * 0x3000 = 8847360 B
+         *   3-bit 240 片 * 0x9000 = 8847360 B  (整除)
+         * 用 PVS_N_SLICES_MAX_F(flags) 一次覆盖两种色深; need_raw 用 u32 算
+         * (720*0x3000 已经溢出 u16, 3-bit 更大)。 */
+        uint32_t stride   = PVS_STRIDE(h.flags);
+        uint32_t need_raw = n_slices * stride;
         uint32_t codec_bits = h.flags & PVS_FLAGS_CODEC;
         if (memcmp(h.magic, PVS_MAGIC, 4) != 0 ||
-            n_slices < 1 || n_slices > PVS_N_SLICES_MAX ||
+            n_slices < 1 || n_slices > PVS_N_SLICES_MAX_F(h.flags) ||
             h.raw_len != need_raw               ||
+            need_raw > (uint32_t)PVS_FRAME_RAW_MAX ||
             h.comp_len == 0 || h.comp_len > COMP_LEN_MAX ||
             (h.flags & ~PVS_FLAGS_KNOWN) != 0   ||
             (codec_bits & (codec_bits - 1)) != 0) {
-            logts("NAK: bad header (magic=%.4s comp=%u raw=%u n=%u flags=0x%x)",
-                  h.magic, h.comp_len, h.raw_len, h.n_slices, h.flags);
+            logts("NAK: bad header (magic=%.4s comp=%u raw=%u n=%u flags=0x%x "
+                  "stride=0x%x want_raw=%u max_n=%u)",
+                  h.magic, h.comp_len, h.raw_len, h.n_slices, h.flags,
+                  stride, need_raw, PVS_N_SLICES_MAX_F(h.flags));
             send_byte(fd, PVS_NAK);
             return -1;
         }
 
-        /* 面拆分: 双面 = [面A nA 片][面B 360 片], nA = FOLD_A ? 180 : 360。
-         * 单面折叠 (FOLD_A 无 DUAL_FACE) = 只有面A 的 180 片。片数与 flag
-         * 不自洽就 NAK —— 拆错了会把面B 的数据当成面A 写出去。 */
+        /* ---- 面拆分 ------------------------------------------------------
+         * 🔴 2026-08-20: 这里以前写死了 PVS_N_SLICES(360):
+         *      n_a = FOLD_A ? 180 : 360;  if (n_slices != n_a + 360) NAK;
+         *   ⇒ **双面帧只认 720 或 540**, 任何别的槽数当场 NAK。3-bit 走的是
+         *   每面 60 槽 (双面 120 片), 槽数优化那条线也要 90/面 —— 都会被这两行
+         *   拦死, 而且报的是"n_slices 不对"这种指向完全错误的信息。
+         *   改成从 n_slices **推**, 用的是排布本身的恒等式:
+         *      面B 永远是一整面 nB;  面A = FOLD_A ? nB/2 : nB
+         *      不折叠: n = 2nB          -> nA = n/2
+         *      折叠:   n = nB/2 + nB    -> nA = n/3   (nB = 2n/3)
+         *   整除性就是自洽校验 (拆错了会把面B 的数据当面A 写出去)。
+         *   老帧逐字节不变: 720 -> 360+360, fold540 -> 180+360, 与写死时同值。 */
         uint32_t n_a = n_slices, face_b_off = 0;
         if (h.flags & PVS_FLAG_DUAL_FACE) {
-            n_a = (h.flags & PVS_FLAG_FOLD_A) ? PVS_N_SLICES_FOLD : PVS_N_SLICES;
-            if (n_slices != n_a + PVS_N_SLICES) {
-                logts("NAK: DUAL_FACE n_slices=%u != %u (nA=%u + nB=%u)",
-                      n_slices, n_a + PVS_N_SLICES, n_a, PVS_N_SLICES);
+            uint32_t div = (h.flags & PVS_FLAG_FOLD_A) ? 3u : 2u;
+            if (n_slices % div) {
+                logts("NAK: DUAL_FACE%s n_slices=%u 不是 %u 的整数倍 "
+                      "(面B=一整面 nB, 面A=%s ⇒ n_slices=%s)",
+                      (h.flags & PVS_FLAG_FOLD_A) ? "|FOLD_A" : "", n_slices, div,
+                      div == 3 ? "nB/2" : "nB", div == 3 ? "1.5*nB" : "2*nB");
                 send_byte(fd, PVS_NAK);
                 return -1;
             }
-            face_b_off = n_a * (uint32_t)PVS_SLICE_STRIDE;
+            n_a = n_slices / div;
+            face_b_off = n_a * stride;
         } else if (h.flags & PVS_FLAG_FOLD_A) {
-            if (n_slices != PVS_N_SLICES_FOLD) {
-                logts("NAK: FOLD_A single face needs n_slices=%d, got %u",
-                      PVS_N_SLICES_FOLD, n_slices);
-                send_byte(fd, PVS_NAK);
-                return -1;
+            /* 单面折叠: 载荷 = 半圈。半圈是多少片取决于**引擎每圈片数**
+             * (RTL 的 fold 用 n_slices_r>>1, 不是写死 180), 而引擎那个数不由
+             * 帧决定 —— 所以协议层没有可校验的常量, 这里只做提示不 NAK。
+             * (老代码写死 n_slices==180, 同样会拦死 3-bit 的 30 片折叠面。) */
+            static uint32_t noted;            /* 同一种几何只提示一次, 不刷屏 */
+            uint32_t n_eng = engine_n_slices();
+            if (n_slices * 2u != n_eng && noted != n_slices) {
+                noted = n_slices;
+                logts("NOTE: FOLD_A 单面 n_slices=%u, 而引擎每圈 %u 片 "
+                      "(PL 按 idx-引擎片数/2 折) —— 要么帧不是半圈, 要么引擎的 "
+                      "0x10[31:16] 没按这个几何设", n_slices, n_eng);
             }
         }
 
@@ -1475,8 +1663,9 @@ static int serve_client(int fd, uint8_t *cbuf)
                 s_nsl[i]  = (uint32_t)e[4] | ((uint32_t)e[5] << 8) |
                             ((uint32_t)e[6] << 16) | ((uint32_t)e[7] << 24);
                 if (s_clen[i] == 0 || s_nsl[i] == 0) bad_ent = 1;
-                /* raw 帧: 每条流就是原始数据, 压缩长度必须 == 解压长度 */
-                if (!comp && s_clen[i] != s_nsl[i] * (uint32_t)PVS_SLICE_STRIDE)
+                /* raw 帧: 每条流就是原始数据, 压缩长度必须 == 解压长度
+                 * (stride 随色深变, 3-bit 时每片 0x9000) */
+                if (!comp && s_clen[i] != s_nsl[i] * stride)
                     bad_ent = 1;
                 sum_c += s_clen[i];
                 sum_s += s_nsl[i];
@@ -1546,6 +1735,7 @@ static int serve_client(int fd, uint8_t *cbuf)
          * 发送端被 TCP 背压顶住, 下一帧更晚 —— 越锁越差。 */
         long t_gate = phase_gate();
 
+        g_log_stride = stride;              /* decode plan 日志按本帧片距换算 */
         long dec_t0 = mono_us();
         /* 🔴 诊断口径: **每个解码核的墙钟**, 不是"每一面"。
          * MSTREAM 之后流数可变(1..16), "面A/面B"这个概念不再成立; 而决定
@@ -1568,7 +1758,7 @@ static int serve_client(int fd, uint8_t *cbuf)
             memset(jobs, 0, sizeof jobs);
             for (uint32_t i = 0; i < n; i++) {
                 uint32_t clen = nstr ? s_clen[i] : cl[i];
-                uint32_t dlen = nstr ? s_nsl[i] * (uint32_t)PVS_SLICE_STRIDE : dl[i];
+                uint32_t dlen = nstr ? s_nsl[i] * stride : dl[i];
                 jobs[i].src     = comp ? cbuf + soff : NULL;
                 jobs[i].src_len = clen;
                 jobs[i].dst     = g_wr.buf + doff;
@@ -1655,8 +1845,10 @@ static int serve_client(int fd, uint8_t *cbuf)
         /* 发布给 flip 线程 + 记参考帧; 旧 ready 没被消费就顶替 (丢帧计数) */
         g_wr.raw_len    = h.raw_len;
         g_wr.n_slices   = n_slices;
+        g_wr.stride     = stride;
         g_wr.face_b_off = face_b_off;
         g_wr.fold_a     = (h.flags & PVS_FLAG_FOLD_A) ? 1u : 0u;
+        g_wr.bpp3       = (h.flags & PVS_FLAG_3BIT) ? 1u : 0u;
         g_prev = g_wr.buf;
         g_prev_len = h.raw_len;
         g_prev_face_b_off = face_b_off;
@@ -1698,6 +1890,10 @@ static void usage(const char *argv0)
         "  --fake RPS     enable motor-less fake-spin at RPS revs/sec\n"
         "                 (programs fake_period + POV_CTRL; otherwise the\n"
         "                  daemon never touches POV_CTRL - JTAG owns it)\n"
+        "  --fake-slices N 引擎每圈片数, 只在 --fake 下有意义 (default %d;\n"
+        "                 3-bit 的 60 槽几何在台面上试时要改它)\n"
+        "  --oe-w W1,W2   3-bit BCM 的中位/高位 OE 沿数 (default %u,%u; 低位平面\n"
+        "                 用 0x0C sub10 的 oe_window, 由 pov_boot.sh 固化成 %u)\n"
         "  --crc          crc32 every decoded frame + log it (costs 11-18 ms\n"
         "                 per frame on the A9; debug only, default off)\n"
         "  --flip-window  single = flip near slice 0 only (default);\n"
@@ -1723,7 +1919,8 @@ static void usage(const char *argv0)
         "                 相位可回收的量实测为 0 (drop=0/668 帧)。细节见\n"
         "                 pov_rxd.c 里 phase_gate 上方那段注释\n"
         "  --no-rmem-fix  对照实验: 不抬 net.core.rmem_max (生产别用)\n",
-        argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT);
+        argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT, PVS_N_SLICES,
+        OE_W1_DEFAULT, OE_W2_DEFAULT, OE_W0_3BIT_HINT);
 }
 
 int main(int argc, char **argv)
@@ -1732,6 +1929,7 @@ int main(int argc, char **argv)
     uint32_t frame_phys = FRAME_PHYS_DEFAULT;
     uint32_t reg_phys = REG_PHYS_DEFAULT;
     double fake_rps = 0.0;
+    uint32_t fake_slices = PVS_N_SLICES;    /* --fake 时写进 0x10[31:16] 的片数 */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
@@ -1741,9 +1939,25 @@ int main(int argc, char **argv)
             reg_phys = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--fake") && i + 1 < argc)
             fake_rps = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--fake-slices") && i + 1 < argc) {
+            long v = strtol(argv[++i], NULL, 0);
+            if (v < 1 || v > 65535) { usage(argv[0]); return 2; }
+            fake_slices = (uint32_t)v;
+        }
         else if (!strcmp(argv[i], "--crc"))
             g_crc_on = 1;
         else if (!strcmp(argv[i], "--swap-faces")) g_swap_faces = 1;
+        else if (!strcmp(argv[i], "--oe-w") && i + 1 < argc) {
+            /* --oe-w W1,W2: 3-bit BCM 的中位/高位平面 OE 沿数 (低位是 oe_window)。
+             * RTL 内箝 [2,187], 这里先箝一遍免得写进去的和生效的不是一个数。 */
+            unsigned w1 = OE_W1_DEFAULT, w2 = OE_W2_DEFAULT;
+            if (sscanf(argv[++i], "%u,%u", &w1, &w2) != 2) { usage(argv[0]); return 2; }
+            if (w1 < OE_W_MIN) w1 = OE_W_MIN;
+            if (w1 > OE_W_MAX) w1 = OE_W_MAX;
+            if (w2 < OE_W_MIN) w2 = OE_W_MIN;
+            if (w2 > OE_W_MAX) w2 = OE_W_MAX;
+            g_oe_w1 = w1; g_oe_w2 = w2;
+        }
         else if (!strcmp(argv[i], "--idle-anim") && i + 1 < argc) idle_path = argv[++i];
         else if (!strcmp(argv[i], "--idle-fps")  && i + 1 < argc) g_idle_fps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--flip-window") && i + 1 < argc) {
@@ -1809,6 +2023,18 @@ int main(int argc, char **argv)
     logts("frames: n_slices 1..%d, raw<=%u B; dual-face -> 0x18/0x28, "
           "fold-a -> 0x10[6], PHASE_B(0x1C) shadow=%u (RTL 复位值, 读不回来)",
           PVS_N_SLICES_MAX, (unsigned)PVS_FRAME_RAW_MAX, g_phase_b);
+    /* v3.4 3-bit: 把"能收什么"和"谁负责 oe_w0"一次说清, 免得上板时靠猜 */
+    logts("3-bit: PVS_FLAG_3BIT=0x%x -> stride 0x%x, n_slices 1..%u "
+          "(1-bit: 0x%x / 1..%d); bpp_mode+oe_w1/oe_w2 -> 0x0C sub01, "
+          "本进程按帧切; oe_w0 = 0x0C sub10 的 oe_window(**本进程不写**, "
+          "3-bit 要 %u, pov_boot.sh 现固化的是 111)",
+          (unsigned)PVS_FLAG_3BIT, (unsigned)PVS_SLICE_STRIDE_3BIT,
+          (unsigned)PVS_N_SLICES_MAX_3BIT, (unsigned)PVS_SLICE_STRIDE,
+          PVS_N_SLICES_MAX, OE_W0_3BIT_HINT);
+    logts("BCM 权重: oe_w1=%u oe_w2=%u (默认 %u/%u, --oe-w 改); "
+          "影子初值=无效 -> 第一帧无条件写 0x0C sub01, 之后每 %u 次重申一遍",
+          g_oe_w1, g_oe_w2, OE_W1_DEFAULT, OE_W2_DEFAULT,
+          (unsigned)BCM_REASSERT_EVERY);
     logts("engine STATUS=0x%08x POV_CTRL=0x%08x",
           reg_rd(REG_STATUS), reg_rd(REG_POV_CTRL));
 
@@ -1817,12 +2043,15 @@ int main(int argc, char **argv)
     reg_wr(REG_SLICE_BASE_B, 0);
     reg_wr(REG_SLICE_BASE, g_bank_phys[0]);
     if (fake_rps > 0.0) {
-        uint32_t period = (uint32_t)((double)ACLK_HZ / (fake_rps * PVS_N_SLICES) + 0.5);
+        /* --fake-slices: 引擎每圈片数。默认 360 = 老行为逐位不变; 3-bit 的
+         * 60 槽几何要在台面上无电机试, 就得能把它改掉 (帧里的 hdr.n_slices
+         * 是"载荷有几片", 与引擎一圈几片是两回事, 见 0x10 的注释)。 */
+        uint32_t period = (uint32_t)((double)ACLK_HZ / (fake_rps * fake_slices) + 0.5);
         reg_wr(REG_FAKE_PERIOD, period);
         /* pov_ctrl_write 会先保证 PHASE_B < n_slices 再落 0x10 */
-        pov_ctrl_write(PVS_N_SLICES, (1u << 1) | 1u);
-        logts("fake-spin: %.2f rps -> fake_period=%u ticks/slice, POV_CTRL set",
-              fake_rps, period);
+        pov_ctrl_write(fake_slices, (1u << 1) | 1u);
+        logts("fake-spin: %.2f rps x %u 片/圈 -> fake_period=%u ticks/slice, "
+              "POV_CTRL set", fake_rps, fake_slices, period);
     }
     logts("POV_CTRL readback 0x24=0x%08x (fold_a_en=%u) -> fold 走安全 RMW",
           reg_rd(REG_POV_CTRL_RB),

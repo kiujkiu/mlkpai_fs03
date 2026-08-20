@@ -28,6 +28,23 @@
 #define PVS_SLICE_STRIDE 0x3000            /* 12288 */
 #define PVS_FRAME_RAW    (PVS_N_SLICES * PVS_SLICE_STRIDE)  /* 4423680 */
 
+/* ---- 2026-08-20 v3.4 3-bit 色深 (docs/design_icnd2047/05_3bit_bcm.md) -----
+ * 每通道 1 bit -> 3 bit (每像素 9 bit = 512 色), 行内 BCM, 权重 27/54/108 沿。
+ * 一片数据 = **3 个位平面顺序排列**, plane p 落在 slice_base + p*0x3000,
+ * 每个 plane 内部布局与今天的 1-bit **逐字节相同** (lane*1296 + row*24 + word*4)。
+ *   plane 0 = 最低位 (权重 1, oe_w0 = 现有 oe_window)
+ *   plane 1 = 中位   (权重 2, oe_w1)
+ *   plane 2 = 最高位 (权重 4, oe_w2)
+ * 于是片距从 0x3000 变成 0x9000, **其它一切都不变** —— 面拆分、MSTREAM 流表、
+ * DELTA、压缩位全部与 1-bit 一模一样, 只是「一片有多大」换了个数。
+ *
+ * 🔴 片距不再是编译期常量: 收发双方都必须**从 flags 推**, 不能再直接用
+ *    PVS_SLICE_STRIDE。用 PVS_STRIDE(flags)。 */
+#define PVS_SLICE_STRIDE_3BIT 0x9000       /* 36864 = 3 * 0x3000 */
+#define PVS_STRIDE(flags)  (((flags) & PVS_FLAG_3BIT) ? \
+                            (uint32_t)PVS_SLICE_STRIDE_3BIT : \
+                            (uint32_t)PVS_SLICE_STRIDE)
+
 /* ---- 2026-07-31 v3.1 偏心屏: 帧长度不再是编译期常量 ----------------------
  * 机械 v3.1 把屏模组整体偏 6.7mm, 两 LED 面落在 X=0 / X=+13.4 → 两面不再关于
  * 转轴对称, 「屏B@θ ≡ 屏A@(θ+180)」作废 ⇒ 单份 360 片喂两面的前提没了。
@@ -35,19 +52,35 @@
  * slice_{i+180} 互为镜像)。
  *
  * **头里的 n_slices 是权威**, 接收方按它算长度, 不再硬校验 == PVS_N_SLICES:
- *     raw_len MUST == n_slices * PVS_SLICE_STRIDE   (<= PVS_FRAME_RAW_MAX)
+ *     raw_len MUST == n_slices * PVS_STRIDE(flags) (<= PVS_FRAME_RAW_MAX)
+ *     (v3.4: 片距随 PVS_FLAG_3BIT 变 0x3000/0x9000, 见下)
  * 老帧 (n_slices=360, 无新 flag) 语义逐字节不变, 老 frames_* 继续可用。
  *
  * 载荷排布 (解压后):
  *   单面:            [面 0 .. n_slices-1]
  *   PVS_FLAG_DUAL_FACE: [面A 0..nA-1][面B 0..nB-1], nA+nB = n_slices,
- *                       nA = PVS_FLAG_FOLD_A ? 180 : 360, nB = 360
- *   PVS_FLAG_FOLD_A:  面A 只送 0..179; 180..359 由 PL 取 idx-180 再做镜像置换
+ *                       nA = PVS_FLAG_FOLD_A ? nB/2 : nB
+ *                       ⇒ nA = FOLD_A ? n_slices/3 : n_slices/2
+ *                       (360 槽: 720 -> 360+360, fold 540 -> 180+360, 与老帧同)
+ *   PVS_FLAG_FOLD_A:  面A 只送前半圈; 后半圈由 PL 取 idx-n_eng/2 再做镜像置换
+ *                     (n_eng = 引擎每圈片数 0x10[31:16]; 360 槽时就是老的 180)
  *                     (仅穿心面 axis_off==0 成立, 发送端必须自检过)
  */
 #define PVS_N_SLICES_MAX 720
 #define PVS_FRAME_RAW_MAX (PVS_N_SLICES_MAX * PVS_SLICE_STRIDE)  /* 8847360 */
-#define PVS_N_SLICES_FOLD 180              /* 折叠后的面A 片数 */
+#define PVS_N_SLICES_FOLD 180              /* 折叠后的面A 片数 (=360 槽时的值) */
+/* 🔴 帧**字节数**上限是硬的 (= 板端一个 DDR bank / staging 缓冲的大小),
+ * 片数上限随片距变: 3-bit 一片大 3 倍, 所以片数上限小 3 倍。
+ *   1-bit: 720 片 * 0x3000 = 8847360 B  (= PVS_FRAME_RAW_MAX)
+ *   3-bit: 240 片 * 0x9000 = 8847360 B  (整除, 一个字节都不浪费)
+ * 240 片对 3-bit 是**两倍余量**: 方案定的是每面 60 槽 (双面 120 片 = 4.42 MB),
+ * 见 05_3bit_bcm.md §4 —— 3-bit 反而比今天在跑的 1-bit 720 片省一半载荷。
+ * 要支持 3-bit 720 片 (26.5 MB/帧) 就必须同时加大板端 bank 间距/povmem 窗口,
+ * 算式见 pov_rxd.c 文件头的帧区地址表。 */
+#define PVS_N_SLICES_MAX_3BIT (PVS_FRAME_RAW_MAX / PVS_SLICE_STRIDE_3BIT)  /* 240 */
+#define PVS_N_SLICES_MAX_F(flags) (((flags) & PVS_FLAG_3BIT) ? \
+                                   (uint32_t)PVS_N_SLICES_MAX_3BIT : \
+                                   (uint32_t)PVS_N_SLICES_MAX)
 
 /* flags bits */
 #define PVS_FLAG_RLE     (1u << 0)  /* payload = zero-run RLE (see protocol.md) */
@@ -74,11 +107,15 @@
                                        * 时间直接减半, 且不需要奇偶帧交错那套额外缓冲
                                        * 与一帧延迟。DELTA 组合时各面各自 XOR 自己上一
                                        * 帧的同面数据 (参考帧也按面分开存)。*/
-#define PVS_FLAG_FOLD_A    (1u << 4)  /* 面A 折叠: 只送 180 片 (θ=0..179°)。
+#define PVS_FLAG_FOLD_A    (1u << 4)  /* 面A 折叠: 只送前半圈 (θ=0..179°)。
                                        * 仅当面A 穿心 (垂距 0) 时合法 —— 此时
-                                       * slice_i ≡ mirror(slice_{i+180}) 严格成立,
-                                       * PL 用 idx>=180 → 取 idx-180 + 镜像置换补齐。
-                                       * 发送端必须先跑打包域自检再置位。*/
+                                       * slice_i ≡ mirror(slice_{i+h}) 严格成立
+                                       * (h = 半圈片数), PL 用 idx>=h → 取 idx-h
+                                       * + 镜像置换补齐。发送端必须先跑打包域自检
+                                       * 再置位。
+                                       * ⚠ 片数**不是**写死的 180: h = 引擎每圈
+                                       * 片数/2, 360 槽下才等于 180。3-bit 走 60
+                                       * 槽时折叠面就是 30 片。 */
 #define PVS_FLAG_LZ4       (1u << 5)  /* 载荷 = LZ4 **raw block**。v3.3 起的首选
                                        * 压缩位, 用来顶掉 ZLIB。
                                        *
@@ -197,6 +234,34 @@
                                        *     —— 响亮地失败, 不会静默解错。
                                        *   新固件 + 老发送端: 没有 MSTREAM 位就走老的
                                        *     两流分支, 逐字节兼容。 */
+#define PVS_FLAG_3BIT      (1u << 7)  /* 每通道 3 bit (行内 BCM), 一片 = 3 个位平面
+                                       * 顺序排列, plane p @ slice_base + p*0x3000,
+                                       * 片距 0x3000 -> 0x9000。详见上面
+                                       * PVS_SLICE_STRIDE_3BIT 那段与
+                                       * docs/design_icnd2047/05_3bit_bcm.md。
+                                       *
+                                       * 🔴 **不是压缩位**, 不进 PVS_FLAGS_CODEC。
+                                       * 板端 face_job_t.codec 存的是「压缩 flag 位
+                                       * 原样」(见 pov_rxd.c 那条注释: 曾经按序号填
+                                       * codec=1 正好命中 PVS_FLAG_RLE, 拿 zlib 流
+                                       * 跑 RLE 解码, 静默失败)。本位落在 bit7 =
+                                       * 压缩位集合 {bit0,bit1,bit5} 之外, 也在
+                                       * 几何位 {bit3,bit4} 之外, 谁都不撞。
+                                       *
+                                       * 与所有现有 flag **正交**:
+                                       *   DUAL_FACE / FOLD_A: 面怎么拆不变, 只是
+                                       *     nA*stride 里的 stride 换成 0x9000;
+                                       *   MSTREAM: 流表里的 n_slices_i 仍是**片数**,
+                                       *     每条流的解压长度 = n_slices_i * stride;
+                                       *   DELTA: 逐字节 XOR, 与片距无关 (但参考帧
+                                       *     必须同色深 —— 长度/面边界校验已覆盖:
+                                       *     色深一变 raw_len 必变);
+                                       *   RLE/ZLIB/LZ4: 压的是字节流, 完全不关心。
+                                       *
+                                       * 🔴 硬件侧: 板端收到 3-bit 帧要把 PL 的
+                                       * bpp_mode 切到 1 (0x0C subcmd=01 [16]), 收到
+                                       * 1-bit 帧切回 0。两种内容可以逐帧交替, 因为
+                                       * 空闲动画和上电默认内容都还是 1-bit。 */
 #define PVS_MAX_STREAMS  16           /* 流表条数上限 (表最大 4+16*8 = 132 B) */
 /* flags == 0 -> payload is raw (comp_len == raw_len) */
 
@@ -208,10 +273,15 @@
 typedef struct {
     char     magic[4];    /* "PVS1" */
     uint32_t comp_len;    /* payload length in bytes as transmitted */
-    uint32_t raw_len;     /* decompressed length; MUST == n_slices * PVS_SLICE_STRIDE
-                           * 且 <= PVS_FRAME_RAW_MAX (老帧里就是 PVS_FRAME_RAW) */
-    uint16_t n_slices;    /* 权威片数, 1..PVS_N_SLICES_MAX。单面老帧 = 360;
-                           * DUAL_FACE 时 = nA+nB; FOLD_A 时 nA=180 */
+    uint32_t raw_len;     /* decompressed length; MUST == n_slices * PVS_STRIDE(flags)
+                           * 且 <= PVS_FRAME_RAW_MAX (老帧里就是 PVS_FRAME_RAW)。
+                           * 🔴 片距是从 flags 推的, 不是常量: 3-bit 帧 0x9000。 */
+    uint16_t n_slices;    /* 权威片数, 1..PVS_N_SLICES_MAX_F(flags) (1-bit 720 /
+                           * 3-bit 240)。单面老帧 = 360; DUAL_FACE 时 = nA+nB;
+                           * FOLD_A 时 nA = nB/2 (360 槽下就是老的 180)。
+                           * 🔴 nA/nB 由 n_slices 推 (DUAL_FACE: nA = FOLD_A ?
+                           * n_slices/3 : n_slices/2), **不是**写死的 360/180 ——
+                           * 3-bit 走的是每面 60 槽。 */
     uint16_t flags;       /* PVS_FLAG_* */
 } pvs_hdr_t;              /* 16 bytes */
 #pragma pack(pop)
