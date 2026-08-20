@@ -27,6 +27,12 @@ gen_wedge.py — 8 级灰度楔测试图 (3-bit 色深上板目视用, 05_3bit_b
 ⚠ 图案与观察者视角的关系 (选 --pattern 时要想清楚):
   · flat  (默认): 8 档沿 **Y (屏高)**, 4 条色带沿 X。屏**不转**、直接看面板时
                   这就是所见即所得的 8×4 方格。
+  · checker: 数字灰度棋盘 —— X 方向 8 列 = 码值 0..7, Y 方向逐行正/反相,
+             每格里用 3x5 点阵写着自己的码值。**屏不转直接看面板**用这个:
+             一眼同时看灰度单调性 / 相邻级可分辨性 / 格边界有没有糊开。
+  · grid64: 8x8=64 格编号方阵 + 三色渐变。行 = 通道组合 (白/R/G/B/黄/品红/青/
+             白反向), 列 = 8 级亮度, 每格写着自己的格号 1..64。
+             看三色独立性 / 通道串扰 / 两端压不压得住, 出问题能指认格号。
   · rings: 同样 8 档沿 Y, 但 X 方向**关于中心列左右对称**。屏转起来时观察者列 X
            与 160-1-X 落在同一半径上, 不对称的图案会互相叠加成一团;
            对称排布转出来就是干净的同心色环 —— **转起来看用这个**。
@@ -55,6 +61,114 @@ def _band_of_y(Y):
     return (LEVELS - 1) - min(Y * LEVELS // H, LEVELS - 1)
 
 
+# 3x5 点阵数字 0-7 (用来把码值本身写进格子里, 免得靠数位置认级)
+DIGITS = {
+    0: ('111', '101', '101', '101', '111'),
+    1: ('010', '110', '010', '010', '111'),
+    2: ('111', '001', '111', '100', '111'),
+    3: ('111', '001', '111', '001', '111'),
+    4: ('101', '101', '111', '001', '001'),
+    5: ('111', '100', '111', '001', '111'),
+    6: ('111', '100', '111', '101', '111'),
+    7: ('111', '001', '001', '001', '001'),
+    8: ('111', '101', '111', '101', '111'),
+    9: ('111', '101', '111', '001', '111'),
+}
+CELL = 20                       # 格边长 (px): W=160 -> 8 列 = 码值 0..7; H=180 -> 9 行
+DIG_SCALE = 4                   # 3x5 -> 12x20, 正好塞进一格
+
+
+def _stamp_digit(code, y0, x0, d, val):
+    """把数字 d 以码值 val 画进格子 (y0,x0) 左上角的 CELL x CELL 区域, 居中。"""
+    gh, gw = 5 * DIG_SCALE, 3 * DIG_SCALE
+    oy, ox = y0 + (CELL - gh) // 2, x0 + (CELL - gw) // 2
+    for r, row in enumerate(DIGITS[d]):
+        for c, ch in enumerate(row):
+            if ch == '1':
+                ys, xs = oy + r * DIG_SCALE, ox + c * DIG_SCALE
+                code[ys:ys + DIG_SCALE, xs:xs + DIG_SCALE, :] = val
+
+
+def build_checker():
+    """数字灰度棋盘: X 方向 8 列 = 码值 0..7; Y 方向逐行反相 (背景/数字对调)。
+
+    一列里同时看到该码值的"正"(亮格黑字)和"反"(黑格亮字)两种呈现:
+      · 横看 8 列 = 8 级灰度是否单调、相邻级分不分得开
+      · 格边界 = 空间对齐 / 串扰 (plane 边界若锁存错位, 会在这里糊开)
+      · 数字本身 = 不用数位置就知道这格该是几
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    for cx in range(W // CELL):                     # 8 列
+        val = min(cx, LEVELS - 1)                   # 码值 0..7
+        for cy in range(H // CELL):                 # 9 行
+            y0, x0 = cy * CELL, cx * CELL
+            if cy % 2 == 0:                         # 亮格黑字
+                code[y0:y0 + CELL, x0:x0 + CELL, :] = val
+                _stamp_digit(code, y0, x0, val, 0)
+            else:                                   # 黑格亮字
+                _stamp_digit(code, y0, x0, val, val)
+    return code
+
+
+
+# ---- grid64: 8x8 编号方阵 + 三色渐变 -------------------------------------
+GRID_CW, GRID_CH = W // 8, 22       # 20 x 22, 8 行占 176 行, 顶部留 4 行黑
+GRID_ROWS = [                       # (名字, 通道掩码, 是否反向递减)
+    ('W',  (1, 1, 1), False),
+    ('R',  (1, 0, 0), False),
+    ('G',  (0, 1, 0), False),
+    ('B',  (0, 0, 1), False),
+    ('RG', (1, 1, 0), False),
+    ('RB', (1, 0, 1), False),
+    ('GB', (0, 1, 1), False),
+    ('W',  (1, 1, 1), True),
+]
+
+
+def _stamp_number(code, y0, x0, n, val, mask):
+    """把十进制数 n 画进 (y0,x0) 起的 GRID_CW x GRID_CH 格子, 居中。"""
+    sc = 2
+    ds = str(n)
+    gw = (len(ds) * 3 + (len(ds) - 1)) * sc      # 位宽 3 + 位间距 1
+    gh = 5 * sc
+    oy, ox = y0 + (GRID_CH - gh) // 2, x0 + (GRID_CW - gw) // 2
+    for i, ch in enumerate(ds):
+        bx = ox + i * 4 * sc
+        for r, row in enumerate(DIGITS[int(ch)]):
+            for c, bit in enumerate(row):
+                if bit == '1':
+                    ys, xs = oy + r * sc, bx + c * sc
+                    for k in range(3):
+                        if mask[k]:
+                            code[ys:ys + sc, xs:xs + sc, k] = val
+
+
+def build_grid64():
+    """8x8 = 64 格, 每格写编号 1..64; 每行一种通道组合, 沿 X 走 8 级渐变。
+
+    一张图同时给出:
+      · 第 2/3/4 行 = R/G/B 三条各自的 8 级渐变 (三色是不是独立、级数对不对)
+      · 第 5/6/7 行 = 黄/品红/青 三个混色 (通道之间有没有串)
+      · 第 1/8 行 = 正反两条白阶对照 (两端有没有被压掉)
+      · 格号 1..64 = 出问题时能直接指认是哪一格
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    for ry, (_, mask, rev) in enumerate(GRID_ROWS):
+        y0 = 4 + ry * GRID_CH
+        if y0 + GRID_CH > H:
+            break
+        for cx in range(8):
+            x0 = cx * GRID_CW
+            val = (LEVELS - 1 - cx) if rev else cx
+            for k in range(3):
+                if mask[k]:
+                    code[y0:y0 + GRID_CH, x0:x0 + GRID_CW, k] = val
+            # 数字取对比色: 底亮就画暗字, 底暗就画亮字
+            _stamp_number(code, y0, x0, ry * 8 + cx + 1,
+                          0 if val >= 4 else LEVELS - 1, mask)
+    return code
+
+
 def build_codes(pattern):
     """→ (H,W,3) uint8 码值图 0..7。"""
     code = np.zeros((H, W, 3), np.uint8)
@@ -65,6 +179,10 @@ def build_codes(pattern):
             for c in range(3):
                 if mask[c]:
                     code[:, x0:x1, c] = lvl[:, None]
+    elif pattern == 'grid64':
+        return build_grid64()
+    elif pattern == 'checker':
+        return build_checker()
     elif pattern == 'rings':
         # 左右对称: 半宽 80 分 4 段, 由中心向外 W/R/G/B, 另一半镜像
         half = W // 2
@@ -127,7 +245,7 @@ def save_png(code, path, gamma):
 def main():
     ap = argparse.ArgumentParser(description='8 级灰度楔测试图 (3-bit 上板目视)')
     ap.add_argument('--bpp', type=int, choices=sorted(pack_obs.BPP_MODES), default=3)
-    ap.add_argument('--pattern', choices=['flat', 'rings', 'ramp'], default='flat')
+    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'rings', 'ramp'], default='flat')
     ap.add_argument('--n-slices', type=int, default=60,
                     help='帧里的片数 (默认 60 = 3-bit 方案推荐的每面槽数)')
     ap.add_argument('--gamma', type=float, default=DEFAULT_GAMMA,
