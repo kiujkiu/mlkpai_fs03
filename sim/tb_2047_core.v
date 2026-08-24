@@ -292,9 +292,13 @@ module tb_2047_core;
 
     //---------- 监视器: fb 读地址不许越界 (rows 箝位的判据) ----------
     integer max_raddr = 0, raddr_err = 0;
+    reg     raddr_seen [0:1023];        // 哪些地址被访问过 (T6r2 验地址序列用)
+    integer rs_i;
+    initial for (rs_i = 0; rs_i < 1024; rs_i = rs_i + 1) raddr_seen[rs_i] = 1'b0;
     always @(posedge clk) if (rstn) begin
         if (fb_raddr > max_raddr) max_raddr = fb_raddr;
         if (fb_raddr > 10'd1023) raddr_err = raddr_err + 1;   // 位宽所限, 只会是绕回
+        raddr_seen[fb_raddr] <= 1'b1;
     end
 
     //---------- 监视器: 行驱推进只允许发生在 plane0 (plane 边界不是行边界) ----------
@@ -936,6 +940,7 @@ module tb_2047_core;
         half_scan = 1'b1;
         oe_window = 8'd16; oe_w1 = 8'd8; oe_w2 = 8'd4;   // 4:2:1, 全在 18 以内
         max_raddr = 0; raddr_err = 0;
+        for (rs_i = 0; rs_i < 1024; rs_i = rs_i + 1) raddr_seen[rs_i] = 1'b0;
         repeat (20) @(posedge clk);
         fc0 = frame_count_o;
         auto_en = 1'b1;
@@ -948,6 +953,25 @@ module tb_2047_core;
                      frame_period_o);
         if (raddr_err != 0) fail("T6 fb_raddr out of range in half_scan");
         else $display("PASS T6r: half_scan max fb_raddr = %0d < 1024", max_raddr);
+        // 🔴 T6r2: 光验范围不够 —— 2026-08-24 上板栽过一次: 行边界漏补跳 3,
+        // 地址逐行累积错位, 而 frame_period 和 max_raddr 两个判据**都是通过的**,
+        // 屏上表现为"发什么内容都显示一样"。这里验**地址序列本身**:
+        // 半屏一整屏必须恰好覆盖 rows*3 个 plane 基址 {row*18 + plane*6},
+        // 且每个基址都被访问到。
+        begin : t6r2
+            integer want, hit, ri, pi;
+            hit = 0;
+            for (ri = 0; ri < 54; ri = ri + 1)
+                for (pi = 0; pi < 3; pi = pi + 1) begin
+                    want = ri * 18 + pi * 6;
+                    if (raddr_seen[want]) hit = hit + 1;
+                end
+            if (hit != 162) begin
+                fail("T6 half_scan 地址序列不全 (plane 基址应命中 162 个)");
+                $display("        命中 %0d / 162", hit);
+            end else
+                $display("PASS T6r2: half_scan 地址序列命中全部 162 个 plane 基址");
+        end
         auto_en = 1'b0;
         k0 = 0;
         while (eg_state_o != 3'd0 && k0 < 2000) begin @(posedge clk); k0 = k0 + 1; end

@@ -994,7 +994,77 @@ def rgbcube_frames(args):
         yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
-ANIMS = {'rgbcube': rgbcube_frames, 'spinpulse': spinpulse_frames, 'globe': globe_frames,
+
+def rgbcyl_frames(args):
+    """倾斜的渐变色圆柱, 绕竖轴(Y)自转 —— 比立方体更适合看 POV 的立体感。
+
+    为什么倾斜: 竖直圆柱绕竖轴转是**旋转对称**的, 转起来看不出在转, 也看不出
+    角分辨率好坏。倾斜之后每个角度的截面都不同, 转起来像陀螺进动, 角分辨率
+    不够会立刻表现为轮廓卡顿/棱边。
+
+    配色: 周向 φ 走 R/G/B 三相彩虹 (相位差 120°), 轴向叠一层亮度渐变
+    —— 一眼能同时判断色深(渐变顺不顺)和角分辨率(周向色带边缘干不干净)。
+    """
+    tilt = math.radians(args.tilt)
+    # ⚠ --half-screen 会把 180 行压成 90 行显示, 垂直方向 2:1 压缩而半径方向不变
+    # ⇒ 立体像必然被压扁 (倾斜 30° 的圆柱视在倾角会变成 16°, 两端斜边角度不一致,
+    #   看起来像"中间拐了个弯")。缩小物体补偿不了, 因为压的只有高度。
+    # 唯一能恢复比例的办法: 把半径也缩一半 ⇒ 物体变小、只用屏中间一半宽度,
+    # 但宽高比正确。--cyl-radius 就是这个旋钮 (半屏时给 0.23, 全屏时 0.46)。
+    r = gas.R_BUDGET * args.cyl_radius
+    hh = gas.H_BUDGET * 0.80                      # 半高
+    n_phi = max(64, int(args.cube_grid))
+    n_t = max(32, int(args.cube_grid) // 2)
+    phi = np.linspace(0, 2 * math.pi, n_phi, endpoint=False, dtype=np.float32)
+    tt = np.linspace(-1.0, 1.0, n_t, dtype=np.float32)
+    P, T = np.meshgrid(phi, tt, indexing='ij')
+    # 🔴 径向也要采样 (--cyl-shells 层同心壳), 不能只画表面:
+    # POV 显示的是"切片平面 x 物体"的交线, 空心圆柱被过轴平面一切就只剩左右
+    # 两条侧壁, 中间是空的 —— 屏上看起来就是"圆柱中间断开"。立方体没这问题
+    # 是因为它的面常整面朝向切片平面; 圆柱侧壁是曲面, 任何角度切下去都只有两条线。
+    nsh = max(1, int(args.cyl_shells))
+    p_side, c_side = [], []
+    for rr in np.linspace(1.0, 0.12, nsh):        # 由外向内几层壳
+        p_side.append(np.stack([r * rr * np.cos(P), T * hh,
+                                r * rr * np.sin(P)], axis=-1).reshape(-1, 3))
+        c_side.append(np.stack([P.ravel(), (T.ravel() + 1) * 0.5], axis=-1))
+    p_side = np.concatenate(p_side, axis=0)
+    c_side = np.concatenate(c_side, axis=0)
+    # 两个端面 (同心圆环采样), 颜色沿用侧面的周向色相
+    rings = []
+    cring = []
+    for sgn in (-1.0, 1.0):
+        for rr in np.linspace(0.08, 1.0, max(8, n_t // 4)):
+            rings.append(np.stack([r * rr * np.cos(phi),
+                                   np.full_like(phi, sgn * hh),
+                                   r * rr * np.sin(phi)], axis=-1))
+            cring.append(np.stack([phi, np.full_like(phi, (sgn + 1) * 0.5)], axis=-1))
+    p0 = np.concatenate([p_side] + rings, axis=0)
+    cc = np.concatenate([c_side] + cring, axis=0)
+    # 颜色: 周向三相彩虹 x 轴向亮度渐变 (0.35..1.0, 别让一端全黑)
+    ph, lv = cc[:, 0], 0.35 + 0.65 * cc[:, 1]
+    col = np.stack([(np.cos(ph) + 1) * 0.5,
+                    (np.cos(ph - 2 * math.pi / 3) + 1) * 0.5,
+                    (np.cos(ph + 2 * math.pi / 3) + 1) * 0.5], axis=-1)
+    col = (col * lv[:, None] * 255.0).clip(0, 255).astype(np.uint8)
+    # 先固定倾斜 (绕 Z), 再逐帧绕 Y 自转 => 陀螺进动
+    ct, st_ = math.cos(tilt), math.sin(tilt)
+    pt = np.empty_like(p0)
+    pt[:, 0] = p0[:, 0] * ct - p0[:, 1] * st_
+    pt[:, 1] = p0[:, 0] * st_ + p0[:, 1] * ct
+    pt[:, 2] = p0[:, 2]
+    n = args.frames
+    for k in range(n):
+        th = 2 * math.pi * k / n
+        c, sn = math.cos(th), math.sin(th)
+        p = np.empty_like(pt)
+        p[:, 0] = pt[:, 0] * c + pt[:, 2] * sn
+        p[:, 1] = pt[:, 1]
+        p[:, 2] = -pt[:, 0] * sn + pt[:, 2] * c
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
+
+
+ANIMS = {'rgbcyl': rgbcyl_frames, 'rgbcube': rgbcube_frames, 'spinpulse': spinpulse_frames, 'globe': globe_frames,
          'glbseq': glbseq_frames, 'glbanim': glbanim_frames,
          'spin': spin_frames, 'palace': palace_frames,
          'notredame': notredame_frames}
@@ -1723,6 +1793,12 @@ def add_render_opts(ap):
     ap.add_argument('--frames', type=int, default=36, help='动画帧数 (=循环周期)')
     ap.add_argument('--half-screen', action='store_true',
                     help='内容压到下半屏 Y90..179, 配 RTL half_scan (整屏拍数减半, 槽数翻倍)')
+    ap.add_argument('--cyl-radius', type=float, default=0.46,
+                    help='rgbcyl 半径 (占 R_BUDGET 的比例); --half-screen 下用 0.23 才不变形')
+    ap.add_argument('--cyl-shells', type=int, default=10,
+                    help='rgbcyl 径向壳层数 (1=只有表面 => 切片上圆柱会中间断开)')
+    ap.add_argument('--tilt', type=float, default=30.0,
+                    help='rgbcyl 圆柱轴的倾斜角(度), 0=竖直(旋转对称, 看不出在转)')
     ap.add_argument('--cube-grid', type=int, default=340,
                     help='rgbcube 每面采样网格边长 (6 面共 6*n^2 点)')
     ap.add_argument('--render-slices', type=int, default=0,

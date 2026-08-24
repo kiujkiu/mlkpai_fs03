@@ -500,8 +500,16 @@ module icnd2047_panel_core (
                             per_cnt        <= 32'd0;
                             frame_count_r  <= frame_count_r + 16'd1;
                             if (bpp3) fb_raddr <= 10'd0;         // 整屏结束归零
-                        end else
+                        end else begin
                             shift_row <= shift_row + 9'd1;
+                            // 🔴 行边界也要补跳: plane2 同样只走 3 个 pair, 预取少推 3 次。
+                            // 漏了这一条 => 每行地址少 3, 逐行累积错位, 引擎读的全是
+                            // 错位的 fb 内容 —— 表现为"发什么内容屏上都一样"
+                            // (2026-08-24 上板抓到: 内容放上半屏/下半屏显示完全相同)。
+                            // ⚠ 仿真没抓到, 因为 T6q 只验 frame_period(时序),
+                            //   T6r 只验 max fb_raddr 范围, **没有用例验地址序列本身**。
+                            if (bpp3 && half_scan) fb_raddr <= fb_raddr + 10'd3;
+                        end
                         // 1-bit: 旧式稀疏地址, 逐拍等价; 3-bit: 预取已到位, 不动
                         if (!bpp3) fb_raddr <= {1'b0, next_row[5:0], 3'd0};
                     end
