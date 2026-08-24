@@ -244,6 +244,27 @@ def build_ab():
     return code
 
 
+
+def build_halftest():
+    """半屏扫描 (half_scan) 专用: 内容只放在 **Y 90..179**, 上半留黑。
+
+    为什么是下半: pack_obs 的 Y 映射是 `_Y_H = 11 - Y//15`, 即 Y=179 落在芯片 0
+    (移位链的数据入口端)。half_scan 每行只发 96 bit, 更新的正是靠入口那 6 颗
+    = 芯片 0..5 = **Y 90..179**; 远端 6 颗保持旧值 (须先整链清零)。
+
+    图案: 下半屏放 8 列灰阶 (码值 0..7) + 一条彩色带, 既验色深也验哪一半亮。
+    上半屏全黑 —— 如果开了 half_scan 之后上半屏出现残影, 说明链没清干净。
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    y0 = H // 2                       # 90
+    band = (H - y0) // 2              # 45
+    for cx in range(8):
+        x0, x1 = cx * (W // 8), (cx + 1) * (W // 8)
+        code[y0:y0 + band, x0:x1, :] = cx            # 上半段: 白灰阶
+        code[y0 + band:, x0:x1, cx % 3] = cx         # 下半段: R/G/B 轮转
+    return code
+
+
 def build_codes(pattern):
     """→ (H,W,3) uint8 码值图 0..7。"""
     code = np.zeros((H, W, 3), np.uint8)
@@ -254,6 +275,8 @@ def build_codes(pattern):
             for c in range(3):
                 if mask[c]:
                     code[:, x0:x1, c] = lvl[:, None]
+    elif pattern == 'halftest':
+        return build_halftest()
     elif pattern == 'ab':
         return build_ab()
     elif pattern == 'rgb3':
@@ -330,7 +353,7 @@ def save_png(code, path, gamma):
 def main():
     ap = argparse.ArgumentParser(description='8 级灰度楔测试图 (3-bit 上板目视)')
     ap.add_argument('--bpp', type=int, choices=sorted(pack_obs.BPP_MODES), default=3)
-    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'rgb3', 'ab', 'levels', 'full', 'bw', 'rings', 'ramp'], default='flat')
+    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'rgb3', 'ab', 'halftest', 'levels', 'full', 'bw', 'rings', 'ramp'], default='flat')
     ap.add_argument("--n-slices", type=int, default=50,
                     help='帧里的片数 (默认 60 = 3-bit 方案推荐的每面槽数)')
     ap.add_argument('--gamma', type=float, default=DEFAULT_GAMMA,

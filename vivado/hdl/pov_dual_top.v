@@ -20,6 +20,7 @@
 //         subcmd 01 (2026-08-20 起) = 3-bit 行内 BCM 配置:
 //           [7:0]=oe_w1 (plane1 沿数, 0=不变) [15:8]=oe_w2 (plane2, 0=不变)
 //           [16]=bpp_mode 0=1-bit(旧行为) 1=3-bit BCM
+//           [18]=half_scan  1=每行只发 96bit (屏高 180->90, 角分辨率翻倍)
 //           [17]=le_plane_mode plane1/2 的 LE 沿数: 0=3 沿(datasheet 默认)
 //                1=与 plane0 同 4/5 沿 (上板逃生门, 免一次重综合)
 //           oe_w0 = 复用 subcmd10 的 oe_window[15:8]; 默认 27/54/108 沿.
@@ -202,6 +203,7 @@ module pov_dual_top #(
     reg  [7:0]  oe_w1_r, oe_w2_r; // 0x0C sub01 3-bit BCM plane1/2 OE 沿数
     reg         bpp3_r;           // 0x0C sub01 [16] 1 = 3-bit 行内 BCM
     reg         le_pl_r;          // 0x0C sub01 [17] plane1/2 LE 沿数选择
+    reg         half_r;           // 0x0C sub01 [18] 半屏扫描 (96bit/行)
 
     //---------- 前向声明 ----------
     wire [15:0] at_slice_idx;
@@ -276,6 +278,7 @@ module pov_dual_top #(
             oe_w2_r       <= 8'd46;      // BCM 权重 1 (plane2 = LSB, 唯一受 ≤111 约束的)
             bpp3_r        <= 1'b0;       // 复位 = 1-bit, 旧内容/空闲动画照跑
             le_pl_r       <= 1'b0;       // 复位 = plane1/2 用 LE 3 沿 (datasheet)
+            half_r        <= 1'b0;       // 复位 = 全屏 192bit, 老行为
         end else begin
             oe_set_pulse <= 1'b0;
             fb_we        <= 1'b0;
@@ -312,6 +315,7 @@ module pov_dual_top #(
                             if (s_axi_wdata[15:8] != 8'd0) oe_w2_r <= s_axi_wdata[15:8];
                             bpp3_r  <= s_axi_wdata[16];
                             le_pl_r <= s_axi_wdata[17];
+                            half_r  <= s_axi_wdata[18];
                         end else if (s_axi_wdata[31:30] == 2'b11) begin
                             auto_en       <= s_axi_wdata[0];
                             use_fb        <= s_axi_wdata[1];
@@ -646,6 +650,7 @@ module pov_dual_top #(
         .oe_w2         (oe_w2_r),
         .bpp_mode      (bpp3_r),
         .le_plane_mode (le_pl_r),
+        .half_scan     (half_r),
         .sdi_mask      (sdi_mask),
         .oe_set_pulse  (oe_set_pulse),
         .oe_set_val    (oe_set_val),

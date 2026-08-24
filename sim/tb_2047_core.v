@@ -127,6 +127,7 @@ module tb_2047_core;
     reg  [7:0]  oe_w1     = 8'd54;      // BCM plane1 (权重 2)
     reg  [7:0]  oe_w2     = 8'd108;     // BCM plane2 (权重 4)
     reg         bpp_mode  = 1'b0;       // 0=1-bit 1=3-bit 行内 BCM
+    reg         half_scan = 1'b0;       // 1=每行只发 96bit (屏高减半, 角分辨率翻倍)
     reg         le_plane_mode = 1'b0;   // plane1/2 的 LE: 0=3 沿 1=同 plane0(4/5)
     reg         ddr_slow  = 1'b0;
     reg         oe_set_pulse = 1'b0;
@@ -179,7 +180,7 @@ module tb_2047_core;
     icnd2047_panel_core dut (
         .aclk(clk), .aresetn(rstn),
         .auto_en(auto_en), .rows(rows), .oe_window(oe_window),
-        .oe_w1(oe_w1), .oe_w2(oe_w2), .bpp_mode(bpp_mode),
+        .oe_w1(oe_w1), .oe_w2(oe_w2), .bpp_mode(bpp_mode), .half_scan(half_scan),
         .le_plane_mode(le_plane_mode),
         .ddr_slow(ddr_slow), .oe_set_pulse(oe_set_pulse), .oe_set_val(oe_set_val),
         .sdi_mask(sdi_mask),
@@ -925,6 +926,46 @@ module tb_2047_core;
         rows = 9'd54;
         repeat (20) @(posedge clk);
 
+        // --- T6q/T6r: 半屏扫描 (half_scan) —— 每行只发 96 bit (6 芯片 = 90 行)
+        //     行周期 195 -> 99 拍, 3-bit 整屏 54*3*99 = 16038 => **角分辨率翻倍**。
+        //     ⚠ 预取每 pair 推一次地址, 96bit 只推 3 次(全屏 6 次), 所以 plane 边界
+        //     要补跳 3 个才落到下一 plane 基址; 不补就会读串平面。
+        //     ⚠ 半屏 plane 周期只有 99 拍, oe 上限 = 99-1-行驱80 = 18。
+        //     沿用全屏的 oe 权重会让 OE 窗口比整个 plane 周期还长 => LWAIT 爆炸,
+        //     整屏时间失控 (第一版就是这么写的, 直接把 TB 跑到 watchdog)。
+        half_scan = 1'b1;
+        oe_window = 8'd16; oe_w1 = 8'd8; oe_w2 = 8'd4;   // 4:2:1, 全在 18 以内
+        max_raddr = 0; raddr_err = 0;
+        repeat (20) @(posedge clk);
+        fc0 = frame_count_o;
+        auto_en = 1'b1;
+        while (frame_count_o != fc0 + 2) @(posedge clk);
+        if (frame_period_o != 32'd16038) begin
+            fail("T6 half_scan frame_period wrong (expect 54*3*99 = 16038)");
+            $display("        got %0d", frame_period_o);
+        end else
+            $display("PASS T6q: half_scan -> frame_period %0d (54 x 3 x 99), 整屏时间减半",
+                     frame_period_o);
+        if (raddr_err != 0) fail("T6 fb_raddr out of range in half_scan");
+        else $display("PASS T6r: half_scan max fb_raddr = %0d < 1024", max_raddr);
+        auto_en = 1'b0;
+        k0 = 0;
+        while (eg_state_o != 3'd0 && k0 < 2000) begin @(posedge clk); k0 = k0 + 1; end
+        half_scan = 1'b0;
+        oe_window = 8'd48; oe_w1 = 8'd54; oe_w2 = 8'd108;  // 还原 T6 的权重
+        repeat (20) @(posedge clk);
+        fc0 = frame_count_o;
+        auto_en = 1'b1;
+        while (frame_count_o != fc0 + 2) @(posedge clk);
+        if (frame_period_o != 32'd31590)
+            fail("T6 half_scan=0 did not restore 31590");
+        else
+            $display("PASS T6s: half_scan 关掉后恢复 %0d (全屏 192bit)", frame_period_o);
+        auto_en = 1'b0;
+        k0 = 0;
+        while (eg_state_o != 3'd0 && k0 < 2000) begin @(posedge clk); k0 = k0 + 1; end
+        repeat (20) @(posedge clk);
+
         // --- T6j: 运行时切回 1-bit, 立刻恢复 195 / 10530 / 旧 fb 布局
         auto_en = 1'b0;
         k0 = 0;
@@ -965,7 +1006,7 @@ module tb_2047_core;
 
     // 看门狗
     initial begin
-        #16_000_000;    // 16 ms (3-bit 用例整屏 631µs, 需要更长)
+        #24_000_000;    // 24 ms (3-bit 整屏 631µs; T6q 半屏又加了 4 个整屏)
         fail("watchdog timeout");
         $display("        eg_state=%0d disp_n=%0d frame_count=%0d",
                  eg_state_o, disp_n, frame_count_o);

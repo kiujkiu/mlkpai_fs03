@@ -51,6 +51,7 @@ module panel_engine #(
     input  wire [7:0]  oe_w1,           // 3-bit BCM plane1 沿数 (stub 忽略)
     input  wire [7:0]  oe_w2,           // 3-bit BCM plane2 沿数 (stub 忽略)
     input  wire        bpp_mode,        // 0=1bit 1=3bit BCM      (stub 忽略)
+    input  wire        half_scan,       // 1=96bit/行 半屏扫描    (stub 忽略)
     input  wire        le_plane_mode,   // plane1/2 LE 沿数选择    (stub 忽略)
     input  wire [8:0]  sdi_mask,
     input  wire        oe_set_pulse,

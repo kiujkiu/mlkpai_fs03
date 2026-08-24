@@ -313,7 +313,25 @@
 #define ACLK_HZ            50000000u
 #define SLICE_WRAP_THRESH  8                    /* window half-width */
 #define WIN_DUAL_CENTER    180                  /* second window @ slice 180 */
-#define FLIP_TIMEOUT_MS    2000                 /* engine idle? flip anyway */
+#define FLIP_TIMEOUT_MS    2000                 /* engine idle? flip anyway (默认) */
+/* 🔬 运行时可调 (--flip-timeout): 转子不转时用它模拟"每圈翻一次页"的节奏。
+ * 用途: 圈级 BCM 实验 —— 把位平面摊到连续多圈上显示, 靠视觉暂留合成灰度。
+ * 那种方案的角分辨率不掉(每屏只扫 1 个平面), 代价是闪烁; 而闪烁感必须按
+ * **真实圈时间**才测得准 (15rps => 66.7ms), 2000ms 差了一个量级根本测不出来。 */
+static unsigned g_flip_timeout_ms = FLIP_TIMEOUT_MS;
+
+/* 🔬 圈级 BCM (--ring-bcm): 把 3 个位平面摊到**连续 3 圈**上显示, 靠视觉暂留
+ * 在时间上合成灰度, 而不是在一屏之内做行内 BCM。
+ *   行内 BCM: 每屏扫 3 遍 => 整屏时间 x3 => 角分辨率掉到 1/3
+ *   圈级 BCM: 每屏只扫 1 遍 => **角分辨率不掉**, 代价是闪烁 (转速/3 的频率)
+ * 权重靠逐圈改 oe_window 实现 (184/92/46), 与 host 侧按 MSB->LSB 顺序推的
+ * 三帧一一对应。⚠ 同步全靠"不丢帧": 丢一帧就整体错位, 颜色会乱。
+ * 1-bit 载荷只有 3-bit 的 1/3, 正常不该丢, 但 flip<rx 时结果不可信。 */
+static int      g_ring_bcm = 0;
+static unsigned g_ring_idx = 0;
+static const unsigned RING_OE[3] = { 184u, 92u, 46u };   /* MSB, mid, LSB */
+/* 0x0C sub10 基值: [23:16]=54 行, bit29=0 fast, bit28 overlap, bit27 cfg_we */
+#define CFG_SUB10_BASE  0x98360001u
 #define COMP_LEN_MAX       (PVS_FRAME_RAW_MAX + 0x10000u)
 #define DUAL_PFX_LEN       4u                   /* [u32 LE comp_len_A] (老两流格式) */
 #define MSTR_ENT_LEN       8u                   /* 流表一条 = {u32 comp_len, u32 n_slices} */
@@ -1397,7 +1415,7 @@ static void *flip_thread(void *arg)
                 need_leave = 0;
             if (!need_leave && win >= 0)
                 break;
-            if (mono_ms() - t0 > FLIP_TIMEOUT_MS) {
+            if (mono_ms() - t0 > (long)g_flip_timeout_ms) {
                 /* 🔴 这条以前只说 "engine idle?", 于是现场看到的只有 drop 一路
                  * 飙升, 被当成**网络丢帧**查了很久 (2026-08-04 定案: 电机不转时
                  * slice_idx 恒定, 翻页窗的「先离开再进入」去抖条件永远不成立,
@@ -1407,11 +1425,11 @@ static void *flip_thread(void *arg)
                     logts("WARN: %d ms 内引擎一片都没走 (slice_idx 恒为 %u) —— "
                           "电机停了 / index 脉冲丢了 / 还在 sensor 模式而没上电? "
                           "本次强制翻页。⚠ 这种状态下 drop 会飙到 90%%+, "
-                          "**与网络无关**, 别去查链路", FLIP_TIMEOUT_MS, slice);
+                          "**与网络无关**, 别去查链路", g_flip_timeout_ms, slice);
                 else
                     logts("WARN: no flip window in %d ms (slice=%u, 本轮走了 %lu 片, "
                           "翻页窗判据没命中?), flipping anyway",
-                          FLIP_TIMEOUT_MS, slice, adv);
+                          g_flip_timeout_ms, slice, adv);
                 forced = 1;
                 break;
             }
@@ -1466,6 +1484,11 @@ static void *flip_thread(void *arg)
          * 去扫 3-bit 的数据 (或反过来) —— 放在 0x18 之前, 让"切基址"是最后
          * 一步, 中间态最多持续一个 pair。 */
         bcm_apply((int)g_disp.bpp3);
+        if (g_ring_bcm) {              /* 圈级 BCM: 本圈用哪个位平面的权重 */
+            unsigned oe = RING_OE[g_ring_idx % 3u];
+            reg_wr(REG_CFG_MISC, CFG_SUB10_BASE | (oe << 8));
+            g_ring_idx++;
+        }
         reg_wr(REG_SLICE_BASE, base_a);
         wmb_frame();                       /* ... before + after base update  */
         engine_check_status(base_b != 0, (int)g_disp.fold_a);
@@ -1949,6 +1972,9 @@ int main(int argc, char **argv)
             reg_phys = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--fake") && i + 1 < argc)
             fake_rps = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--ring-bcm")) g_ring_bcm = 1;
+        else if (!strcmp(argv[i], "--flip-timeout") && i + 1 < argc)
+            g_flip_timeout_ms = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fake-slices") && i + 1 < argc) {
             long v = strtol(argv[++i], NULL, 0);
             if (v < 1 || v > 65535) { usage(argv[0]); return 2; }

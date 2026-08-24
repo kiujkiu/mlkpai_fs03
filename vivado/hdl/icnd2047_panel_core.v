@@ -75,6 +75,16 @@ module icnd2047_panel_core (
     input  wire [7:0]   oe_w1,          // 0x0C sub01 [7:0]  plane1 (权重 2) 沿数
     input  wire [7:0]   oe_w2,          // 0x0C sub01 [15:8] plane2 (权重 4) 沿数
     input  wire         bpp_mode,       // 0x0C sub01 [16]: 0=1-bit(旧) 1=3-bit BCM
+    input  wire         half_scan,      // 0x0C sub01 [18] 1=每行只发 96 bit (6 芯片 = 90 行)
+                                        //   Y 180 = 12 芯片 x 15 通道, 每芯片发 16 bit (第 16
+                                        //   个不接 LED) => 一行 192 bit。只发前 96 bit 时,
+                                        //   只有靠数据入口那 6 颗更新, 远端 6 颗保持旧值
+                                        //   (须先整链清零) => 屏高减半, 行周期 195->99 拍,
+                                        //   整屏时间减半 ⇒ **角分辨率翻倍**。
+                                        //   ⚠ oe 上限同时从 111 掉到 18 (那个 111 来自"OE 收完
+                                        //   还要等行驱 80 拍", 与移位窗无关) ⇒ 必须把 row_cfg
+                                        //   的 adv_high 压到 25 (=500ns@50MHz, ICND1028 下限;
+                                        //   2026-08-24 上板双向验证过可用), 上限才回到 57。
     input  wire         le_plane_mode,  // 0x0C sub01 [17]: plane1/2 的 LE 沿数
                                         //   0 = 3 沿 (普通锁存/行不变, datasheet 默认)
                                         //   1 = 与 plane0 同 (4/5 沿) —— 上板逃生门
@@ -193,7 +203,9 @@ module icnd2047_panel_core (
     // 后续 3 (=普通锁存"行不变", 正是 plane 边界要的语义)
     wire [2:0] le_len   = (plane != 2'd0 && !le_plane_mode) ? 3'd3 :
                           ((shift_row == 9'd0) ? 3'd5 : 3'd4);
-    wire [7:0] le_start = 8'd192 - {5'd0, le_len};
+    wire [7:0] sh_last  = half_scan ? 8'd95  : 8'd191;   // 最后一个 bit 的序号
+    wire [7:0] sh_total = half_scan ? 8'd96  : 8'd192;
+    wire [7:0] le_start = sh_total - {5'd0, le_len};
     // 行边界静默区 (0x24[30:25], 拍): LE尾→OE落 与 OE落→下行突发 各插死区,
     // 隔离 OE/LCK 电流阶跃与 CLK 沿 (2026-07-17 行边界串扰案)。0=关=原行为
     wire [5:0] q_gap = row_cfg[30:25];
@@ -416,7 +428,7 @@ module icnd2047_panel_core (
                         fb_raddr <= fb_raddr + 10'd1;
                     if (tick) begin
                         slow_ph <= 1'b0;
-                        if (sh_cnt == 8'd191) begin
+                        if (sh_cnt == sh_last) begin
                             // 192 沿发完 (dclk_r 已回 0), latch1=本行数据
                             sdi_r <= 9'd0;
                             le_r  <= 1'b0;
@@ -475,7 +487,9 @@ module icnd2047_panel_core (
                         // ---- plane 边界 (不是行边界) ----
                         // shift_row 不动 / adv_fired 保持 1 ⇒ P2 不会再发 row_go,
                         // 行驱在 3 个 plane 之间一步都不走; fb_raddr 已被预取推到
-                        // 下一 plane 的基址 (base+6), 原样留着。
+                        // 下一 plane 的基址 (base+6)。全屏时预取已推满 6 次, 原样留着;
+                        // 半屏只走 3 个 pair (96bit), 预取少推 3 次 => 这里补上。
+                        if (half_scan) fb_raddr <= fb_raddr + 10'd3;
                         plane <= plane + 2'd1;
                     end else begin
                         plane     <= 2'd0;

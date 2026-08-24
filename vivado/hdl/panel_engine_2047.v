@@ -45,6 +45,7 @@ module panel_engine #(
     input  wire [7:0]  oe_w1,           // 0x0C sub01 [7:0]  plane1 沿数
     input  wire [7:0]  oe_w2,           // 0x0C sub01 [15:8] plane2 沿数
     input  wire        bpp_mode,        // 0x0C sub01 [16] 0=1bit 1=3bit BCM
+    input  wire        half_scan,       // 0x0C sub01 [18] 1=只发 96bit (屏高减半, 角分辨率翻倍)
     input  wire        le_plane_mode,   // 0x0C sub01 [17] plane1/2 LE: 0=3沿 1=同plane0
     input  wire [8:0]  sdi_mask,
     input  wire        oe_set_pulse,
@@ -88,6 +89,7 @@ module panel_engine #(
         .oe_w1           (oe_w1),
         .oe_w2           (oe_w2),
         .bpp_mode        (bpp_mode),
+        .half_scan       (half_scan),
         .le_plane_mode   (le_plane_mode),
         .ddr_slow        (dclk_fast),            // 位改义: 1=25Mbps 降级
         .oe_set_pulse    (oe_set_pulse && enable),
