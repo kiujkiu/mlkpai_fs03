@@ -95,7 +95,7 @@ SLICE_STRIDE = pack_obs.slice_stride(BPP)             # 0x3000 / 0x9000
 FRAME_RAW = N_SLICES * SLICE_STRIDE                   # 4423680 (传统单面帧长)
 # 🔴 硬上限是**字节数** (板端 staging 缓冲/DDR bank 间距), 不是片数:
 #    1-bit 720 片 × 0x3000 = 3-bit 240 片 × 0x9000 = 8847360B。
-FRAME_RAW_MAX = 0x1500000                             # = PVS_FRAME_RAW_MAX (21 MB)
+FRAME_RAW_MAX = pack_obs.FRAME_RAW_MAX                # 唯一定义在 pack_obs
 # 🔴 2026-08-24 从 8847360 抬到 0xA00000: 半屏扫描后每圈画得出 283 槽, 旧上限
 # 只够 3-bit 240 片。必须与 protocol.h 和 pov_boot.sh 的 povmem size 三处同改
 # (povmem 那个是手写常量, 漏改 = mmap 覆盖不到 bank C 尾部 = 静默越界写)。

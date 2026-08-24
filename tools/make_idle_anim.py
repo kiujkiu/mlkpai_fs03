@@ -42,12 +42,16 @@ import json
 import zlib
 import struct
 import argparse
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pack_obs
 
 # ---- 协议常量 (stream/protocol.h 的镜像; 这里不 import 板端头文件) ----------
 PLANE_STRIDE = 0x3000                       # 一个位平面 = 12288B
 SLICE_STRIDE = PLANE_STRIDE                 # 1-bit 片距
 SLICE_STRIDE_3BIT = 3 * PLANE_STRIDE        # 0x9000 = 36864
-FRAME_RAW_MAX = 8847360                     # = PVS_FRAME_RAW_MAX (一个 DDR bank)
+FRAME_RAW_MAX = pack_obs.FRAME_RAW_MAX      # 唯一定义在 pack_obs, 别在这里抄常量
 N_SLICES_FULL = 360
 N_SLICES_FOLD = 180
 

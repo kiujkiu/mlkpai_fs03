@@ -72,14 +72,17 @@ BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x12000000, 0x1500000
 #   · oe 上限从 111 掉到 **18** (那个 111 来自"OE 收完还要等行驱 80 拍", 与移位窗
 #     无关) ⇒ 必须把 row_cfg 的 adv_high 压到 25 (=500ns@50MHz, ICND1028 下限,
 #     2026-08-24 双向上板验证过), 上限才回到 57
-HALF = 1                                  # ← 半屏开关 (只在 BPP3=1 时有意义)
+# 🔴 默认 0 = 全屏。全屏用满槽数(142)与半屏 142 槽**角分辨率完全一样**(都是 2.54°),
+# 但空间分辨率翻倍(160x180 vs 80x90)、亮度高 65%(占空 0.550 vs 0.333)。
+# 半屏唯一的优势是能到 283 槽(1.27°), 代价是 2x2 的马赛克颗粒 —— 用户实看
+# "颗粒感过了"。除非确实要 1.27°, 否则全屏用满槽数是纯赚。
+HALF = 0                                  # ← 半屏开关 (只在 BPP3=1 时有意义)
 BPP3 = 1                                  # ← 唯一的开关: 1 = 冷启动进 3-bit
 # 槽数: 全屏 3-bit 每圈画得出 143, 半屏 283。双面受 bank 容量钳制 (见末行 assert)
-N_SLICES = (142 if HALF else 100) if BPP3 else 360
+N_SLICES = 142 if BPP3 else 360           # 全屏每圈画得出 143, 半屏 283; 取偶数便于 PHASE_B
 STRIDE   = 0x9000 if BPP3 else 0x3000     # 片距 = 3 个位平面 / 1 个位平面
-DEFAULT_BIN = ('/home/uisrc/helix3b_half.bin' if (BPP3 and HALF)  # 142+142 片 半屏螺旋管
-               else '/home/uisrc/anime_dual3b100.bin' if BPP3    # 100+100 片 全屏
-               else '/home/uisrc/anime_dual720.bin')             # 360+360 片 1-bit
+DEFAULT_BIN = ('/home/uisrc/helix3b.bin' if BPP3          # 142+142 片 3-bit 彩虹螺旋管
+               else '/home/uisrc/anime_dual720.bin')      # 360+360 片 1-bit
 # 🔴 三个权重与 plane 位序是一对, 见上面那段"五样一起改"。plane0=MSB(权重4)。
 # 半屏下 oe 上限只有 57 ⇒ 整组权重按 4:2:1 缩到 **56/28/14** (W=14)。
 # ⚠ 不取 57 吃满上限: 4W=56, 用 57 会让码值4 那一步变 15 沿而其余都是 14,

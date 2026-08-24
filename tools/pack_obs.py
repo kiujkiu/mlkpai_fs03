@@ -42,6 +42,11 @@ LANES, ROWS, WORDS = 9, 54, 6
 SLICE_DATA = LANES * ROWS * WORDS * 4              # 11664 = 一个 plane 的有效数据
 PLANE_STRIDE = 0x3000                              # 12288 = 一个 plane 的步长
 SLICE_STRIDE = PLANE_STRIDE                        # 1-bit 片步长 (兼容老常量)
+# 🔴 帧字节上限 —— **host 侧唯一的定义处**, 其他脚本一律 import 它, 别再抄。
+# 必须与 stream/protocol.h 的 PVS_FRAME_RAW_MAX 和 pov_boot.sh 的 povmem size
+# 一致 (那两处在板端/C 侧, 改动时三处一起改)。2026-08-24 从 8.85MB 抬到 21MB
+# 以支持半屏 283 槽 —— 当天就因为这个常量散落在五个文件里漏改了两次。
+FRAME_RAW_MAX = 0x1500000                          # 22020096 (21 MB)
 SLICE_STRIDE_3BIT = 3 * PLANE_STRIDE               # 36864 = 0x9000
 PLANE_PAD = b'\0' * (PLANE_STRIDE - SLICE_DATA)    # 624B
 BPP_MODES = (1, 3)
