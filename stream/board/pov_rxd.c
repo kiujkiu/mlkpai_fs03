@@ -328,6 +328,14 @@ static unsigned g_flip_timeout_ms = FLIP_TIMEOUT_MS;
  * 三帧一一对应。⚠ 同步全靠"不丢帧": 丢一帧就整体错位, 颜色会乱。
  * 1-bit 载荷只有 3-bit 的 1/3, 正常不该丢, 但 flip<rx 时结果不可信。 */
 static int      g_ring_bcm = 0;
+/* --half-scan: 0x0C sub01 [18]。RTL 每行只发 96 bit ⇒ 屏高 180->90, 整屏
+ * 31590->16038 拍, 每圈画得出的槽数翻倍 (3.6° -> 1.27°)。
+ * ⚠ 必须写在**这个字**里: 本进程每帧重申 sub01, 位不带上就会被当场清掉
+ *   (2026-08-24 踩过: 手动 devmem 开的 half_scan 被下一次翻页抹掉)。
+ * ⚠ 半屏行周期只有 99 拍, oe 上限从 111 掉到 18 ⇒ 必须同时把 row_cfg 的
+ *   adv_high 压到 25 (行驱 80->41 拍) 才能把上限拿回 57, 见 pov_boot.sh。 */
+static int      g_half_scan = 0;
+#define BCM_HALF_SCAN      (1u << 18)
 static unsigned g_ring_idx = 0;
 static const unsigned RING_OE[3] = { 184u, 92u, 46u };   /* MSB, mid, LSB */
 /* 0x0C sub10 基值: [23:16]=54 行, bit29=0 fast, bit28 overlap, bit27 cfg_we */
@@ -588,7 +596,8 @@ static int      g_bcm_rb_hi;     /* 被动探测: 见过 STATUS[17] 跟着我们
 static uint32_t bcm_word(int three_bit)
 {
     return CFG_SUB_BCM | (g_oe_w1 & 0xffu) | ((g_oe_w2 & 0xffu) << 8)
-         | (three_bit ? BCM_BPP_MODE : 0u);
+         | (three_bit ? BCM_BPP_MODE : 0u)
+         | (g_half_scan ? BCM_HALF_SCAN : 0u);
 }
 
 /* 每帧翻页时调 (与 0x18/0x28/0x10 同一个翻页窗内)。three_bit = 本帧色深。 */
@@ -1973,6 +1982,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--fake") && i + 1 < argc)
             fake_rps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--ring-bcm")) g_ring_bcm = 1;
+        else if (!strcmp(argv[i], "--half-scan")) g_half_scan = 1;
         else if (!strcmp(argv[i], "--flip-timeout") && i + 1 < argc)
             g_flip_timeout_ms = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fake-slices") && i + 1 < argc) {
