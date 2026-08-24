@@ -67,7 +67,14 @@
  *                     (仅穿心面 axis_off==0 成立, 发送端必须自检过)
  */
 #define PVS_N_SLICES_MAX 720
-#define PVS_FRAME_RAW_MAX (PVS_N_SLICES_MAX * PVS_SLICE_STRIDE)  /* 8847360 */
+/* 🔴 2026-08-24 半屏扫描 (RTL half_scan) 把整屏拍数砍半 ⇒ 每圈画得出 283 槽,
+ * 而旧上限 720*0x3000 = 8847360 只够 3-bit 240 片。抬到 0xA00000 (10.49 MB):
+ *   3-bit: 0xA00000 / 0x9000 = 291 片  (283 槽单面装得下)
+ *   1-bit: 0xA00000 / 0x3000 = 853 片  (实际仍只用 720, 几何约定没变)
+ * 连带 pov_rxd 的 BANK_BYTES/FRAME_MAP_LEN 自动跟着涨 (它们由本常量推),
+ * ⚠ 但 pov_boot.sh 的 povmem size 是**手写常量**, 必须同步改到 >= 0x29F3000,
+ *   否则 mmap 覆盖不到 bank C 的尾部 —— 那是静默的越界写。 */
+#define PVS_FRAME_RAW_MAX 0xA00000u                              /* 10485760 */
 #define PVS_N_SLICES_FOLD 180              /* 折叠后的面A 片数 (=360 槽时的值) */
 /* 🔴 帧**字节数**上限是硬的 (= 板端一个 DDR bank / staging 缓冲的大小),
  * 片数上限随片距变: 3-bit 一片大 3 倍, 所以片数上限小 3 倍。
@@ -77,7 +84,7 @@
  * 见 05_3bit_bcm.md §4 —— 3-bit 反而比今天在跑的 1-bit 720 片省一半载荷。
  * 要支持 3-bit 720 片 (26.5 MB/帧) 就必须同时加大板端 bank 间距/povmem 窗口,
  * 算式见 pov_rxd.c 文件头的帧区地址表。 */
-#define PVS_N_SLICES_MAX_3BIT (PVS_FRAME_RAW_MAX / PVS_SLICE_STRIDE_3BIT)  /* 240 */
+#define PVS_N_SLICES_MAX_3BIT (PVS_FRAME_RAW_MAX / PVS_SLICE_STRIDE_3BIT)  /* 291 */
 #define PVS_N_SLICES_MAX_F(flags) (((flags) & PVS_FLAG_3BIT) ? \
                                    (uint32_t)PVS_N_SLICES_MAX_3BIT : \
                                    (uint32_t)PVS_N_SLICES_MAX)

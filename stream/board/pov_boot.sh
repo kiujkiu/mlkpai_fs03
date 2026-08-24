@@ -126,7 +126,7 @@ PY
 # 回落到 /dev/mem 的 Strongly-Ordered 映射 (8.85MB 要 74-148ms) = 帧率崩。
 # 3-bit 100 片 (3.52MB/帧) 比 1-bit 720 片还小, 这个窗**不用跟着改**。
 # 显式传参, 不靠模块默认 (.ko 默认只有 0x1900000, 对三缓冲不够)
-/sbin/insmod /home/uisrc/povmem.ko base=0x10000000 size=0x2900000 2>/dev/null
+/sbin/insmod /home/uisrc/povmem.ko base=0x10000000 size=0x2A00000 2>/dev/null
 # pov_rxd 由 povrxd.service 托管 (Restart=always + 开机自启), 本脚本不再自己起 ——
 # 两边都起会抢 9500 端口, 表现为 service 无限重启 (NRestarts 狂涨) + bind 失败。
 # ②USB PHY 复位 (短脉冲) + WiFi

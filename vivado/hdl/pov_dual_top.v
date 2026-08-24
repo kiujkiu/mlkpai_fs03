@@ -688,6 +688,7 @@ module pov_dual_top #(
         .oe_w2         (oe_w2_r),
         .bpp_mode      (bpp3_r),
         .le_plane_mode (le_pl_r),
+        .half_scan     (half_r),
         .sdi_mask      (sdi_mask),
         .oe_set_pulse  (oe_set_pulse),
         .oe_set_val    (oe_set_val),

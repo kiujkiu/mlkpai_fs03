@@ -95,7 +95,10 @@ SLICE_STRIDE = pack_obs.slice_stride(BPP)             # 0x3000 / 0x9000
 FRAME_RAW = N_SLICES * SLICE_STRIDE                   # 4423680 (传统单面帧长)
 # 🔴 硬上限是**字节数** (板端 staging 缓冲/DDR bank 间距), 不是片数:
 #    1-bit 720 片 × 0x3000 = 3-bit 240 片 × 0x9000 = 8847360B。
-FRAME_RAW_MAX = 8847360                               # = PVS_FRAME_RAW_MAX
+FRAME_RAW_MAX = 0xA00000                              # = PVS_FRAME_RAW_MAX (10.49 MB)
+# 🔴 2026-08-24 从 8847360 抬到 0xA00000: 半屏扫描后每圈画得出 283 槽, 旧上限
+# 只够 3-bit 240 片。必须与 protocol.h 和 pov_boot.sh 的 povmem size 三处同改
+# (povmem 那个是手写常量, 漏改 = mmap 覆盖不到 bank C 尾部 = 静默越界写)。
 N_SLICES_MAX = FRAME_RAW_MAX // SLICE_STRIDE          # 1-bit 720 / 3-bit 240
 N_SLICES_FOLD = 180                                   # --fold-a 折叠后的面A 片数
 
@@ -536,6 +539,31 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
 
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
 
+HALF_SCREEN = False      # --half-screen: 内容压到 Y 90..179 (配 RTL 的 half_scan)
+
+
+def _to_half_screen(q):
+    """把整屏码值图 (180,160,3) 压成下半屏: 相邻两行取平均 -> 90 行, 放进 Y 90..179。
+
+    为什么是"下半": pack_obs 的 Y 映射 `_Y_H = 11 - Y//15`, 即 Y=179 落在芯片 0
+    (移位链数据入口端)。RTL 的 half_scan 每行只发 96 bit, 更新的正是靠入口那 6 颗
+    = 芯片 0..5 = Y 90..179。远端 6 颗拿到的是**上一个扫描行**被推过去的数据,
+    所以上半屏会出现一份几乎相同的拷贝 (只差一个扫描行) —— 这是 192bit 移位链的
+    固有行为, 芯片没有短链配置可以消除它 (datasheet REG1/REG2 只有电流增益/白平衡/
+    消影/开路检测)。**用法是只看其中一半, 另一半的拷贝不管。**
+
+    换来的是整屏 31590 -> 16038 拍, 槽数翻倍 (3.6° -> 1.8°)。
+    """
+    # 🔴 取 max 不取平均: 立方体/人物这类**表面**内容在垂直方向是稀疏的
+    # (一行亮一行黑), 取平均等于把亮线和黑底混在一起 —— 实测点亮处平均码值
+    # 从 2.43 腰斩到 1.40、码值7 占比 17.7%->6.3%, 屏上直接暗一倍。
+    # max 丢的是"两行都有内容时的细节", 对表面渲染远比腰斩亮度划算。
+    half = np.maximum(q[0::2], q[1::2])
+    out = np.zeros_like(q)
+    out[q.shape[0] // 2:] = half
+    return out
+
+
 def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
                         freeze_phase=False, axis_off=0.0, mirror_u=True, gain=None,
                         n_out=N_SLICES, led_gamma=gas.LED_GAMMA):
@@ -583,6 +611,8 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
                 q = gas.to_1bit(img, thresh, dither, phase)
             else:
                 q = gas.to_3bit(img, thresh, dither, phase, gamma=led_gamma)
+            if HALF_SCREEN:
+                q = _to_half_screen(q)
             parts.append(pack_obs.pack_slice(q, bpp=BPP, pad=True))
     return b''.join(parts)
 
@@ -1691,6 +1721,8 @@ def cmd_bench(args):
 def add_render_opts(ap):
     ap.add_argument('--anim', choices=sorted(ANIMS), default='spinpulse')
     ap.add_argument('--frames', type=int, default=36, help='动画帧数 (=循环周期)')
+    ap.add_argument('--half-screen', action='store_true',
+                    help='内容压到下半屏 Y90..179, 配 RTL half_scan (整屏拍数减半, 槽数翻倍)')
     ap.add_argument('--cube-grid', type=int, default=340,
                     help='rgbcube 每面采样网格边长 (6 面共 6*n^2 点)')
     ap.add_argument('--render-slices', type=int, default=0,
@@ -1877,6 +1909,12 @@ def main():
         print(f'[bpp] 每通道 {bpp} bit: 片距 0x{SLICE_STRIDE:X}, 片数上限 '
               f'{N_SLICES_MAX}, 帧头置 PVS_FLAG_3BIT(0x{FLAG_3BIT:04x}), '
               f'--led-gamma {getattr(args, "led_gamma", gas.LED_GAMMA)}', flush=True)
+    if getattr(args, 'half_screen', False):
+        global HALF_SCREEN
+        HALF_SCREEN = True
+        print('[half] 内容压到下半屏 Y90..179 (相邻两行取 max); 需配 RTL half_scan '
+              '(0x0C sub01 [18]) —— 整屏 31590->16038 拍, 槽数可翻倍。'
+              '⚠ 上半屏会出现一份差一个扫描行的拷贝, 移位链固有, 只看下半屏。', flush=True)
     ns = getattr(args, 'n_slices', None)
     if ns is not None:
         if not 1 <= ns <= N_SLICES_MAX:
