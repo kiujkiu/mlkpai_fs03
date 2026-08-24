@@ -206,6 +206,44 @@ def build_full():
     return np.full((H, W, 3), LEVELS - 1, np.uint8)
 
 
+
+def build_rgb3():
+    """一张图同时显示 R/G/B 三条渐变: 屏高分 3 条大色带, 每条沿 X 走 8 级。
+
+    比 grid64 直观 —— 不用在 8 行里找哪行是纯色, 三条色带一眼平行对比:
+      · 每条各自单调吗 (三个通道独立成阶)
+      · 三条的级数看起来一致吗 (通道间增益是否一致)
+      · 同一列上三条的亮度关系 (白平衡)
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    band = H // 3
+    for bi, ch in enumerate((0, 1, 2)):            # 上=R 中=G 下=B
+        y0 = bi * band
+        y1 = H if bi == 2 else (bi + 1) * band
+        for cx in range(8):
+            code[y0:y1, cx * (W // 8):(cx + 1) * (W // 8), ch] = cx
+    return code
+
+
+
+def build_ab():
+    """受控对比: 上半屏白色 8 级 / 下半屏红色 8 级, 同一张图同一组码值。
+
+    用来回答一个具体问题: "单通道(只有一个颜色亮)时还有没有 8 级?"
+      · 上下都是 8 级 => 单通道没问题, 之前判读受了干扰
+      · 上半 8 级 / 下半只有亮和不亮 => 单通道特有问题, 往 lane/plane 映射查
+    白色三通道同时亮, 低码值端的绝对亮度是单通道的 3 倍, 所以低端更容易看见 ——
+    这本身也是一个可能的解释, 对比图能把它和"真的只有二值"分开。
+    """
+    code = np.zeros((H, W, 3), np.uint8)
+    half = H // 2
+    for cx in range(8):
+        x0, x1 = cx * (W // 8), (cx + 1) * (W // 8)
+        code[:half, x0:x1, :] = cx          # 上: 白 (R=G=B)
+        code[half:, x0:x1, 0] = cx          # 下: 纯红
+    return code
+
+
 def build_codes(pattern):
     """→ (H,W,3) uint8 码值图 0..7。"""
     code = np.zeros((H, W, 3), np.uint8)
@@ -216,6 +254,10 @@ def build_codes(pattern):
             for c in range(3):
                 if mask[c]:
                     code[:, x0:x1, c] = lvl[:, None]
+    elif pattern == 'ab':
+        return build_ab()
+    elif pattern == 'rgb3':
+        return build_rgb3()
     elif pattern == 'levels':
         return build_levels()
     elif pattern == 'full':
@@ -288,7 +330,7 @@ def save_png(code, path, gamma):
 def main():
     ap = argparse.ArgumentParser(description='8 级灰度楔测试图 (3-bit 上板目视)')
     ap.add_argument('--bpp', type=int, choices=sorted(pack_obs.BPP_MODES), default=3)
-    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'levels', 'full', 'bw', 'rings', 'ramp'], default='flat')
+    ap.add_argument('--pattern', choices=['flat', 'checker', 'grid64', 'rgb3', 'ab', 'levels', 'full', 'bw', 'rings', 'ramp'], default='flat')
     ap.add_argument("--n-slices", type=int, default=50,
                     help='帧里的片数 (默认 60 = 3-bit 方案推荐的每面槽数)')
     ap.add_argument('--gamma', type=float, default=DEFAULT_GAMMA,

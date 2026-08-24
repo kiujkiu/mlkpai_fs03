@@ -1361,7 +1361,10 @@ class Streamer:
     # -- 内部: 每收到一个 ACK 记一帧 (5s 滑窗: 页率/码率/链路占用/delta 压缩比) --
     # ⚠ ACK 回收有两条路径 (窗口满时的 recv 和收尾/切换时的 _drain_inflight),
     #   累计计数放这里, 两条路都算得到 (window>1 时最后 window-1 帧走 drain)。
-    def _stat_frame(self, is_delta, wire, raw_len=FRAME_RAW):
+    # raw_len 必须由调用方给 (两处都给了): 默认值会在 import 时就把 FRAME_RAW
+    # 冻成 1-bit 360 片的 4423680, --bpp 3 / --n-slices 之后再取就是错的,
+    # 而它只影响统计行 —— 悄悄报一个假的 raw 字节数/压缩比, 没人会发现。
+    def _stat_frame(self, is_delta, wire, raw_len):
         if is_delta:
             self.delta_frames += 1
         now = time.time()
@@ -1499,6 +1502,50 @@ def bpp_from_dir(d, cli_bpp):
     return bpp
 
 
+# meta 的 n_slices 是**各面之和**, 反解回"单面整圈槽数" N_SLICES 的比例
+# (= expected_n_slices 的逆): 总数 = N × num/den。
+_SLOT_RATIO = {0: (1, 1),                                   # 单面整圈   → N
+               FLAG_FOLD_A: (1, 2),                         # 单面折叠   → N/2
+               FLAG_DUAL_FACE: (2, 1),                      # 双面整圈   → 2N
+               FLAG_DUAL_FACE | FLAG_FOLD_A: (3, 2)}        # 双面+折叠  → 1.5N
+
+
+def slots_from_dir(d, cli_ns, geom_flags):
+    """预渲染目录 → 一圈槽数, 落回模块全局 N_SLICES (与 bpp_from_dir 同理:
+    数据已经渲好了, **目录说了算**, 命令行 --n-slices 只是老目录的兜底)。
+
+    🔴 2026-08-20 修: 以前 --dir 只从 meta 取 bpp 和几何 flags, 槽数还是拿命令行
+    的默认 360, 于是任何 --n-slices != 360 渲出来的目录都推不出去:
+      · 轻的 (单面): check_layout 直接判 "n_slices=50 与 flags 不自洽, 板端要求
+        360 片" 退出 —— 明明目录自己写着 n_slices=50;
+      · 重的 (DUAL_FACE): face_split_bytes / stream_plan 仍按 N_SLICES=360 定
+        面A 的字节数, 拆流点整体错位。长度还是对的, 板端两个核照收不误,
+        解出来却是错的 —— 这种错没有任何一层会报出来。
+    老目录 (meta 里没有 n_slices, 或压根没有 meta.json) → 沿用命令行值,
+    逐字节兼容; 360 片的老目录也走同一条路径, 反解回来就是 360。"""
+    try:
+        with open(os.path.join(d, 'meta.json')) as f:
+            total = json.load(f).get('n_slices')
+        total = None if total is None else int(total)
+    except (OSError, ValueError, TypeError):
+        total = None
+    if total is None:
+        _apply_slot_count(cli_ns)
+        return cli_ns
+    num, den = _SLOT_RATIO[geom_flags & FLAG_GEOM]
+    ns = total * den // num
+    if not 1 <= ns <= N_SLICES_MAX or ns * num != total * den:
+        sys.exit(f'{d}/meta.json: n_slices={total} 与几何 flags='
+                 f'0x{geom_flags & FLAG_GEOM:04x} 反解不出合法的单面槽数 '
+                 f'(总数须是单面槽数的 {num}/{den} 倍, 且单面槽数 ∈ '
+                 f'1..{N_SLICES_MAX})')
+    if ns != cli_ns:
+        print(f'[meta] {d}: 一圈 {ns} 槽 (命令行给的是 {cli_ns}) — 以目录为准, '
+              f'帧共 {total} 片 × 0x{SLICE_STRIDE:X}', flush=True)
+    _apply_slot_count(ns)
+    return ns
+
+
 def cmd_stream(args):
     if args.delta and args.codec not in DELTA_CODECS:
         sys.exit(f'--delta 需要 --codec {"/".join(DELTA_CODECS)} '
@@ -1507,6 +1554,8 @@ def cmd_stream(args):
     if args.dir:
         bpp_from_dir(args.dir, args.bpp)          # 片距: 目录 meta 说了算
         geom_flags = geom_flags_from_dir(args.dir) | bpp_flag()
+        # 槽数也一样以目录为准 (要排在 bpp 之后: N_SLICES_MAX 随片距变)
+        slots_from_dir(args.dir, args.n_slices, geom_flags)
         if args.dual_face or args.fold_a:
             print('[net] ⚠ --dir 模式下 --dual-face/--fold-a 不生效, '
                   '几何以目录 meta.json 为准 (帧数据已经渲好了)', flush=True)
