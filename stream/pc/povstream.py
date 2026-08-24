@@ -95,7 +95,7 @@ SLICE_STRIDE = pack_obs.slice_stride(BPP)             # 0x3000 / 0x9000
 FRAME_RAW = N_SLICES * SLICE_STRIDE                   # 4423680 (传统单面帧长)
 # 🔴 硬上限是**字节数** (板端 staging 缓冲/DDR bank 间距), 不是片数:
 #    1-bit 720 片 × 0x3000 = 3-bit 240 片 × 0x9000 = 8847360B。
-FRAME_RAW_MAX = 0xA00000                              # = PVS_FRAME_RAW_MAX (10.49 MB)
+FRAME_RAW_MAX = 0x1500000                             # = PVS_FRAME_RAW_MAX (21 MB)
 # 🔴 2026-08-24 从 8847360 抬到 0xA00000: 半屏扫描后每圈画得出 283 槽, 旧上限
 # 只够 3-bit 240 片。必须与 protocol.h 和 pov_boot.sh 的 povmem size 三处同改
 # (povmem 那个是手写常量, 漏改 = mmap 覆盖不到 bank C 尾部 = 静默越界写)。
@@ -539,10 +539,11 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
 
 # ================= 帧渲染 (点云 → 4.4MB packed frame) =================
 
+HALF_ASPECT = False      # --half-aspect: 半径方向也压一半, 保持宽高比
 HALF_SCREEN = False      # --half-screen: 内容压到 Y 90..179 (配 RTL 的 half_scan)
 
 
-def _to_half_screen(q):
+def _to_half_screen(q, aspect=False):
     """把整屏码值图 (180,160,3) 压成下半屏: 相邻两行取平均 -> 90 行, 放进 Y 90..179。
 
     为什么是"下半": pack_obs 的 Y 映射 `_Y_H = 11 - Y//15`, 即 Y=179 落在芯片 0
@@ -558,9 +559,17 @@ def _to_half_screen(q):
     # (一行亮一行黑), 取平均等于把亮线和黑底混在一起 —— 实测点亮处平均码值
     # 从 2.43 腰斩到 1.40、码值7 占比 17.7%->6.3%, 屏上直接暗一倍。
     # max 丢的是"两行都有内容时的细节", 对表面渲染远比腰斩亮度划算。
-    half = np.maximum(q[0::2], q[1::2])
+    half = np.maximum(q[0::2], q[1::2])          # 180 -> 90 行
     out = np.zeros_like(q)
-    out[q.shape[0] // 2:] = half
+    if aspect:
+        # 等比例: 半径方向也压一半并居中。半屏只压高度不压半径 ⇒ 立体像必然扁
+        # (倾斜 30° 的圆柱视在倾角会变成 16°)。把 X 也压一半, 物体只占屏中间
+        # 一半宽度, 但**宽高比恢复正确** —— 代价是立体像整体小一号。
+        hw = np.maximum(half[:, 0::2], half[:, 1::2])    # 160 -> 80 列
+        x0 = (q.shape[1] - hw.shape[1]) // 2
+        out[q.shape[0] // 2:, x0:x0 + hw.shape[1]] = hw
+    else:
+        out[q.shape[0] // 2:] = half
     return out
 
 
@@ -612,7 +621,7 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
             else:
                 q = gas.to_3bit(img, thresh, dither, phase, gamma=led_gamma)
             if HALF_SCREEN:
-                q = _to_half_screen(q)
+                q = _to_half_screen(q, HALF_ASPECT)
             parts.append(pack_obs.pack_slice(q, bpp=BPP, pad=True))
     return b''.join(parts)
 
@@ -1064,7 +1073,79 @@ def rgbcyl_frames(args):
         yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
 
 
-ANIMS = {'rgbcyl': rgbcyl_frames, 'rgbcube': rgbcube_frames, 'spinpulse': spinpulse_frames, 'globe': globe_frames,
+
+def _hsv_ring(h):
+    """色相 h∈[0,1) → RGB (S=V=1), 逐元素。红→黄→绿→青→蓝→品红→红。"""
+    h6 = (np.asarray(h, np.float32) % 1.0) * 6.0
+    i = np.floor(h6).astype(np.int32) % 6
+    f = h6 - np.floor(h6)
+    zeros, ones = np.zeros_like(f), np.ones_like(f)
+    r = np.select([i == 0, i == 1, i == 2, i == 3, i == 4, i == 5],
+                  [ones, 1 - f, zeros, zeros, f, ones])
+    g = np.select([i == 0, i == 1, i == 2, i == 3, i == 4, i == 5],
+                  [f, ones, ones, 1 - f, zeros, zeros])
+    b = np.select([i == 0, i == 1, i == 2, i == 3, i == 4, i == 5],
+                  [zeros, zeros, f, ones, ones, 1 - f])
+    return np.stack([r, g, b], axis=-1)
+
+
+def rgbhelix_frames(args):
+    """螺旋管 (蛇形绕竖轴盘旋), 颜色沿路径渐变, **中心留空**。
+
+    为什么中心要留空: POV 的每个切片都是过旋转轴的平面, 所有角度的切片在轴
+    附近**全部重叠** —— 靠近中心的体素会被几百个不同角度反复写, 必然糊成一团,
+    而且那里的角分辨率天然过采样(同样角度间隔, 半径越小弧长越短), 画了也白画。
+    螺旋管把内容全部放在 helix_r 这个半径上, 正好避开这块区域。
+
+    蛇形还有个好处: 它在每个角度的截面都不同(不像竖直圆柱是旋转对称的),
+    转起来能看出角分辨率够不够 —— 不够的话螺旋的边缘会出现棱和台阶。
+    """
+    turns = max(1.0, float(args.helix_turns))
+    R = gas.R_BUDGET * args.helix_r          # 螺旋中心线半径 (避开轴)
+    tr = gas.R_BUDGET * args.tube_r          # 管半径
+    hh = gas.H_BUDGET * 0.82
+    n_t = max(200, int(args.cube_grid) * 2)  # 沿路径采样
+    n_c = max(16, int(args.cube_grid) // 8)  # 管截面采样
+    shells = max(1, int(args.cyl_shells))
+    t = np.linspace(0.0, turns * 2 * math.pi, n_t, dtype=np.float32)
+    ct, st_ = np.cos(t), np.sin(t)
+    # 中心线 + 切线 (解析求导)
+    cen = np.stack([R * ct, np.linspace(-hh, hh, n_t, dtype=np.float32), R * st_], axis=-1)
+    dy = 2 * hh / (turns * 2 * math.pi)
+    tan = np.stack([-R * st_, np.full_like(t, dy), R * ct], axis=-1)
+    tan /= np.linalg.norm(tan, axis=1, keepdims=True)
+    # 法平面上的两个正交向量 (用竖直向量做参考构 Frenet 近似)
+    up = np.array([0, 1, 0], np.float32)
+    n1 = np.cross(tan, up); n1 /= np.linalg.norm(n1, axis=1, keepdims=True)
+    n2 = np.cross(tan, n1)
+    ang = np.linspace(0, 2 * math.pi, n_c, endpoint=False, dtype=np.float32)
+    pts, cols = [], []
+    for rr in np.linspace(1.0, 0.15, shells):    # shells=1 => 只有管外壳
+        for a in ang:
+            off = (tr * rr) * (math.cos(a) * n1 + math.sin(a) * n2)
+            pts.append(cen + off)
+            # 颜色: 沿路径走**真 HSV 色相环** (S=V=1), 管截面叠明暗做立体感。
+            # ⚠ 不用三相余弦: 三个 cos 的和不恒定, 某些相位会发白、饱和度不均;
+            #   HSV 每一档都是纯色 (红→黄→绿→青→蓝→品红), 3-bit 只有 8 级/通道,
+            #   饱和色才撑得住。
+            hue = (t / (2 * math.pi * turns)) % 1.0        # 沿整条路径走满一圈色相
+            lv = 0.45 + 0.55 * (0.5 + 0.5 * math.cos(a))
+            c = _hsv_ring(hue)
+            cols.append((c * lv * 255.0).clip(0, 255).astype(np.uint8))
+    p0 = np.concatenate(pts, axis=0).astype(np.float32)
+    col = np.concatenate(cols, axis=0)
+    n = args.frames
+    for k in range(n):
+        th = 2 * math.pi * k / n
+        c, sn = math.cos(th), math.sin(th)
+        p = np.empty_like(p0)
+        p[:, 0] = p0[:, 0] * c + p0[:, 2] * sn
+        p[:, 1] = p0[:, 1]
+        p[:, 2] = -p0[:, 0] * sn + p0[:, 2] * c
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
+
+
+ANIMS = {'rgbhelix': rgbhelix_frames, 'rgbcyl': rgbcyl_frames, 'rgbcube': rgbcube_frames, 'spinpulse': spinpulse_frames, 'globe': globe_frames,
          'glbseq': glbseq_frames, 'glbanim': glbanim_frames,
          'spin': spin_frames, 'palace': palace_frames,
          'notredame': notredame_frames}
@@ -1791,8 +1872,14 @@ def cmd_bench(args):
 def add_render_opts(ap):
     ap.add_argument('--anim', choices=sorted(ANIMS), default='spinpulse')
     ap.add_argument('--frames', type=int, default=36, help='动画帧数 (=循环周期)')
+    ap.add_argument('--half-aspect', action='store_true',
+                    help='配 --half-screen: 半径方向也压一半保持宽高比 (物体小一号但不变形)')
     ap.add_argument('--half-screen', action='store_true',
                     help='内容压到下半屏 Y90..179, 配 RTL half_scan (整屏拍数减半, 槽数翻倍)')
+    ap.add_argument('--helix-turns', type=float, default=2.5, help='rgbhelix 螺旋圈数')
+    ap.add_argument('--helix-r', type=float, default=0.55,
+                    help='rgbhelix 螺旋中心线半径 (占 R_BUDGET); 大 => 中心留空更多')
+    ap.add_argument('--tube-r', type=float, default=0.13, help='rgbhelix 管半径')
     ap.add_argument('--cyl-radius', type=float, default=0.46,
                     help='rgbcyl 半径 (占 R_BUDGET 的比例); --half-screen 下用 0.23 才不变形')
     ap.add_argument('--cyl-shells', type=int, default=10,
@@ -1986,8 +2073,9 @@ def main():
               f'{N_SLICES_MAX}, 帧头置 PVS_FLAG_3BIT(0x{FLAG_3BIT:04x}), '
               f'--led-gamma {getattr(args, "led_gamma", gas.LED_GAMMA)}', flush=True)
     if getattr(args, 'half_screen', False):
-        global HALF_SCREEN
+        global HALF_SCREEN, HALF_ASPECT
         HALF_SCREEN = True
+        HALF_ASPECT = bool(getattr(args, 'half_aspect', False))
         print('[half] 内容压到下半屏 Y90..179 (相邻两行取 max); 需配 RTL half_scan '
               '(0x0C sub01 [18]) —— 整屏 31590->16038 拍, 槽数可翻倍。'
               '⚠ 上半屏会出现一份差一个扫描行的拷贝, 移位链固有, 只看下半屏。', flush=True)

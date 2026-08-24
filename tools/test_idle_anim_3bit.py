@@ -474,8 +474,40 @@ def test_boot_cross(tmp):
     m = re.search(r'#define OE_W1_DEFAULT\s+(\d+)u', rxd)
     m2 = re.search(r'#define OE_W2_DEFAULT\s+(\d+)u', rxd)
     m3 = re.search(r'#define OE_W0_3BIT_HINT\s+(\d+)u', rxd)
-    b = re.search(r'^OE_W1, OE_W2 = (\d+), (\d+)', sh, re.M)
-    b0 = re.search(r'^OE_W0 = (\d+) if BPP3', sh, re.M)
+    # pov_boot.sh 的权重行现在是条件表达式 (全屏 92/46 / 半屏 28/14), 正则不够用,
+    # 直接把配置段抠出来执行 —— 也顺带验它本身语法没写坏。
+    cfg = {'BANK_BYTES': 0x1500000}
+    for ln in sh.split('\n'):
+        mm = re.match(r'^(HALF|BPP3|N_SLICES|STRIDE|OE_W0|OE_W1, OE_W2|ADV_HIGH)\s*=\s*(.+?)(?:\s+#.*)?$', ln)
+        if not mm:
+            continue
+        try:
+            val = eval(mm.group(2), {}, cfg)
+        except Exception:
+            continue
+        if mm.group(1) == 'OE_W1, OE_W2':
+            cfg['OE_W1'], cfg['OE_W2'] = val
+        else:
+            cfg[mm.group(1)] = val
+    half = bool(cfg.get('HALF')) and bool(cfg.get('BPP3'))
+    b = type('X', (), {'group': lambda self, i: str((cfg['OE_W1'], cfg['OE_W2'])[i - 1])})()
+    b0 = type('X', (), {'group': lambda self, i: str(cfg['OE_W0'])})()
+    # 🔴 半屏时权重由 systemd drop-in 传给 pov_rxd (它每帧重申 sub01 会冲掉
+    # pov_boot.sh 设的值), 所以对账对象换成 drop-in 而不是 pov_rxd.c 的默认值。
+    if half:
+        dropin = os.path.join(BOARD_DIR, 'systemd', 'povrxd.service.d-half.conf')
+        check(os.path.exists(dropin),
+              '半屏模式必须有 systemd drop-in (否则 pov_rxd 会把半屏权重冲掉)', dropin)
+        if os.path.exists(dropin):
+            dd = open(dropin, encoding='utf-8').read()
+            mo = re.search(r'--oe-w\s+(\d+),(\d+)', dd)
+            check(mo and (int(mo.group(1)), int(mo.group(2))) == (cfg['OE_W1'], cfg['OE_W2']),
+                  'drop-in 的 --oe-w == pov_boot.sh 的 OE_W1/OE_W2',
+                  f"dropin={mo.groups() if mo else None} boot=({cfg['OE_W1']},{cfg['OE_W2']})")
+            check('--half-scan' in dd, 'drop-in 必须带 --half-scan (HALF=1 时)')
+        m = m2 = m3 = None      # 半屏不与 pov_rxd.c 的默认值对账
+    if m is None:
+        return
     check(m and b and (int(m.group(1)), int(m2.group(1))) == (int(b.group(1)), int(b.group(2))),
           'pov_boot.sh 的 oe_w1/oe_w2 == pov_rxd.c 的 OE_W*_DEFAULT',
           f'boot=({b.group(1)},{b.group(2)}) rxd=({m.group(1)},{m2.group(1)})')

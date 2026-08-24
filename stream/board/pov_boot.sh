@@ -12,7 +12,9 @@ def pw(off, v): p[off:off+4] = v.to_bytes(4,'little')
 # 帧区地址表 v3.1 (权威表见 stream/board/pov_rxd.c 文件头): bank 间距 16 MB,
 # 每 bank 实际用 0x870000 (720 片双面帧的最大尺寸)。老的 5 MB 间距/0x438000
 # 已作废——按老值清零会清到 bank A 自己身上, 而 bank B 留着上电垃圾。
-BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x11000000, 0x870000
+# 🔴 BANK_STRIDE 2026-08-24 从 16MB 抬到 32MB (3-bit 双面 282 槽 = 20.8MB/帧),
+# BANK_BYTES 跟着 PVS_FRAME_RAW_MAX 抬到 21MB。povmem size 见文末 insmod。
+BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x12000000, 0x1500000
 
 # ==== v3.4 3-bit 色深 (docs/design_icnd2047/05_3bit_bcm.md) ==================
 # 🔴 **冷启动默认仍然是 1-bit** —— BPP3=0 时下面每一个写出去的值都与改这段之前
@@ -60,15 +62,33 @@ BANK_A, BANK_B, BANK_BYTES = 0x10000000, 0x11000000, 0x870000
 #      MSB, 权重 184/92/46 (精确 4:2:1)。实测占空比 0.550 vs 1-bit 的 0.569
 #      = 96.7%, 亮度几乎无损, 且 frame_period 一拍不涨。
 #      (反过来 LSB-first 的话 4W 落在受限的 plane2 上, W<=27, 占空比只剩 0.32)
-BPP3 = 0                                  # ← 唯一的开关: 1 = 冷启动进 3-bit
-N_SLICES = 50 if BPP3 else 360            # 引擎每圈片数 (每面); 见上面第 2 条
+# ==== v3.5 half_scan 半屏扫描 (0x0C sub01 [18]) ==============================
+# 每行只发 96bit (6 芯片) 而不是 192bit ⇒ 行周期 195→99, 整屏 31590→16038 拍,
+# 每圈画得出的槽数**翻倍** (3.6°→1.28°)。代价三条, 都是真的:
+#   · 屏高只用一半 (180→90 行), 内容要由 host 压过去 (povstream --half-screen)
+#   · 上半屏必然出现一份差一个扫描行的**拷贝** —— 192bit 移位链发一半就必然把
+#     旧数据推到远端; datasheet 的 REG1/REG2 只有电流增益/白平衡/消影/开路检测,
+#     **没有级联深度配置**, 配不出短链。用法是只看其中一半
+#   · oe 上限从 111 掉到 **18** (那个 111 来自"OE 收完还要等行驱 80 拍", 与移位窗
+#     无关) ⇒ 必须把 row_cfg 的 adv_high 压到 25 (=500ns@50MHz, ICND1028 下限,
+#     2026-08-24 双向上板验证过), 上限才回到 57
+HALF = 1                                  # ← 半屏开关 (只在 BPP3=1 时有意义)
+BPP3 = 1                                  # ← 唯一的开关: 1 = 冷启动进 3-bit
+# 槽数: 全屏 3-bit 每圈画得出 143, 半屏 283。双面受 bank 容量钳制 (见末行 assert)
+N_SLICES = (142 if HALF else 100) if BPP3 else 360
 STRIDE   = 0x9000 if BPP3 else 0x3000     # 片距 = 3 个位平面 / 1 个位平面
-DEFAULT_BIN = ('/home/uisrc/anime_dual3b100.bin' if BPP3      # 50+50 片 3-bit
-               else '/home/uisrc/anime_dual720.bin')          # 360+360 片 1-bit
+DEFAULT_BIN = ('/home/uisrc/helix3b_half.bin' if (BPP3 and HALF)  # 142+142 片 半屏螺旋管
+               else '/home/uisrc/anime_dual3b100.bin' if BPP3    # 100+100 片 全屏
+               else '/home/uisrc/anime_dual720.bin')             # 360+360 片 1-bit
 # 🔴 三个权重与 plane 位序是一对, 见上面那段"五样一起改"。plane0=MSB(权重4)。
-OE_W0 = 184 if BPP3 else 111              # plane0 = MSB, 走 0x0C **sub10** 的 oe_window
-OE_W1, OE_W2 = 92, 46                     # plane1(权重2) / plane2 = LSB(权重1), 走 sub01
-assert not BPP3 or (OE_W0, OE_W1, OE_W2) == (4*46, 2*46, 46), '权重必须是 4:2:1'
+# 半屏下 oe 上限只有 57 ⇒ 整组权重按 4:2:1 缩到 **56/28/14** (W=14)。
+# ⚠ 不取 57 吃满上限: 4W=56, 用 57 会让码值4 那一步变 15 沿而其余都是 14,
+#   灰阶就不是严格线性了 (偏亮 1.8%)。精确比例比多那 1 沿重要。
+OE_W0 = (56 if HALF else 184) if BPP3 else 111   # plane0 = MSB, 走 0x0C **sub10**
+OE_W1, OE_W2 = (28, 14) if (BPP3 and HALF) else (92, 46)
+ADV_HIGH = 25 if (BPP3 and HALF) else 0   # row_cfg[7:0]: 半屏必须压行驱, 0=默认64
+_W = OE_W2
+assert not BPP3 or (OE_W1, OE_W0) == (2*_W, 4*_W), '权重必须精确 4:2:1'
 assert not BPP3 or N_SLICES % 2 == 0, 'PHASE_B = N_SLICES//2 要整除'
 assert 2*N_SLICES*STRIDE <= BANK_BYTES, '双面帧装不进一个 bank'
 # ===========================================================================
@@ -110,13 +130,23 @@ pw(0x10, (N_SLICES << 16) | 0x5)     # sensor 模式 + dual_en(bit2) <- 少了�
 #    上限, plane0 的上限是移位窗 192。见上面第 4 条。
 # BPP3=0 时下面这行算出来正好还是 0x98366F01, 一位都不差。
 CFG_MISC = (0x98366F01 & ~0xFF00) | ((OE_W0 & 0xFF) << 8)
-pw(0x0C, 0x000001FF); pw(0x0C, CFG_MISC); pw(0x0C, 0xC1000003)
+# 🔴 顺序要紧: **改 row_cfg(行驱时序) 必须在引擎停着的时候做**。
+# 2026-08-24 踩过两次: 对着正在跑的引擎写 adv_high, 行驱会卡在中间态,
+# EG_IDLE 永远等不到 !rd_busy ⇒ 引擎再也进不了 FETCH。现象是 auto_en=1 但
+# OE 零边沿、frame_period 冻在残值, 极像"新 bit 坏了"(我差点据此回滚 bitstream)。
+# 复位办法就是 auto_en 关再开 —— 所以这里一律先关、配完再开。
+pw(0x0C, 0xC1000000)                      # auto_en=0: 停引擎
+pw(0x24, ADV_HIGH)                        # row_cfg[7:0]=adv_high (0 = 默认 64 拍)
+pw(0x0C, 0x000001FF); pw(0x0C, CFG_MISC)  # sdi_mask + sub10(rows/oe_w0/fast)
+pw(0x0C, 0xC1000003)                      # auto_en=1 + use_fb: 重新起跑
 # v3.4 0x0C **subcmd=01**: [7:0]=oe_w1 [15:8]=oe_w2 [16]=bpp_mode。
 # 这是 3-bit 的固化点 —— 不写的话重启就回 1-bit (pov_rxd 会在收到第一帧时按帧
 # 重写它, 但那要等到有人推流, 冷启动的默认内容等不到)。
 # ⚠ 老比特流里 subcmd=01 是个未实现的空槽, 写它是无害的空操作, 所以这一行
 #   在 RTL 落地之前也可以照写。
-pw(0x0C, (1 << 30) | (OE_W1 & 0xFF) | ((OE_W2 & 0xFF) << 8) | ((1 if BPP3 else 0) << 16))
+# sub01: [7:0]=oe_w1 [15:8]=oe_w2 [16]=bpp_mode [17]=le_plane_mode [18]=half_scan
+pw(0x0C, (1 << 30) | (OE_W1 & 0xFF) | ((OE_W2 & 0xFF) << 8)
+         | ((1 if BPP3 else 0) << 16) | ((1 if (BPP3 and HALF) else 0) << 18))
 print('bpp_mode', 1 if BPP3 else 0, 'oe_w', OE_W0, OE_W1, OE_W2, 'n_slices', N_SLICES)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
@@ -126,7 +156,7 @@ PY
 # 回落到 /dev/mem 的 Strongly-Ordered 映射 (8.85MB 要 74-148ms) = 帧率崩。
 # 3-bit 100 片 (3.52MB/帧) 比 1-bit 720 片还小, 这个窗**不用跟着改**。
 # 显式传参, 不靠模块默认 (.ko 默认只有 0x1900000, 对三缓冲不够)
-/sbin/insmod /home/uisrc/povmem.ko base=0x10000000 size=0x2A00000 2>/dev/null
+/sbin/insmod /home/uisrc/povmem.ko base=0x10000000 size=0x5800000 2>/dev/null
 # pov_rxd 由 povrxd.service 托管 (Restart=always + 开机自启), 本脚本不再自己起 ——
 # 两边都起会抢 9500 端口, 表现为 service 无限重启 (NRestarts 狂涨) + bind 失败。
 # ②USB PHY 复位 (短脉冲) + WiFi

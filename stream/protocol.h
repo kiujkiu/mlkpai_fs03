@@ -74,7 +74,11 @@
  * 连带 pov_rxd 的 BANK_BYTES/FRAME_MAP_LEN 自动跟着涨 (它们由本常量推),
  * ⚠ 但 pov_boot.sh 的 povmem size 是**手写常量**, 必须同步改到 >= 0x29F3000,
  *   否则 mmap 覆盖不到 bank C 的尾部 —— 那是静默的越界写。 */
-#define PVS_FRAME_RAW_MAX 0xA00000u                              /* 10485760 */
+#define PVS_FRAME_RAW_MAX 0x1500000u                             /* 22020096 (21 MB) */
+/* 🔴 2026-08-24 第二次抬: 半屏每圈画得出 283 槽, 双面 282 槽 = 564 片 x 0x9000
+ * = 20.8 MB。连带板端 BANK_STRIDE 必须从 16MB 抬到 32MB (否则 bank 会踩到下一个
+ * bank 头上), FRAME_MAP_LEN -> 87.9MB, pov_boot.sh 的 povmem size 同步。
+ *   3-bit: 0x1500000 / 0x9000 = 611 片   1-bit: / 0x3000 = 1834 片 */
 #define PVS_N_SLICES_FOLD 180              /* 折叠后的面A 片数 (=360 槽时的值) */
 /* 🔴 帧**字节数**上限是硬的 (= 板端一个 DDR bank / staging 缓冲的大小),
  * 片数上限随片距变: 3-bit 一片大 3 倍, 所以片数上限小 3 倍。

@@ -300,7 +300,7 @@
 #define FRAME_PHYS_DEFAULT 0x10000000u
 #define FRAME_REGION_BASE  0x10000000u          /* mem=256M 让出的保留区 */
 #define FRAME_REGION_END   0x20000000u          /* (半开区间) */
-#define BANK_STRIDE        0x01000000u          /* 16 MiB, bank 间距 */
+#define BANK_STRIDE        0x02000000u          /* 32 MiB, bank 间距 (3-bit 双面 282 槽 = 20.8MB/帧, 16MB 装不下) */
 #define BANK_BYTES         PVS_FRAME_RAW_MAX    /* 0x870000, 页整数倍 */
 #define FRAME_BANKS        3                    /* v3.2: A/B/C 三缓冲翻页 */
 /* 只映射到最后一个 bank 的末尾, 不白占后面的地址空间 = 0x2870000 (40.4 MiB) */

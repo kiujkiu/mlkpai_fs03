@@ -1,0 +1,24 @@
+{
+ "anim": "rgbhelix",
+ "frames": 1,
+ "render_slices": 142,
+ "frame_raw": 10469376,
+ "freeze_phase": false,
+ "bpp": 3,
+ "led_gamma": 2.2,
+ "n_slices": 284,
+ "geom_flags": 136,
+ "faces": [
+  {
+   "name": "A",
+   "axis_off_px": 0.0,
+   "n_slices": 142
+  },
+  {
+   "name": "B",
+   "axis_off_px": 14.2933,
+   "n_slices": 142
+  }
+ ],
+ "generated": "2026-08-24 21:58:14"
+}
