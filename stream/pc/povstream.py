@@ -929,7 +929,42 @@ def notredame_frames(args):
     yield from orbit_frames(p0, col, args)
 
 
-ANIMS = {'spinpulse': spinpulse_frames, 'globe': globe_frames,
+
+def rgbcube_frames(args):
+    """RGB 色立方体: 表面每点的颜色 = 它自己的归一化 (x,y,z)。
+
+    为什么用它验色深: 8 个顶点正好是 黑/红/绿/蓝/黄/品红/青/白, 整个表面是
+    三个通道各自沿一条棱的**平滑渐变**。色阶断层在平滑渐变上最刺眼 ——
+    有几级就会看到几条等色带(Mach band), 数带子就能数出色深, 比色块图直观。
+    立方体还有个好处: 三个可见面朝向不同, 一眼能同时看到三组不同的通道组合。
+
+    绕竖轴(y)匀速自转, --frames 一个整周期, 无缝循环。
+    """
+    a = gas.R_BUDGET * 0.52                      # 半边长; 对角线 a*sqrt3 仍在预算内
+    m = max(8, int(args.cube_grid))              # 每面 m x m 采样
+    g = np.linspace(-1.0, 1.0, m, dtype=np.float32)
+    U, V = np.meshgrid(g, g, indexing='ij')
+    u, v = U.ravel(), V.ravel()
+    one = np.ones_like(u)
+    faces = [                                    # 6 个面: (x, y, z)
+        (one, u, v), (-one, u, v),
+        (u, one, v), (u, -one, v),
+        (u, v, one), (u, v, -one),
+    ]
+    p0 = np.concatenate([np.stack(f, axis=1) for f in faces], axis=0) * a
+    # 颜色 = 归一化坐标 -> 0..255, 三通道各沿一条棱渐变
+    col = (((p0 / a) + 1.0) * 0.5 * 255.0).clip(0, 255).astype(np.uint8)
+    n = args.frames
+    for t in range(n):
+        th = 2 * math.pi * t / n
+        c, sn = math.cos(th), math.sin(th)
+        p = p0.copy()
+        p[:, 0] = p0[:, 0] * c + p0[:, 2] * sn   # 绕 y 轴转
+        p[:, 2] = -p0[:, 0] * sn + p0[:, 2] * c
+        yield gas.voxel_grid(p, col, verbose=False, ssaa=args.ssaa)
+
+
+ANIMS = {'rgbcube': rgbcube_frames, 'spinpulse': spinpulse_frames, 'globe': globe_frames,
          'glbseq': glbseq_frames, 'glbanim': glbanim_frames,
          'spin': spin_frames, 'palace': palace_frames,
          'notredame': notredame_frames}
@@ -1656,6 +1691,8 @@ def cmd_bench(args):
 def add_render_opts(ap):
     ap.add_argument('--anim', choices=sorted(ANIMS), default='spinpulse')
     ap.add_argument('--frames', type=int, default=36, help='动画帧数 (=循环周期)')
+    ap.add_argument('--cube-grid', type=int, default=340,
+                    help='rgbcube 每面采样网格边长 (6 面共 6*n^2 点)')
     ap.add_argument('--render-slices', type=int, default=0,
                     help='实际渲染角度数 (整除槽数, 减少省时, 布局仍是槽数那么多槽); '
                          '0 = 跟 --n-slices 走 (每槽一个真实角度)')
