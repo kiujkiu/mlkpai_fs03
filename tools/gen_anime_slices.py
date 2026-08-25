@@ -346,7 +346,44 @@ LED_GAMMA = 2.2
 CODES_3BIT = 8          # 0..7
 
 
-def to_3bit(img, thresh, dither, phase, gamma=LED_GAMMA, levels=CODES_3BIT):
+def _apply_dark_floor(x, levels=CODES_3BIT):
+    """存在性下限: 把**被几何覆盖**的体素重映射到 [1, levels-1], 真空仍为 0。
+
+    解决的问题 (2026-08-24 实测):
+      抖动是无偏的 (E[code]=x), 但 x<1 时它靠"大部分体素灭、少数点亮"来实现,
+      于是一个面被打成稀疏点阵。洞率 = 1-x = 1-7·v^gamma, gamma=2.2 下
+      **亮度低于 41.3% 的整片区域都在打洞**, v=20% 时 80% 的体素完全不亮。
+      大面积中低亮度的面 (披风、暗色球壳) 会整片碎掉。
+
+    做法 —— 用 **max 通道定标, 其余按比例跟随**:
+        Lmax = max_c(x_c);  覆盖 = Lmax > 0
+        x_max' = 1 + (levels-2)·Lmax/(levels-1)     ⇒ 落在 [1, levels-1]
+        x_c'   = x_max' · (x_c / Lmax)              ⇒ **色比不变 = 色相不变**
+
+    🔴 为什么不逐通道垫底: 深蓝 (0,0,0.4) 若三通道各自抬到 ≥1 就成了 (1,1,3.4),
+    整个暗部会褪色发灰。**存在性是几何属性, 不是颜色属性** —— 该由"这个体素
+    有没有被物体覆盖"决定, 不该由某个通道决定。
+
+    代价: 最暗的物体固定在 1/(levels-1) = 14% 亮度, 不能更暗; 暗部对比度被压缩。
+    换来的是洞率 0 且真空仍然全黑 (硬垫底 max(1,code) 会把暗部压成一片死灰)。
+
+    ⚠ 覆盖判据用 `Lmax > 0` 成立的前提: 当前 render_slice 是**最近邻**取样
+    (np.rint) 且子角度间用 max 混合 ⇒ 没有抗锯齿, 覆盖是干净的二值。
+    **一旦加了抗锯齿, 这里必须改成 coverage > 0.5** —— 否则半覆盖的边缘体素
+    被抬到 14% 会让物体**变胖一圈**, 轮廓发虚。下限与抗锯齿在 8 级色深下
+    是互相打架的, 见 project_pov3d_3bit_dark_voxel_holes 记忆。
+    """
+    top = float(levels - 1)
+    lmax = x.max(axis=2)                       # (H,W) 每个体素的最亮通道
+    cov = lmax > 0.0
+    safe = np.where(cov, lmax, 1.0)            # 防除零; 真空处的值随后被清掉
+    x_new_max = 1.0 + (top - 1.0) * (lmax / top)
+    scaled = x * (x_new_max / safe)[:, :, None]
+    return np.where(cov[:, :, None], scaled, 0.0).astype(np.float32)
+
+
+def to_3bit(img, thresh, dither, phase, gamma=LED_GAMMA, levels=CODES_3BIT,
+            dark_floor=False):
     """float 图 (H,W,3) 0..255 → uint8 码值图 0..7 (pack_obs.pack_slice bpp=3 的输入)。
 
     三步: ① 曝光标度 ② gamma 解码到线性光 ③ 量化 + 残差有序抖动。
@@ -364,9 +401,14 @@ def to_3bit(img, thresh, dither, phase, gamma=LED_GAMMA, levels=CODES_3BIT):
        d 用与 1-bit 同一张 BAYER4, 同一套 `phase` 滚动 ⇒ **逐槽 + 逐帧变相位的
        时域平滑设计原封不动地继承下来** (旋转时空间抖动 → 时间抖动, 眼睛做低通)。
     dither=False 时退化成就近取整 (灰度楔/上板目视 8 阶用, 会看到真实的跳阶)。
+
+    dark_floor=True: **存在性下限** —— 见 _apply_dark_floor。POV 显示专用,
+    默认关 (开了会破坏 E[code]=x 的无偏性, 灰度楔/量化器自测都不该开)。
     """
     v = np.clip(np.asarray(img, np.float32) * (128.0 / float(thresh)) / 255.0, 0.0, 1.0)
     x = (levels - 1) * np.power(v, gamma, dtype=np.float32)
+    if dark_floor:
+        x = _apply_dark_floor(x, levels)
     if not dither:
         return np.clip(np.rint(x), 0, levels - 1).astype(np.uint8)
     d = (BAYER4 + 0.5) / 16.0                       # 0..1, 均值 0.5, 16 个不同值

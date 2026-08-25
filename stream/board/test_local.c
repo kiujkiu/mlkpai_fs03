@@ -171,12 +171,22 @@ static int send_dual(int fd, const uint8_t *raw, uint16_t flags,
     uint32_t raw_len = n_slices * stride;
     uint32_t n_a     = (flags & PVS_FLAG_FOLD_A) ? n_slices / 3u : n_slices / 2u;
     uint32_t la      = n_a * stride, lb = raw_len - la;
-    flags |= PVS_FLAG_DUAL_FACE | PVS_FLAG_ZLIB;
+    flags |= PVS_FLAG_DUAL_FACE;
+    if (!(flags & PVS_FLAG_LZ4)) flags |= PVS_FLAG_ZLIB;
 
+    /* 压缩位跟着 caller 走: 老用例给 0 -> zlib (逐字节不变); 给 PVS_FLAG_LZ4
+     * -> 两条 raw block, 供 v3.5 的 PL 路径用 (PL 只认 lz4)。 */
     uLongf ca = compressBound(la), cb = compressBound(lb);
     uint8_t *pa = scratch, *pb = scratch + ca;
-    if (compress2(pa, &ca, raw, la, 6) != Z_OK ||
-        compress2(pb, &cb, raw + la, lb, 6) != Z_OK) return -1;
+    if (flags & PVS_FLAG_LZ4) {
+        int a = LZ4_compress_HC((const char *)raw, (char *)pa, (int)la,
+                                LZ4_compressBound((int)la), LZ4_HC_LEVEL);
+        int b = LZ4_compress_HC((const char *)raw + la, (char *)pb, (int)lb,
+                                LZ4_compressBound((int)lb), LZ4_HC_LEVEL);
+        if (a <= 0 || b <= 0) { fprintf(stderr, "LZ4_compress_HC dual rc=%d/%d\n", a, b); return -1; }
+        ca = (uLongf)a; cb = (uLongf)b;
+    } else if (compress2(pa, &ca, raw, la, 6) != Z_OK ||
+               compress2(pb, &cb, raw + la, lb, 6) != Z_OK) return -1;
 
     memcpy(h.magic, PVS_MAGIC, 4);
     h.raw_len = raw_len;
@@ -301,6 +311,193 @@ static int expect_nak_close2(int fd, const pvs_hdr_t *h, const void *extra,
 static int expect_nak_close(int fd, const pvs_hdr_t *h, const char *what)
 {
     return expect_nak_close2(fd, h, NULL, 0, what);
+}
+
+
+/* ==== v3.5: --pl-lz4 数据通路 =============================================
+ * x86 上没有 PL, 但 pov_rxd 的 SIM 构建里有一个按 lz4_axi_top.v 行为写的引擎
+ * 模型 (见 pov_rxd.c 的 "SIM: PL lz4 引擎模型")。于是**整条 PL 软件路径**都能
+ * 在这里跑真的: bank 认领与轮转、多引擎动态派活、等 done 的纪律、以及三条
+ * 回退路径 (非 lz4 / DELTA / 引擎坏)。
+ *
+ * 判据比老用例强一档: PL 模式下 --crc 算的是**真正落进 DDR bank 的字节**
+ * (pov_rxd 那边专门为此分了支), 所以 crc 对得上 = PL 把对的数据写到了对的
+ * bank 的对的偏移上 —— 不只是"解码结果对"。
+ */
+#define PL_PORT_BASE 9530
+
+struct plwant { const char *needle; const char *why; };
+
+static int pl_pass(const char *name, int port, int engines, const char *fault,
+                   const struct plwant *want, int nwant, int expect_delta_nak,
+                   int serial)
+{
+    printf("\n=== PL pass: %s (engines=%d fault=%s) ===\n",
+           name, engines, fault ? fault : "none");
+    n_sent = 0; n_pairs = 0;
+
+    int pfd[2];
+    if (pipe(pfd)) { perror("pipe"); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        char ps[16], es[16];
+        snprintf(ps, sizeof ps, "%d", port);
+        snprintf(es, sizeof es, "%d", engines);
+        dup2(pfd[1], 1);
+        close(pfd[0]); close(pfd[1]);
+        const char *argv[16];
+        int a = 0;
+        argv[a++] = "pov_rxd_sim";
+        argv[a++] = "--port";  argv[a++] = ps;
+        argv[a++] = "--fake";  argv[a++] = "20";
+        argv[a++] = "--crc";
+        argv[a++] = "--pl-lz4";
+        argv[a++] = "--pl-engines"; argv[a++] = es;
+        if (serial) argv[a++] = "--no-pipeline";
+        if (fault) { argv[a++] = "--pl-fault"; argv[a++] = fault;
+                     argv[a++] = "--pl-timeout"; argv[a++] = "150"; }
+        argv[a] = NULL;
+        execv("./pov_rxd_sim", (char *const *)argv);
+        perror("execl pov_rxd_sim");
+        _exit(127);
+    }
+    close(pfd[1]);
+
+    int rc = -1, fd = -1;
+    uint8_t *raw  = malloc(PVS_FRAME_RAW_MAX);
+    uint8_t *raw2 = malloc(PVS_FRAME_RAW_MAX);
+    uint8_t *xbuf = malloc(PVS_FRAME_RAW_MAX);
+    uint8_t *scratch = malloc(2 * compressBound(PVS_FRAME_RAW_MAX) + PVS_FRAME_RAW_MAX);
+    if (!raw || !raw2 || !xbuf || !scratch) { perror("malloc"); goto done; }
+
+    fd = connect_retry(port);
+    if (fd < 0) { fprintf(stderr, "FAIL: %s: cannot connect\n", name); goto done; }
+
+    /* 1) 单流 lz4 -> PL, 一个引擎在干活 */
+    gen_frame(raw, 40);
+    if (send_frame(fd, raw, NULL, PVS_FLAG_LZ4, xbuf, scratch) || recv_ack(fd)) goto done;
+    /* 2) MSTREAM 3 条 -> 多引擎动态派活 (2 个引擎吃 3 条流 = 有一条要等) */
+    {
+        static const int s3[] = { 120, 120, 120 };
+        gen_frame(raw, 41);
+        if (send_mstream(fd, raw, NULL, PVS_FLAG_LZ4, s3, 3, xbuf, scratch)
+            || recv_ack(fd)) goto done;
+    }
+    /* 3) DUAL_FACE 两条 lz4 流 -> 两个不同的 bank 偏移 (面拆分由 bankcrc 核对) */
+    gen_frame_n(raw, 42, PVS_FRAME_RAW_MAX);
+    if (send_dual(fd, raw, PVS_FLAG_LZ4, PVS_N_SLICES_MAX, scratch) || recv_ack(fd)) goto done;
+    usleep(300000);                       /* 等 flip 线程把它翻上去 */
+    /* 4) zlib 帧 -> PL 接不了, 必须回退 CPU 且照样正确 (bank 由 RX 自己写) */
+    gen_frame(raw, 43);
+    if (send_frame(fd, raw, NULL, PVS_FLAG_ZLIB, xbuf, scratch) || recv_ack(fd)) goto done;
+    /* 5) 连翻几帧: bank 轮转 A->B->C->A 必须一直对 (crc 全部要能对上) */
+    for (uint32_t seed = 44; seed < 48; seed++) {
+        gen_frame(raw, seed);
+        if (send_frame(fd, raw, NULL, PVS_FLAG_LZ4, xbuf, scratch) || recv_ack(fd)) goto done;
+        usleep(120000);
+    }
+
+    if (expect_delta_nak) {
+        /* 6) DELTA|LZ4: PL 帧不留参考帧 -> 这一帧必须 NAK+关连接, 并且**进程级**
+         *    把 PL 关掉。重连后的 keyframe 走 CPU, 之后 DELTA 链就正常了
+         *    —— 关键是 NAK 只该发生**一次**, 不能变成重连风暴。 */
+        pvs_hdr_t bad;
+        memcpy(bad.magic, PVS_MAGIC, 4);
+        bad.comp_len = 1024; bad.raw_len = PVS_FRAME_RAW;
+        bad.n_slices = PVS_N_SLICES; bad.flags = PVS_FLAG_LZ4 | PVS_FLAG_DELTA;
+        if (expect_nak_close(fd, &bad, "PL 模式下的 DELTA 帧")) goto done;
+        close(fd);
+        fd = connect_retry(port);
+        if (fd < 0) { fprintf(stderr, "FAIL: %s: reconnect\n", name); goto done; }
+        gen_frame(raw, 50);
+        if (send_frame(fd, raw, NULL, PVS_FLAG_LZ4, xbuf, scratch) || recv_ack(fd)) goto done;
+        memcpy(raw2, raw, PVS_FRAME_RAW);
+        gen_frame(raw, 51);
+        if (send_frame(fd, raw, raw2, PVS_FLAG_LZ4 | PVS_FLAG_DELTA, xbuf, scratch)
+            || recv_ack(fd)) goto done;
+        memcpy(raw2, raw, PVS_FRAME_RAW);   /* 参考帧 <- 刚 ACK 的那一帧 (seed 51) */
+        gen_frame(raw, 52);                 /* 再来一个 DELTA: 不能再 NAK 一次 */
+        if (send_frame(fd, raw, raw2, PVS_FLAG_LZ4 | PVS_FLAG_DELTA, xbuf, scratch)
+            || recv_ack(fd)) goto done;
+    }
+    usleep(200000);
+    close(fd); fd = -1;
+
+    kill(pid, SIGINT);
+    {
+        FILE *lf = fdopen(pfd[0], "r");
+        char line[512];
+        uint32_t got[MAX_FRAMES];
+        int n_got = 0, n_flips = 0, bad_faces = 0, guard = 0;
+        int *seen = calloc((size_t)(nwant > 0 ? nwant : 1), sizeof(int));
+        while (fgets(line, sizeof line, lf)) {
+            if (!strstr(line, "SIM: reg[")) fputs(line, stdout);
+            /* 🔴 流水线最危险的不变量: RX 绝不能往正在显示的 bank 里写。
+             * daemon 在 SIM 构建里守着它并打 BANKGUARD FAIL, 这里只要见到
+             * 一次就判失败 —— 这类撕裂在真板上是查不出来的。 */
+            if (strstr(line, "BANKGUARD FAIL")) guard = 1;
+            char *p = strstr(line, "crc=");
+            if (p && strstr(line, "FRAME ") && n_got < MAX_FRAMES)
+                got[n_got++] = (uint32_t)strtoul(p + 4, NULL, 16);
+            if (strstr(line, "FLIP ")) n_flips++;
+            for (int i = 0; i < nwant; i++)
+                if (strstr(line, want[i].needle)) seen[i] = 1;
+            if ((p = strstr(line, "bankcrc")) != NULL) {
+                unsigned la = 0, lb = 0;
+                char *q1 = strstr(p, "len="), *q2 = q1 ? strstr(q1 + 4, "len=") : NULL;
+                if (q1 && q2 && sscanf(q1 + 4, "%u", &la) == 1 &&
+                    sscanf(q2 + 4, "%u", &lb) == 1) {
+                    int ok = 0;
+                    for (int i = 0; i < n_pairs; i++)
+                        if (exp_pair[i][0] == la && exp_pair[i][1] == lb) ok = 1;
+                    if (!ok) {
+                        fprintf(stderr, "FAIL: %s: bank 面拆分 A=%u B=%u 不在期望集合里\n",
+                                name, la, lb);
+                        bad_faces = 1;
+                    }
+                }
+            }
+        }
+        fclose(lf);
+        waitpid(pid, NULL, 0);
+        pid = 0;
+        if (guard) {
+            fprintf(stderr, "FAIL: %s: RX 认领了正在显示的 bank (见 BANKGUARD FAIL)\n", name);
+            free(seen); goto done;
+        }
+        if (bad_faces) { free(seen); goto done; }
+        if (n_got != n_sent) {
+            fprintf(stderr, "FAIL: %s: sent %d frames, daemon logged %d\n",
+                    name, n_sent, n_got);
+            free(seen); goto done;
+        }
+        for (int i = 0; i < n_sent; i++)
+            if (got[i] != sent_crc[i]) {
+                fprintf(stderr, "FAIL: %s: frame %d crc sent=%08x got=%08x "
+                        "(PL 写进 bank 的字节不对?)\n", name, i, sent_crc[i], got[i]);
+                free(seen); goto done;
+            }
+        if (n_flips < 1) {
+            fprintf(stderr, "FAIL: %s: no flip happened\n", name);
+            free(seen); goto done;
+        }
+        for (int i = 0; i < nwant; i++)
+            if (!seen[i]) {
+                fprintf(stderr, "FAIL: %s: 日志里没有 \"%s\" —— %s\n",
+                        name, want[i].needle, want[i].why);
+                free(seen); goto done;
+            }
+        free(seen);
+        printf("test: PL pass %s OK (%d frames, %d flips, crc 全对)\n",
+               name, n_got, n_flips);
+    }
+    rc = 0;
+done:
+    if (fd >= 0) close(fd);
+    if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+    free(raw); free(raw2); free(xbuf); free(scratch);
+    return rc;
 }
 
 int main(void)
@@ -662,6 +859,61 @@ int main(void)
                n_dualflip, n_pairs);
         printf("test: %d frames, all CRCs match (delta rebuilt OK), %d flips\n",
                n_got, n_flips);
+    }
+
+    /* ---- v3.5: --pl-lz4 数据通路 (三趟) --------------------------------- */
+    {
+        static const struct plwant w_ok[] = {
+            { "PL 自检: 引擎0", "开机自检必须真的点名每个引擎跑一遍" },
+            { "PL 自检: 引擎1", "多引擎时每个都要单测, 否则'两个引擎其实是同一个'查不出来" },
+            { "PL lz4 自检通过", "自检结论要落到日志里" },
+            { "PL 回退 CPU: PL 只认 lz4", "zlib 帧必须**响亮地**说明为什么没走 PL" },
+            { "PLDIAG", "PL 的墙钟/B-per-clk 要能在运行中看到" },
+            { "退回 CPU 解码", "DELTA 帧必须当场说清 PL 为什么被关掉" },
+        };
+        static const struct plwant w_err[] = {
+            { "PL 解码失败", "STATUS[1]=error 必须原样打出来" },
+            { "**PL 引擎有问题**", "CPU 解得出来而 PL 解不出 = 引擎的锅, 必须点名" },
+        };
+        /* 🔴 引擎"卡死"是 BD 交付时确认的**安全问题**: 一条流长度不对时引擎
+         * busy 恒 1、不 done 不 error, 而 RTL 没有软复位。所以这两趟守的是:
+         *  (a) 3 个挂 1 个 -> 摘掉它, 剩下 2 个**继续跑**, 不能一路退化;
+         *  (b) 全挂了 -> 永久关 PL, 而且日志要说是"卡死"不是"解码出错"。 */
+        static const struct plwant w_hang1[] = {
+            { "卡死", "必须点名是引擎卡住, 不是解码出错" },
+            { "摘出派发池", "卡死的引擎不摘掉, 下一帧派给它又超时, 会一路退化" },
+            { "PL 降级运行: 还有 2/3", "3 挂 1 必须还剩 2 个在跑, 不是整个关掉" },
+        };
+        static const struct plwant w_hangall[] = {
+            { "全部卡死", "全挂时要明确区分'硬件卡住'和'解码出错'" },
+            { "永久关闭", "全挂了才该关 PL" },
+        };
+        static const struct plwant w_st[] = {
+            { "PL lz4 自检没过", "自检失败必须是一条醒目结论" },
+            { "全部走 CPU 解码", "自检没过就该自动关掉 --pl-lz4, 而不是带病上路" },
+        };
+        static const struct plwant w_ser[] = {
+            { "PL lz4 串行 (--no-pipeline)", "退回开关必须在启动日志里说清楚" },
+            { "pipe=off", "PLDIAG 要能一眼看出跑的是哪种模式" },
+        };
+        if (pl_pass("正常 2 引擎 (流水线)", PL_PORT_BASE, 2, NULL,
+                    w_ok, (int)(sizeof w_ok / sizeof w_ok[0]), 1, 0)) goto out;
+        /* 同一组帧走串行路径: 退回开关必须逐帧结果一致 (crc 全对) */
+        if (pl_pass("正常 2 引擎 (--no-pipeline)", PL_PORT_BASE + 4, 2, NULL,
+                    w_ser, (int)(sizeof w_ser / sizeof w_ser[0]), 1, 1)) goto out;
+        /* 1 个引擎 => 自检只 start 一次 => fault at 2 正好打在第一帧上 */
+        if (pl_pass("引擎报 error", PL_PORT_BASE + 1, 1, "error:2",
+                    w_err, (int)(sizeof w_err / sizeof w_err[0]), 0, 0)) goto out;
+        /* 3 引擎: 自检占掉 start 1..3, 第 4 次 start 落在引擎0 的第一帧上 ->
+         * 只有引擎0 卡死, 1/2 照常 -> 必须降级到 2 个引擎继续跑 */
+        if (pl_pass("3 引擎挂 1 -> 降级继续", PL_PORT_BASE + 5, 3, "hang:4",
+                    w_hang1, (int)(sizeof w_hang1 / sizeof w_hang1[0]), 0, 0)) goto out;
+        /* 1 引擎: 唯一的引擎卡死 = 全挂 -> 永久关 PL */
+        if (pl_pass("引擎全卡死", PL_PORT_BASE + 2, 1, "hang:2",
+                    w_hangall, (int)(sizeof w_hangall / sizeof w_hangall[0]), 0, 0)) goto out;
+        /* fault at 1 => 自检第一次 start 就挂 => 开机就该把 PL 关掉 */
+        if (pl_pass("自检就挂", PL_PORT_BASE + 3, 1, "hang:1",
+                    w_st, (int)(sizeof w_st / sizeof w_st[0]), 0, 0)) goto out;
     }
 
     printf("PASS\n");

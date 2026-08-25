@@ -172,6 +172,102 @@
  *     300-800 MB/s), 不在则回退 /dev/mem (Strongly-Ordered, 60-120 MB/s)。
  *     寄存器页永远走 /dev/mem (寄存器就该 SO)。
  *
+ * ---- v3.5 (--pl-lz4): PL 硬件 lz4 解码器, 一刀砍掉 dec + cpy ---------------
+ * 实测账 (半屏 3-bit 双面 282 槽 = 10.47 MB/帧, 转动实测):
+ *     dec 158 ms + cpy 80 ms = 238 ms/帧  =>  4.2 fps
+ * 而转速给的上限是 22 fps。PL 解码器 (dr1v90/lz4hw/rtl/lz4_axi_top.v) 同时
+ * 消掉这两项:
+ *   dec -> PL 干 (字节串行核, 片上 64 KB 历史窗 = LZ4 的 offset 上限,
+ *          全程不回读 DDR);
+ *   cpy -> **不需要**: 输出是纯顺序流, 所以 DST_ADDR 直接给最终的帧 bank,
+ *          不必先解到 cached staging 再 memcpy 8-21 MB 进 WC。
+ *
+ * 数据通路 (--pl-lz4 打开时):
+ *     收网络包 -> cbuf(cached) -> memcpy 压缩流进 DDR 的 comp 缓冲(WC, 几百 KB)
+ *     -> 每条流启一个 PL 引擎, DST = 帧 bank 里该流的落点 -> 等 STATUS[0]
+ *     -> 发布 bank 号 -> flip 线程只写寄存器 (**一次 memcpy 都没有**)
+ * 关掉时 (默认) 逐字节还是老路径: RX 解到 staging, flip 线程 memcpy + 翻页。
+ *
+ * ---- v3.5b: 收包与解码**必须**流水线 (2026-08-24 链路复核后的定案) --------
+ * 板子只有 WiFi, 而且这是**物理必然** —— Zynq 跟着 LED 屏一起以 11.1 rev/s 转,
+ * 插不了网线 (eth0 carrier=0, 全部流量走 wlx*)。实测收一帧 (~300 KB) 55-80 ms
+ * = 30-44 Mbps, 就是这条 USB WiFi 的真实能力, 换环境也不会变好。于是:
+ *     串行   recv(55-80) + PL(75) = 130-155 ms => 6.5-7.7 fps
+ *     流水线 max(recv, PL)        =  75-80 ms  => 12.5-13 fps => 撞上转速上限 11.1
+ * 花 3 个引擎把 dec+cpy 的 238 ms 干掉, 再让串行 recv 把一半吃回去, 不值。
+ * ⇒ 默认**流水线**: 给 PL 发完车立刻 ACK, 回去收下一帧; 下一帧收完再回来收割。
+ *   `--no-pipeline` 退回串行 (出问题时二分用)。细节见 g_plp 上方那一大段。
+ *
+ * 🔴 谁往 bank 里写, 两种模式**不一样**, 这是本次改动最容易踩的地方:
+ *     --pl-lz4 off : flip 线程写 bank (memcpy)，bank 轮转 = active+1
+ *     --pl-lz4 on  : **RX 线程**写 bank (PL 直写 / CPU 回退时 RX 自己 memcpy),
+ *                    flip 线程只写寄存器。bank 认领走 bank_claim()。
+ *   两种写者绝不混用 —— 混用时"下一个空闲 bank"会被两个线程各算一遍, 撞车。
+ *
+ * PL 寄存器 (AXI-Lite, 0x40020000 + i*0x10000, 每个引擎一个 64 KB 窗;
+ * 落点与 vivado/create_panel_proj_v6.tcl 的 BD 一致, 寄存器定义见
+ * dr1v90/lz4hw/rtl/lz4_axi_top.v 与 vivado/hdl/lz4/lz4_engine_axi.v):
+ *     0x00 CTRL   [0]=start(自清)     0x04 STATUS [0]=done [1]=error
+ *                                                 [4:2]=err_code [5]=busy
+ *     0x08 SRC_ADDR  0x0C SRC_LEN     0x10 DST_ADDR  0x14 DST_LEN
+ *     0x18 CYCLES (本次耗时, 用来实测 B/clk)
+ * 🔴 RTL 注释里的两条硬约束, 软件必须照办:
+ *   (1) **done 不是 core_done**: core 报完时最后几个字节可能还压在 wr_acc /
+ *       AXI 写通道里, 只有 STATUS[0]=1 才代表结果真的落到 DDR。等 done 之前
+ *       读 bank 会读到尾巴写回前的旧数据。
+ *   (2) done_r 只在 start 那一拍被清 0 ⇒ **刚写完 CTRL 就读 STATUS, 读到的
+ *       done 可能是上一次的残留**。所以 pl_run 先确认引擎"动起来了"
+ *       (busy=1 或 done=0) 才开始采信 done。
+ *
+ * 压缩流缓冲 (为什么在帧区里, 不是 malloc):
+ *   PL 从 DDR 读压缩流, 走的是 HP 口 ⇒ 必须是**物理连续 + 与 CPU 缓存无关**
+ *   的地址。malloc 出来的既不连续也在 cache 里, PL 看不到。所以压缩流落在
+ *   帧区尾部 (见下面的地址表), 与 bank 同一个 WC 映射。
+ * 🔴 每条流在 comp 缓冲里的落点**对齐到 64 B**: lz4_axi_top 的读侧是
+ *   `rd_ptr <= src_addr` 然后每拍取 8 字节、从 rd_buf[7:0] 开始吃 —— 它假设
+ *   src_addr 是 8 字节对齐的。而 MSTREAM 载荷里各条流是紧挨着排的, 第 2 条
+ *   起的偏移是任意字节。反正我们本来就要 memcpy 一次, 顺手对齐, 这一整类
+ *   风险就没了 (顺带给每条流留出末尾那不足一拍的 8 字节读越界余量)。
+ *
+ * 多引擎派活: PL 引擎**不能拆一条 LZ4 流** (LZ4 是串行依赖), 所以并行度 =
+ *   载荷里的流数。BD 现在放 3 个引擎 (Zynq-7020 四个 HP 口, panel 占一个,
+ *   每个 lz4 引擎独占一口) ⇒ 板上一般 `--pl-engines 3`。PVS_FLAG_MSTREAM 本来就是为双核并行切的多条独立流, 正好
+ *   1:1 喂多个引擎, 协议一个字节都不用改。流数 < 引擎数时多余的引擎闲着,
+ *   启动时会打一行提示 (要发送端把 --mstream 的条数提上去)。
+ *
+ * 什么帧走 PL, 什么帧回退 CPU (回退**永远响亮**, 不静默):
+ *   走 PL : PVS_FLAG_LZ4 且不带 DELTA 且 comp_len <= PL_COMP_BYTES
+ *   回退  : zlib / RLE / raw (PL 只认 lz4)、DELTA 帧、载荷太大、自检没过
+ *   DELTA 为什么不能走 PL: XOR 要读上一帧的原始数据, 而 PL 帧的输出在 WC
+ *   bank 里 —— WC 读极慢 (feedback_lz4_onboard_reality_check), 把 10 MB 读
+ *   回来比省下的还多。所以 PL 帧过后参考帧一律作废; 一个连接里第一次见到
+ *   DELTA 帧就**整条连接退回 CPU 路径**并打一行醒目日志 (只 NAK 这一帧,
+ *   povstream 收到 NAK 会自动降级重发 keyframe, 之后就一路 CPU, 不会 NAK
+ *   风暴)。
+ *
+ * PL 出错怎么办 (本项目吃过静默失败的亏, 三条都要响亮):
+ *   启动自检 : 每个引擎各解一段本进程现压的 LZ4 raw block 并逐字节比对,
+ *              不过就把 --pl-lz4 关掉并说清楚 —— "PL 没进比特流 / 地址给错 /
+ *              HP 口没接" 这类问题必须在开机时炸, 不是在推流中间。
+ *   STATUS[1]: 打出 err_code + src/dst/len, 然后**用 CPU 把同一条流再解一遍**
+ *              交叉验证: CPU 解得出来 = 引擎有问题 -> 永久关掉 PL 并大声说;
+ *              CPU 也解不出来 = 流真的坏了 -> NAK。
+ *   超时     : done 一直不来 = 八成 PL 根本没接上 -> 关掉 PL, 本帧改用 CPU
+ *              解 (画面不断), 大声说。
+ *
+ * ---- v3.5 帧区地址表 (--pl-lz4 打开时多出尾部两块) -----------------------
+ *   phys 起址    大小(槽)   用途
+ *   0x10000000   32 MB      bank A = 翻页缓冲 0   (实际用量 <= 0x1500000)
+ *   0x12000000   32 MB      bank B
+ *   0x14000000   21 MB      bank C (只映射到实际用量为止)
+ *   0x15500000    2 MB      PL 压缩流缓冲 (comp)  <- v3.5 新增
+ *   0x15700000   64 KB      PL 启动自检落点        <- v3.5 新增
+ *   映射窗: off 时 0x5500000 (85.0 MiB), on 时 0x5710000 (87.1 MiB)。
+ *   ⚠ pov_boot.sh 现在 insmod 的是 size=0x5800000 (88 MiB) ⇒ **两种都装得下,
+ *     启动脚本一个字都不用改**。窗口是按需求的最小值 map 的: --pl-lz4 关着时
+ *     不多映射那 2.06 MB, 免得把老 povmem 配置(刚好 0x5500000)的板子推进
+ *     mmap -EINVAL -> 回退 SO 的坑里。
+ *
  * Cache coherency: on 32-bit ARM, kernel 6.6 arch/arm/mm/mmu.c
  * phys_mem_access_prot() returns pgprot_noncached() for any pfn where
  * !pfn_valid(pfn). With mem=256M the frame region (and the PL register
@@ -303,12 +399,57 @@
 #define BANK_STRIDE        0x02000000u          /* 32 MiB, bank 间距 (3-bit 双面 282 槽 = 20.8MB/帧, 16MB 装不下) */
 #define BANK_BYTES         PVS_FRAME_RAW_MAX    /* 0x870000, 页整数倍 */
 #define FRAME_BANKS        3                    /* v3.2: A/B/C 三缓冲翻页 */
-/* 只映射到最后一个 bank 的末尾, 不白占后面的地址空间 = 0x2870000 (40.4 MiB) */
-#define FRAME_MAP_LEN      ((FRAME_BANKS - 1) * BANK_STRIDE + BANK_BYTES)
+/* 只映射到最后一个 bank 的末尾, 不白占后面的地址空间 = 0x5500000 (85.0 MiB) */
+#define FRAME_MAP_BANKS    ((FRAME_BANKS - 1) * BANK_STRIDE + BANK_BYTES)
+
+/* ---- v3.5 PL lz4 解码器用的两块尾部区域 (只在 --pl-lz4 时映射) ---------- */
+#define PL_COMP_OFF        FRAME_MAP_BANKS      /* 压缩流缓冲, 帧区尾部 */
+/* 2 MB: 单帧压缩流实测约 300 KB (10.47 MB / 33x), 留 6-7 倍余量, 顺带覆盖
+ * "这一帧特别难压"的情况。超过就回退 CPU 路径 (响亮), 不越界。
+ * 上限不能再大: povmem 现在给的是 0x5800000, 映射窗必须留在里面。 */
+#define PL_COMP_BYTES      0x200000u
+#define PL_ST_OFF          (PL_COMP_OFF + PL_COMP_BYTES)  /* 启动自检落点 */
+#define PL_ST_BYTES        0x10000u             /* 64 KB, 4 个引擎各 16 KB */
+#define FRAME_MAP_PL       (PL_ST_OFF + PL_ST_BYTES)      /* 0x5710000 (87.1 MiB) */
+/* 映射长度是**运行时**决定的 (见上面地址表里那条 ⚠): --pl-lz4 关着时按老值
+ * 映射, 免得把 povmem size 刚好卡在老值上的板子推进 mmap -EINVAL。 */
+static uint32_t g_map_len = FRAME_MAP_BANKS;
+
+/* PL lz4 解码器 AXI-Lite 寄存器 (dr1v90/lz4hw/rtl/lz4_axi_top.v) */
+#define PL_REG_CTRL        0x00                 /* W [0]=start (自清) */
+#define PL_REG_STATUS      0x04                 /* R 见下面的位定义 */
+#define PL_REG_SRC_ADDR    0x08
+#define PL_REG_SRC_LEN     0x0C
+#define PL_REG_DST_ADDR    0x10
+#define PL_REG_DST_LEN     0x14
+#define PL_REG_CYCLES      0x18                 /* R 本次解码拍数 */
+#define PL_ST_DONE         (1u << 0)
+#define PL_ST_ERROR        (1u << 1)
+#define PL_ST_BUSY         (1u << 5)
+#define PL_ST_ECODE(s)     (((s) >> 2) & 7u)
+/* BD 已定稿 (2026-08-24, bitstream 已建/时序收敛/160 向量过):
+ *   AXI-Lite  lz4_0/1/2 @ 0x40020000 / 0x40030000 / 0x40040000, 各 64 KB, 挂 GP0
+ *             (窗内每 256 B 一个镜像 —— lz4_engine_axi 只译码 awaddr[7:0]);
+ *             panel core 仍在 0x40010000。
+ *   AXI4 主口 每引擎独占一个 HP, 顺序 HP3 -> HP1 -> HP2 (HP0 留给面板取数)。
+ *   时钟      FCLK_CLK0 50 MHz, 与 panel 同域。
+ * ⇒ 默认就是 3 个引擎。写多了也不怕: 自检逐引擎判决, 不存在的那些会被单独
+ *   判死并降级运行 (见 pl_selftest 结尾), 不会一票否决掉整条 PL 通路。 */
+#define PL_BASE_DEFAULT    0x40020000u
+#define PL_STRIDE_DEFAULT  0x10000u
+#define PL_ENGINES_MAX     4
+#define PL_SRC_ALIGN       64u                  /* 见文件头: AXI 读侧要 8B 对齐,
+                                                 * 给到 64 顺带留末拍读越界余量 */
+/* 吞吐下限告警线。BD 定稿基准: 95 片一条流 = 95*0x9000 = 3502080 B, 实测应在
+ * 3.63-3.77M aclk ⇒ 0.93-0.97 B/clk。留出余量取 0.80 —— 低于它基本就是小事务
+ * 或 DDR 争用, 不是"本来就这么慢"。 */
+#define PL_BPC_WARN        0.80
+/* 发车后确认"引擎动起来了"最多读几次 STATUS。一次 AXI-Lite 读 ~µs, 而 done_r
+ * 在 start 后 1-2 个 aclk (40 ns @50MHz) 就清掉 ⇒ 正常第一次就成立。 */
+#define PL_START_CONFIRM_TRIES 64
 
 #define POVMEM_DEV         "/dev/povmem"        /* povmem.ko WC window */
 #define POVMEM_PHYS_BASE   0x10000000u          /* povmem.ko `base` param */
-#define POVMEM_MIN_SIZE    FRAME_MAP_LEN        /* insmod povmem.ko size>=这个 */
 
 #define ACLK_HZ            50000000u
 #define SLICE_WRAP_THRESH  8                    /* window half-width */
@@ -399,6 +540,36 @@ static void on_sig(int sig) { (void)sig; g_stop = 1; }
 static uint8_t  *g_bank[FRAME_BANKS];      /* virtual addresses of bank A/B/C */
 static uint32_t  g_bank_phys[FRAME_BANKS]; /* physical addresses (0x18/0x28) */
 static int       g_frame_wc = 0; /* 1 = frame map is write-combine (povmem) */
+/* 整个帧区映射的起点 (虚/物), v3.5 的 PL 压缩流缓冲与自检落点都从它算偏移。
+ * SIM 里的"物理地址"也用它做基准, 于是 PL 模型能把 PL 看到的 phys 翻回虚址。*/
+static uint8_t  *g_frame_virt;
+static uint32_t  g_frame_base_phys;
+
+/* ---- v3.5 PL 配置 (选项解析在 main; hw_init 之前必须定好 g_map_len) ------ */
+static int      g_pl_on;                    /* --pl-lz4: 走 PL 数据通路 */
+static int      g_pl_ok;                    /* 自检过了且还没被判死 */
+static uint32_t g_pl_base   = PL_BASE_DEFAULT;
+static uint32_t g_pl_stride = PL_STRIDE_DEFAULT;
+static int      g_pl_n      = 3;            /* --pl-engines; BD 定稿 NENG=3 */
+/* 🔴 引擎会**静默挂死**: 一条流的长度不对 (源字节耗尽而 raw_len 还没到) 时,
+ * 引擎 busy 恒 1、不置 error、不置 done —— 纯粹卡住。而 RTL **没有软复位**,
+ * 唯一的出路是整个 PL 复位 (画面闪一下), 那不是守护进程该干的事。
+ * ⇒ 卡死的引擎必须**摘出派发池**并且再也不派活: 不摘的话下一帧派给它又超时,
+ *   一路退化成"每帧都等满一个超时"。3 个挂 1 个 = 降到 0.80x 需求, 会掉帧但
+ *   不黑屏; 全挂了才永久关 PL 回退纯 CPU。 */
+static int      g_pl_dead[PL_ENGINES_MAX];  /* 1 = 卡死/自检没过, 永久摘掉 */
+static int      g_pl_live;                  /* 还能派活的引擎数 */
+static unsigned g_pl_timeout_ms = 400;      /* --pl-timeout, 每帧总预算 */
+/* --pl-fault error:N / hang:N —— **只有 SIM 引擎模型认它**, 用来在 x86 上把
+ * "引擎报错但 CPU 解得出来" 和 "done 永远不来" 这两条回退路径真跑一遍。
+ * 板上给了也没用 (真引擎不看这个变量), 留着是为了两个构建的选项集一致。 */
+/* 见 serve_client 里 DELTA 那段: 这条流一旦用 DELTA, 本进程就整体退回 CPU
+ * 解码路径 (**进程级**, 不是连接级 —— NAK 会关连接, 做成连接级就是重连风暴)。*/
+static int      g_pl_delta_off;
+/* --no-pipeline: 退回"发车后立刻等" 的串行模式。出问题时二分用。 */
+static int      g_pl_serial;
+static int      g_pl_fault_mode;            /* 0=off 1=error 2=hang */
+static unsigned g_pl_fault_at;              /* 第几次 start 开始发作 (1 基) */
 
 /* DSB: WC 是弱序, 翻页前必须排空 write buffer; SO 路径 DMB 也够, 统一用最强 */
 static inline void wmb_frame(void)
@@ -413,6 +584,7 @@ static inline void wmb_frame(void)
 #ifndef SIM_NO_DEVMEM
 
 static volatile uint32_t *g_regs;
+static volatile uint32_t *g_pl_regs;        /* v3.5: 覆盖 g_pl_n 个引擎的映射 */
 
 static int hw_init(uint32_t reg_phys, uint32_t frame_phys)
 {
@@ -424,13 +596,30 @@ static int hw_init(uint32_t reg_phys, uint32_t frame_phys)
     if (r == MAP_FAILED) { perror("mmap regs"); return -1; }
     g_regs = (volatile uint32_t *)r;
 
+    /* PL lz4 解码器的寄存器页: 一次映射覆盖全部引擎。寄存器就该走 SO 的
+     * /dev/mem, 不能走 povmem 那个 WC 窗 (弱序 + 写合并 = 控制寄存器灾难)。 */
+    if (g_pl_on) {
+        size_t plen = (size_t)g_pl_n * g_pl_stride;
+        if (plen < REG_MAP_LEN) plen = REG_MAP_LEN;
+        void *p = mmap(NULL, plen, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       fd, g_pl_base);
+        if (p == MAP_FAILED) {
+            logts("WARN: mmap PL lz4 regs @0x%08x len=0x%zx 失败 (%s) -> "
+                  "--pl-lz4 关闭, 退回 CPU 解码", g_pl_base, plen,
+                  strerror(errno));
+            g_pl_on = 0;
+        } else {
+            g_pl_regs = (volatile uint32_t *)p;
+        }
+    }
+
     /* frame region: try the WC window first (povmem.ko), fall back to the
      * old strongly-ordered /dev/mem path if the module isn't loaded */
     void *f = MAP_FAILED;
     if (frame_phys >= POVMEM_PHYS_BASE) {
         int pfd = open(POVMEM_DEV, O_RDWR | O_SYNC);
         if (pfd >= 0) {
-            f = mmap(NULL, FRAME_MAP_LEN, PROT_READ | PROT_WRITE, MAP_SHARED,
+            f = mmap(NULL, g_map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
                      pfd, frame_phys - POVMEM_PHYS_BASE);
             if (f == MAP_FAILED) {
                 perror("mmap " POVMEM_DEV " (falling back to /dev/mem)");
@@ -438,18 +627,20 @@ static int hw_init(uint32_t reg_phys, uint32_t frame_phys)
                  * 当前默认的 0x1900000 窗口, mmap 直接 -EINVAL。SO 慢 5-10 倍。*/
                 logts("HINT: need `insmod povmem.ko base=0x%08x size=0x%x` "
                       "(window must cover %u B)",
-                      POVMEM_PHYS_BASE, (unsigned)POVMEM_MIN_SIZE,
-                      (unsigned)FRAME_MAP_LEN);
+                      POVMEM_PHYS_BASE, (unsigned)g_map_len,
+                      (unsigned)g_map_len);
             } else
                 g_frame_wc = 1;
             close(pfd);
         }
     }
     if (f == MAP_FAILED) {
-        f = mmap(NULL, FRAME_MAP_LEN, PROT_READ | PROT_WRITE, MAP_SHARED,
+        f = mmap(NULL, g_map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
                  fd, frame_phys);
         if (f == MAP_FAILED) { perror("mmap frame region"); return -1; }
     }
+    g_frame_virt      = (uint8_t *)f;
+    g_frame_base_phys = frame_phys;
     for (int i = 0; i < FRAME_BANKS; i++) {
         g_bank[i]      = (uint8_t *)f + (uint32_t)i * BANK_STRIDE;
         g_bank_phys[i] = frame_phys  + (uint32_t)i * BANK_STRIDE;
@@ -461,6 +652,16 @@ static int hw_init(uint32_t reg_phys, uint32_t frame_phys)
 static uint32_t reg_rd(uint32_t off)            { return g_regs[off / 4]; }
 static void     reg_wr(uint32_t off, uint32_t v){ g_regs[off / 4] = v;    }
 
+/* PL 引擎 e 的寄存器 (AXI-Lite, SO 映射 -> 顺序天然保证) */
+static uint32_t pl_rd(int e, uint32_t off)
+{
+    return g_pl_regs[((uint32_t)e * g_pl_stride + off) / 4];
+}
+static void pl_wr(int e, uint32_t off, uint32_t v)
+{
+    g_pl_regs[((uint32_t)e * g_pl_stride + off) / 4] = v;
+}
+
 #else /* SIM_NO_DEVMEM: x86 test build ------------------------------------ */
 
 static uint32_t g_sim_regs[REG_MAP_LEN / 4];
@@ -469,8 +670,10 @@ static uint32_t g_sim_slice;   /* fake advancing slice counter */
 static int hw_init(uint32_t reg_phys, uint32_t frame_phys)
 {
     (void)reg_phys;
-    uint8_t *f = malloc(FRAME_MAP_LEN);
+    uint8_t *f = malloc(g_map_len);
     if (!f) { perror("malloc banks"); return -1; }
+    g_frame_virt      = f;
+    g_frame_base_phys = frame_phys;
     for (int i = 0; i < FRAME_BANKS; i++) {
         g_bank[i]      = f + (uint32_t)i * BANK_STRIDE;
         g_bank_phys[i] = frame_phys + (uint32_t)i * BANK_STRIDE;
@@ -488,9 +691,18 @@ static uint32_t reg_rd(uint32_t off)
     return g_sim_regs[off / 4];
 }
 
+/* SIM 自检用: 引擎此刻真正在扫的是哪一块 bank (由 0x18 的值反查)。
+ * bank_claim 拿它守住流水线里最危险的那条不变量 —— **RX 绝不能往正在显示的
+ * bank 里写**。这条一旦破了, 症状是偶发撕裂/花屏, 现场根本查不出来。 */
+static int g_sim_active_bank = 0;
+
 static void reg_wr(uint32_t off, uint32_t v)
 {
     g_sim_regs[off / 4] = v;
+    if (off == REG_SLICE_BASE) {
+        for (int i = 0; i < FRAME_BANKS; i++)
+            if (g_bank_phys[i] == v) { g_sim_active_bank = i; break; }
+    }
     /* 模拟 RTL 的 STATUS 回读位, 让一致性自检在 x86 上也走真路径 */
     if (off == REG_SLICE_BASE_B) {
         if (v) g_sim_regs[0] |=  STATUS_BASE_B_ACT;
@@ -507,6 +719,92 @@ static void reg_wr(uint32_t off, uint32_t v)
         else                  g_sim_regs[0] &= ~STATUS_BPP_MODE;
     }
     logts("SIM: reg[0x%02x] <= 0x%08x", off, v);
+}
+
+/* ---- v3.5 SIM: PL lz4 引擎模型 -------------------------------------------
+ * x86 上没有 PL, 但**整条 PL 数据通路的软件侧必须能自检**: bank 认领与轮转、
+ * 多引擎派活、done 的等待纪律、错误/超时回退。所以这里按 lz4_axi_top.v 的
+ * 行为建个模型, test_local 就能把这些路径真跑一遍。
+ * 刻意复刻的两个坑 (软件的防御正是冲它们去的):
+ *   (1) done_r **只在 start 那一拍清 0** ⇒ 刚写完 CTRL 就读 STATUS 会读到
+ *       上一次的 done。模型在 start 时才清, 与 RTL 一致。
+ *   (2) busy 要过几拍才落下去 ⇒ 模型让前几次 STATUS 读回 busy=1, 逼着软件
+ *       走"先确认动起来了再采信 done"那条路。
+ * "解码"本身直接调 LZ4_decompress_safe —— PL 与软件解出来必须逐字节一样,
+ * 用同一个参考实现正好把这条约束钉死。 */
+/* 🔴 busy 必须按**时间**建模, 不能按"还能读几次"。
+ * 2026-08-25 上板打脸: 老模型是 g_simpl_busy 计数, 每读一次 STATUS 减一 ——
+ * 于是**无论隔多久去读, 头几次一定读到 busy=1**, 那个"引擎动起来了"的瞬态
+ * 永远抓得到。真硬件不是这样: busy 是一段**时间**(74 ms), 流水线下我们隔
+ * 55-80 ms 才第一次 poll, 那会儿 done 早就置上、busy 早就掉了, 瞬态**根本
+ * 不存在**。老模型把"漏检 done"这个 bug 完美地藏了起来, SIM 全绿而板上 24
+ * 帧只成 1 帧。
+ * 现在: start 之后 SIM_PL_BUSY_US 内报 busy, 之后报真状态 —— 与板上同形。
+ * 200 µs 选得很短是故意的: 发车时的确认读 (~µs 级) 一定落在窗内 (与真硬件
+ * 相同), 而调度器 poll (recv 之后, ms 级) 一定落在窗外 = 复现板上的时序。 */
+#define SIM_PL_BUSY_US 200L
+static uint32_t g_simpl[PL_ENGINES_MAX][8];      /* 引擎寄存器 */
+static long     g_simpl_until[PL_ENGINES_MAX];   /* busy 到这个 mono_us 为止 */
+static int      g_simpl_hung[PL_ENGINES_MAX];    /* 1 = 这个引擎已经卡死了 */
+static unsigned g_simpl_starts;                  /* --pl-fault 的计数基准 */
+
+/* PL 看到的是物理地址; SIM 里把它翻回帧区映射内的虚址 (越界返回 NULL) */
+static uint8_t *sim_phys2virt(uint32_t phys, uint32_t len)
+{
+    if (phys < g_frame_base_phys) return NULL;
+    uint32_t off = phys - g_frame_base_phys;
+    if ((uint64_t)off + len > g_map_len) return NULL;
+    return g_frame_virt + off;
+}
+
+static uint32_t pl_rd(int e, uint32_t off)
+{
+    if (off == PL_REG_STATUS && mono_us() < g_simpl_until[e])
+        return PL_ST_BUSY;                        /* 还在跑, done 未置 */
+    return g_simpl[e][off / 4];
+}
+
+static void pl_wr(int e, uint32_t off, uint32_t v)
+{
+    if (off != PL_REG_CTRL) { g_simpl[e][off / 4] = v; return; }
+    if (!(v & 1u)) return;                        /* start 是自清脉冲 */
+    uint32_t src = g_simpl[e][PL_REG_SRC_ADDR / 4], slen = g_simpl[e][PL_REG_SRC_LEN / 4];
+    uint32_t dst = g_simpl[e][PL_REG_DST_ADDR / 4], dlen = g_simpl[e][PL_REG_DST_LEN / 4];
+    g_simpl[e][PL_REG_STATUS / 4] = 0;            /* start 那一拍清 done/error */
+    g_simpl[e][PL_REG_CYCLES / 4] = 0;
+    g_simpl_until[e] = mono_us() + SIM_PL_BUSY_US;
+    unsigned n = ++g_simpl_starts;
+
+    /* hang: 复刻 BD 交付时确认的真实失效模式 —— **busy 恒 1, 不置 done 也不置
+     * error**, 而且**只有这一个引擎**卡住 (第 g_pl_fault_at 次 start 落在谁头上
+     * 谁倒霉), 其余引擎照常工作。这样才测得出"摘掉一个继续跑"那条降级路径;
+     * 做成"从此所有 start 都挂"就只能测到"全挂"那一种。 */
+    if (g_pl_fault_mode == 2 && (g_simpl_hung[e] || n == g_pl_fault_at)) {
+        if (!g_simpl_hung[e]) {
+            g_simpl_hung[e] = 1;
+            logts("SIM-PL[%d]: --pl-fault hang 生效 (第 %u 次 start) —— "
+                  "这个引擎从此 busy 恒 1", e, n);
+        }
+        g_simpl_until[e] = mono_us() + 3600L * 1000000L;   /* 实质上永远 busy */
+        return;
+    }
+    uint8_t *s = sim_phys2virt(src, slen), *d = sim_phys2virt(dst, dlen);
+    if (!s || !d) {                               /* 地址越界 = 引擎报错 */
+        g_simpl[e][PL_REG_STATUS / 4] = PL_ST_ERROR | (3u << 2);
+        return;
+    }
+    if (g_pl_fault_mode == 1 && n >= g_pl_fault_at) {   /* error: 谎报流损坏 */
+        g_simpl[e][PL_REG_STATUS / 4] = PL_ST_ERROR | (1u << 2);
+        logts("SIM-PL[%d]: --pl-fault error 生效 (第 %u 次 start)", e, n);
+        return;
+    }
+    int rc = LZ4_decompress_safe((const char *)s, (char *)d, (int)slen, (int)dlen);
+    if (rc < 0 || (uint32_t)rc != dlen) {
+        g_simpl[e][PL_REG_STATUS / 4] = PL_ST_ERROR | ((rc < 0 ? 1u : 2u) << 2);
+        return;
+    }
+    g_simpl[e][PL_REG_STATUS / 4] = PL_ST_DONE;
+    g_simpl[e][PL_REG_CYCLES / 4] = dlen + dlen / 8;   /* ~0.89 B/clk, 逼真即可 */
 }
 
 #endif /* SIM_NO_DEVMEM */
@@ -660,11 +958,26 @@ typedef struct {
     uint32_t face_b_off;     /* 面B 在 buf 内的字节偏移; 0 = 单面帧 */
     uint32_t fold_a;         /* PVS_FLAG_FOLD_A -> PL 的 POV_CTRL[6] */
     uint32_t bpp3;           /* v3.4: PVS_FLAG_3BIT -> PL 的 0x0C sub01 bpp_mode */
+    /* v3.5: >=0 = 数据**已经在这个 DDR bank 里**(PL 直写 / RX 自己 memcpy 过了),
+     * flip 线程只写寄存器; -1 = 老路径, 数据在 buf 里等 flip 线程 memcpy。 */
+    int      bank;
 } stage_t;
 
 static stage_t g_wr, g_ready, g_disp;
 static unsigned g_ready_gen, g_consumed_gen;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---- v3.5 PL 模式下的 bank 归属 (只在 g_pl_on 时有意义) -------------------
+ * 三个 bank 恒定处于三种角色之一: active(引擎正在扫) / cool(上一帧, 留一整轮
+ * 冷却, 因为 PL 的 base_lat 是 pair 级快照) / held(RX 正在写或已写完待翻)。
+ * RX 认领的永远是"两次翻页之前退下来的那块", 与老路径的 active+1 轮转等价。
+ *   翻页把 held 变成 active  =>  g_bank_free = (held + 1) % 3
+ * 🔴 认领与"发布槽是否还压着一帧"必须在**同一把锁**里判: RX 比 flip 快时要
+ * 就地顶替那一帧(最新帧赢), 顶替的同时必须把它从待翻队列里摘掉, 否则 flip
+ * 会把一块**正在被 PL 改写**的 bank 翻上屏 = 撕裂。 */
+static int g_bank_free = 1;      /* 下一个可认领的 bank (main 让 bank0 上屏) */
+static int g_bank_held = -1;     /* RX 已认领、还没被翻上去的 bank; -1 = 无 */
+
 
 static uint8_t *g_prev;          /* DELTA 参考帧 (仅 RX 线程读写指针) */
 static uint32_t g_prev_len;      /* 参考帧长度: DELTA 必须等长, 否则 NAK */
@@ -679,6 +992,32 @@ static int g_swap_faces = 0;     /* --swap-faces: 两面数据对调到另一块
 /* stats (RX 线程写, flip 线程读, 32-bit 对齐字, 统计精度要求低) */
 static unsigned g_st_rx, g_st_flip, g_st_drop, g_st_forced;
 static unsigned long g_st_dec_us;
+
+static int bank_claim(void)
+{
+    int b;
+    pthread_mutex_lock(&g_mu);
+    if (g_bank_held >= 0) {
+        b = g_bank_held;                        /* 就地顶替上一帧 */
+        if (g_ready_gen != g_consumed_gen) {    /* 它还没被翻 -> 摘掉 + 计丢帧 */
+            g_st_drop++;
+            g_consumed_gen = g_ready_gen;
+        }
+    } else {
+        b = g_bank_free;
+        g_bank_held = b;
+    }
+    pthread_mutex_unlock(&g_mu);
+#ifdef SIM_NO_DEVMEM
+    /* 🔴 流水线之后这条不变量是最容易被破的 (见 g_plp 上方 "先发布再认领"):
+     * 认领到正在显示的 bank = 边扫边写 = 撕裂, 而且完全静默。x86 上直接守死。*/
+    if (b == g_sim_active_bank)
+        logts("BANKGUARD FAIL: RX 认领了正在显示的 bank %d "
+              "(active=%d free=%d held=%d) —— 这会边扫边写", b,
+              g_sim_active_bank, g_bank_free, g_bank_held);
+#endif
+    return b;
+}
 
 /* ---- 诊断计数器 (2026-08-04 丢帧/端到端帧率排查) --------------------------
  * 老 STAT 行只有 dec_avg, 而且是**自启动以来的累计均值** —— 跑上几百帧后对
@@ -1186,6 +1525,589 @@ static void dec_errline(const face_job_t *jobs, int n, char *out, size_t cap)
                               jobs[i].rc ? jobs[i].err : "ok");
 }
 
+/* ==== v3.5 PL lz4 解码器 ==================================================
+ * 完整背景见文件头的 v3.5 段。这里只留"为什么这么写"的那几条。
+ */
+static uint8_t  *g_comp_virt;    /* 压缩流缓冲 (帧区尾部, WC) 的虚址 */
+static uint32_t  g_comp_phys;
+static uint8_t  *g_plst_virt;    /* 启动自检落点 */
+static uint32_t  g_plst_phys;
+/* 窗内统计: PL 墙钟 / 拍数 / 输出字节 / 回退帧数 (DIAG 里那一段) */
+static unsigned long g_w_pl_us, g_w_pl_max, g_w_pl_n;
+static unsigned long g_w_pl_cyc, g_w_pl_out, g_w_pl_fb;
+/* 流水线奏效不奏效, 看的就是这个: RX 线程**真正阻塞**在等 done 上的时间。
+ * PL 墙钟 (g_w_pl_us) 藏在 recv 后面时它应该接近 0; 它一旦逼近 pl, 说明
+ * recv 比解码快, 瓶颈换边了。 */
+static unsigned long g_w_plw_us, g_w_plw_max;
+static unsigned g_pl_fb_frames;          /* 累计回退帧数 (最终 STAT 行) */
+
+static const char *pl_errname(uint32_t code)
+{
+    switch (code) {
+    case 0: return "none";
+    case 1: return "E_OFF0 (match offset==0, 流损坏)";
+    case 2: return "E_OVERRUN (输出超过 DST_LEN)";
+    case 3: return "E_SRC (压缩流提前耗尽)";
+    default: return "未知 err_code";
+    }
+}
+
+/* 一次启动: 四个参数落完再写 start, 然后**当场确认引擎真的动起来了**。
+ * 🔴 wmb 必须在 start **之前** —— 压缩流是刚 memcpy 进 WC 内存的, WC 弱序,
+ *    不排空写缓冲就按下 start, PL 可能读到还没落地的字节。
+ *
+ * ---- 为什么"确认"这一步必须在这里做, 而不是留给后面的 poll ----------------
+ * 2026-08-25 上板打脸, 教训值得写全:
+ *   done_r **只在 start 那一拍清 0**, 没有写 1 清零口。所以"我读到的 done 是
+ *   这一次的还是上一次残留的"必须有办法分辨。老做法是留给调度器的第一次 poll:
+ *   先看见 busy=1 或 done=0 (瞬态), 才开始采信 done。
+ *   串行时这没问题 —— 发车后立刻 poll, 瞬态就在眼前。
+ *   **流水线之后就错了**: 发完车 RX 就去 recv 下一帧 (55-80 ms), 而引擎 74 ms
+ *   就干完了 ⇒ 回来第一次 poll 时 done=1、busy=0, **瞬态早就没了**, 两个条件
+ *   一个都不成立 ⇒ 永远 continue ⇒ 每帧等满 400 ms 超时。
+ *   板上实测: 自检三个引擎全过 (0.93 B/clk), 推流 24 帧只成 1 帧, 超时后去读
+ *   寄存器三个引擎全是 done=1 busy=0 CYCLES≈3.69M(=73.9 ms) —— 硬件干得好好的,
+ *   是软件没认。
+ * 🔴 结论: **瞬态只在发车后的几微秒内保证存在, 就必须在那几微秒内去看。**
+ *   写完 CTRL 后 done_r 在 1-2 个 aclk 内(50 MHz = 40 ns)被清掉, 而一次
+ *   AXI-Lite 读要 ~µs ⇒ 紧接着读一次必然看到 done=0 (通常还带 busy=1)。
+ *   确认之后, 后面任何时候读到的 done 都必然是本次的, poll 侧不再需要任何
+ *   "新鲜度"判断 —— 那套逻辑连同它的坑一起删掉。
+ * 返回 0 = 确认成功。 */
+static int pl_start(int e, uint32_t src, uint32_t slen,
+                    uint32_t dst, uint32_t dlen)
+{
+    pl_wr(e, PL_REG_SRC_ADDR, src);
+    pl_wr(e, PL_REG_SRC_LEN,  slen);
+    pl_wr(e, PL_REG_DST_ADDR, dst);
+    pl_wr(e, PL_REG_DST_LEN,  dlen);
+    wmb_frame();
+    pl_wr(e, PL_REG_CTRL, 1u);
+    /* 确认: 看见 done 掉下去 (或 busy 起来) = 上一次的残留已经被本次 start 清掉。
+     * 正常情况下第一次读就成立; 循环只是为了不依赖任何时序假设。 */
+    for (int i = 0; i < PL_START_CONFIRM_TRIES; i++) {
+        uint32_t st = pl_rd(e, PL_REG_STATUS);
+        if (!(st & PL_ST_DONE) || (st & PL_ST_BUSY)) return 0;
+    }
+    /* 走到这里 = 写了 start 却始终看到"上一次的 done 还挂着且不 busy"。真硬件
+     * 上这不该发生 (开机自检已经证明 CTRL 写得进去)。**大声说**, 然后仍然按
+     * "已确认"往下走: 引擎实际上已经在跑了, 拒绝采信只会把这一帧吊死到超时,
+     * 反而更糟; 真出问题还有超时兜底。 */
+    {
+        static int noted;
+        if (!noted++)
+            logts("⚠ PL 引擎%d: 写完 CTRL 后 %d 次读 STATUS 仍是 done=1&&busy=0 "
+                  "—— 按理 start 会当场清掉 done_r。仍按已启动处理, 但这说明"
+                  "start 脉冲或 STATUS 回读有问题, 值得查",
+                  e, PL_START_CONFIRM_TRIES);
+    }
+    return 0;
+}
+
+/* ---- 派活器: 把 n 条流喂给 g_pl_n 个引擎 --------------------------------
+ * 拆成 launch / poll / wait 三段, 是为了让**解码和收下一帧的包重叠**(v3.5b
+ * 流水线): launch 之后 RX 线程就回去 recv 了, 硬件在背后跑; 等下一帧收完再
+ * 回来 wait。串行模式 (--no-pipeline) 就是 launch 后立刻 wait, 逐字节等价。
+ *
+ *   jobs[] 里只用 src_len / dst_len —— dst 落点靠**累加**还原, 因为构造 jobs
+ *   的两处 (serve_client / idle_anim_step) 都是把流按顺序紧挨着排的; src 落点
+ *   由 caller 给 soff[] (每条对齐到 PL_SRC_ALIGN, 见 pl_stage_streams)。
+ *
+ * 🔴 流数 > 引擎数时, 多出来的流要等某个引擎空了才发得出去 —— 而流水线模式下
+ *    RX 那会儿正阻塞在 recv 里, 没人去 poll ⇒ 那些流要等到下一帧收完才起跑。
+ *    所以**流数应当正好等于引擎数**(BD 现在是 3)。不等时启动阶段会告警一次。 */
+typedef struct {
+    face_job_t jobs[PVS_MAX_STREAMS];   /* 按值存: 调用方的局部数组会走 */
+    uint32_t   soff[PVS_MAX_STREAMS];   /* 各流在 comp 缓冲里的偏移 */
+    uint32_t   doff[PVS_MAX_STREAMS];   /* 各流在 bank 里的偏移 */
+    int        n;
+    uint32_t   comp_phys, bank_phys;
+    int        cur[PL_ENGINES_MAX];     /* 引擎 e 正在跑第几条流; -1 = 空 */
+    int        next, live, rc;
+    long       t0;                      /* 上次有进展的时刻 (超时判据) */
+    char       why[224];
+} pl_sched_t;
+
+static void pl_sched_launch(pl_sched_t *s, const face_job_t *jobs, int n,
+                            const uint32_t *soff, uint32_t comp_phys,
+                            uint32_t bank_phys)
+{
+    uint32_t d = 0;
+    memset(s, 0, sizeof *s);
+    s->n = n; s->comp_phys = comp_phys; s->bank_phys = bank_phys;
+    for (int i = 0; i < n; i++) {
+        s->jobs[i] = jobs[i];
+        s->soff[i] = soff[i];
+        s->doff[i] = d; d += jobs[i].dst_len;
+    }
+    for (int e = 0; e < g_pl_n; e++) s->cur[e] = -1;
+    s->next = 0; s->live = 0; s->rc = 0; s->why[0] = '\0';
+    /* 一个活引擎都没有时**绝不能**进等待循环: 派不出去 + 收不回来 = 死等到
+     * 超时。调用方的 use_pl 判据里已经挡了一层, 这里是第二层。 */
+    if (g_pl_live <= 0) {
+        s->rc = -2;
+        snprintf(s->why, sizeof s->why, "没有可用的 PL 引擎 (全部已判死)");
+        return;
+    }
+    /* 有空引擎就上一条流。谁先空谁接下一条 = 纯动态派活: 引擎同构, 比
+     * dec_plan 那种静态切分更抗流长不均。 */
+    for (int e = 0; e < g_pl_n && s->next < n; e++) {
+        if (g_pl_dead[e]) continue;              /* 卡死过的引擎不再派活 */
+        pl_start(e, comp_phys + s->soff[s->next], s->jobs[s->next].src_len,
+                 bank_phys + s->doff[s->next], s->jobs[s->next].dst_len);
+        s->cur[e] = s->next++;
+        s->live++;
+    }
+    s->t0 = mono_ms();
+}
+
+/* 转一圈: 收割已完成的引擎, 把空出来的引擎补上新流。
+ * 返回 1 = 这一批已经落定 (全完成 / 出错且都停了 / 超时)。 */
+static int pl_sched_poll(pl_sched_t *s)
+{
+    int moved = 0;
+    for (int e = 0; e < g_pl_n; e++) {
+        if (s->cur[e] < 0) continue;
+        uint32_t st = pl_rd(e, PL_REG_STATUS);
+        /* done 的"新鲜度"已经在 pl_start 里当场确认过了 (瞬态只在发车后几微秒
+         * 内保证存在, 见那边那段)。所以这里读到 done 就是本次的, 不需要、也
+         * **不能**再去等什么瞬态 —— 流水线下瞬态早没了, 等就是死等。 */
+        if (st & PL_ST_ERROR) {
+            if (!s->why[0])
+                snprintf(s->why, sizeof s->why,
+                         "引擎%d 流#%d STATUS=0x%08x err_code=%u %s "
+                         "[src=0x%08x+%u dst=0x%08x+%u]",
+                         e, s->cur[e], st, PL_ST_ECODE(st),
+                         pl_errname(PL_ST_ECODE(st)),
+                         s->comp_phys + s->soff[s->cur[e]], s->jobs[s->cur[e]].src_len,
+                         s->bank_phys + s->doff[s->cur[e]], s->jobs[s->cur[e]].dst_len);
+            s->rc = -1;
+            s->cur[e] = -1; s->live--; moved = 1;
+        } else if (st & PL_ST_DONE) {
+            g_w_pl_cyc += pl_rd(e, PL_REG_CYCLES);
+            g_w_pl_out += s->jobs[s->cur[e]].dst_len;
+            s->cur[e] = -1; s->live--; moved = 1;
+        }
+    }
+    /* 出错后不再上新流, 但已经在跑的要等它们自己停 —— 否则调用方去重用这块
+     * bank / comp 缓冲时, 背后还有个没停的引擎在写。 */
+    for (int e = 0; e < g_pl_n && !s->rc && s->next < s->n; e++) {
+        if (s->cur[e] >= 0 || g_pl_dead[e]) continue;
+        pl_start(e, s->comp_phys + s->soff[s->next], s->jobs[s->next].src_len,
+                 s->bank_phys + s->doff[s->next], s->jobs[s->next].dst_len);
+        s->cur[e] = s->next++;
+        s->live++;
+        moved = 1;
+    }
+    if (!s->live && (s->rc || s->next >= s->n)) return 1;
+    if (moved) {
+        s->t0 = mono_ms();      /* 超时是"卡住多久", 不是"整批多久" */
+    } else if (mono_ms() - s->t0 > (long)g_pl_timeout_ms) {
+        if (!s->why[0])
+            snprintf(s->why, sizeof s->why,
+                     "阻塞等了 %u ms 还没 done (还有 %d 条流在跑, 流 %d/%d) "
+                     "—— 已知失效模式是流长度不对导致引擎 busy 恒 1; "
+                     "也可能是 PL 没进比特流 / 基址给错 / HP 口没接",
+                     g_pl_timeout_ms, s->live, s->next, s->n);
+        s->rc = -2;
+        return 1;
+    }
+    return 0;
+}
+
+/* 一直转到落定。返回 0=全解完, -1=某个引擎报 error, -2=超时。
+ *
+ * 🔴 进循环前**必须重置超时起点**。发车时设的那个 t0 在流水线下是没用的:
+ *    launch 之后 RX 就去 recv 下一帧了 (WiFi 55-80 ms, 抖起来更长), 等回到这里
+ *    时"自发车以来"早就吃掉大半个预算 —— 第一次 poll 就会判超时。
+ *    而超时的后果是**把引擎永久摘出派发池**(RTL 没有软复位, 摘了就回不来),
+ *    所以这个假阳性的代价极高: 链路抖一下就报废一个引擎。
+ *    要限的本来就是"**我们真正阻塞了多久**", 不是"硬件跑了多久" —— 后者由
+ *    g_plp.t_launch_us 单独记, 进 PLDIAG 的 pl 字段。 */
+static int pl_sched_wait(pl_sched_t *s)
+{
+    s->t0 = mono_ms();
+    while (!pl_sched_poll(s)) usleep(100);
+    return s->rc;
+}
+
+/* 重新数一遍还能派活的引擎 */
+static void pl_recount_live(void)
+{
+    g_pl_live = 0;
+    for (int e = 0; e < g_pl_n; e++) if (!g_pl_dead[e]) g_pl_live++;
+}
+
+/* ---- 超时收尾: 把卡死的引擎摘出派发池 ------------------------------------
+ * 🔴 这是 2026-08-24 BD 交付时确认的**安全问题**, 不是性能问题:
+ *   一条流的长度不对 (源字节耗尽而 raw_len 还没到) 时, 引擎 **busy 恒 1、
+ *   不置 error、不置 done** —— 纯粹卡住, 而 RTL **没有软复位**, 只有整个 PL
+ *   复位才救得回来 (= 画面闪一下, 守护进程不该干这事)。
+ *   MSTREAM 那两个求和自校验**管不到单条流的 raw_len**, 所以"校验过了"不等于
+ *   "喂进去是安全的" ⇒ 超时是安全网里唯一的一层。
+ *
+ * 于是超时之后**不能只是"这帧转 CPU"就完事**: 那个引擎还卡着, 下一帧再派给它
+ * 又超时, 会一路退化成"每帧都等满一个超时"。必须把它摘掉:
+ *   3 个挂 1 个 -> 0.80x 需求, 掉帧但不黑屏; 全挂了才永久关 PL。
+ *
+ * 两段:
+ *   (1) 先给一小段宽限 —— 万一只是慢 (DDR 争用/小事务), 让它自己落定。
+ *       ⚠ 宽限**必须有界**: 真卡死的引擎永远等不到 busy 掉下去, 老 pl_drain
+ *         那种"等到不 busy 为止"在这个失效模式下就是第二个死等点。
+ *   (2) 还没落定的判死。它是卡在"等源字节"上, 不会再往 DDR 写, 所以本帧改用
+ *       CPU 重解并覆盖同一块 bank 是安全的 —— 这一条是可以讲清楚的, 不是
+ *       "应该没事"。
+ * 返回还活着的引擎数。 */
+static int pl_reap_stuck(pl_sched_t *s)
+{
+    long t0 = mono_ms();
+    long grace = (long)(g_pl_timeout_ms / 2u);
+    if (grace < 20) grace = 20;
+    for (;;) {                          /* (1) 有界宽限 */
+        int busy = 0;
+        for (int e = 0; e < g_pl_n; e++)
+            if (s->cur[e] >= 0 && !g_pl_dead[e] &&
+                !(pl_rd(e, PL_REG_STATUS) & (PL_ST_DONE | PL_ST_ERROR)))
+                busy = 1;
+        if (!busy || mono_ms() - t0 > grace) break;
+        usleep(500);
+    }
+    /* 🔴 超时了但引擎其实**全是完成态** = 这不是硬件问题, 是我们的轮询漏检。
+     * 2026-08-25 板上就是这个形态 (三个引擎 done=1 busy=0 CYCLES≈3.69M, 而我们
+     * 报超时), 当时得靠人去 devmem 读寄存器才看出来。把这句话直接印出来, 下次
+     * 一眼就能定性, 不用再猜是不是 DDR 争用 / 引擎卡死。 */
+    {
+        int held = 0, settled = 0;
+        for (int e = 0; e < g_pl_n; e++) {
+            if (s->cur[e] < 0 || g_pl_dead[e]) continue;
+            held++;
+            if (pl_rd(e, PL_REG_STATUS) & (PL_ST_DONE | PL_ST_ERROR)) settled++;
+        }
+        if (held && held == settled)
+            logts("🔴 超时了, 但这 %d 个引擎**全都是完成态** —— 硬件干完了, 是"
+                  "**轮询逻辑漏检 done**, 不是引擎卡死也不是 DDR 争用。"
+                  "去看 pl_start 的'发车即确认'那段。", held);
+    }
+    for (int e = 0; e < g_pl_n; e++) {   /* (2) 判死 */
+        if (s->cur[e] < 0 || g_pl_dead[e]) continue;
+        uint32_t st = pl_rd(e, PL_REG_STATUS);
+        if (st & (PL_ST_DONE | PL_ST_ERROR)) continue;   /* 只是慢, 放过 */
+        g_pl_dead[e] = 1;
+        s->cur[e] = -1;
+        logts("🔴 PL 引擎%d 卡死 (STATUS=0x%08x: busy 恒 1, 既不 done 也不 error) "
+              "—— 这是流长度不对时的已知失效模式, RTL **没有软复位**, 只有整个 "
+              "PL 复位才救得回来。**把它摘出派发池, 不再派活**", e, st);
+    }
+    pl_recount_live();
+    if (g_pl_live <= 0) {
+        g_pl_ok = 0;
+        logts("🔴 PL 引擎**全部卡死** (不是解码出错 —— 是硬件卡住了) ⇒ 永久关闭 "
+              "PL 解码, 本进程余下时间全部走 CPU。要救回来只能重新加载比特流 / "
+              "复位 PL。");
+    } else {
+        logts("PL 降级运行: 还有 %d/%d 个引擎可用 (每帧能力 %.2fx) —— "
+              "会掉帧但不会黑屏", g_pl_live, g_pl_n,
+              (double)g_pl_live / (g_pl_n ? g_pl_n : 1));
+    }
+    return g_pl_live;
+}
+
+/* ---- 启动自检: 每个引擎各解一段本进程现压的 raw block 并逐字节比对 -------
+ * 🔴 为什么非做不可: "PL 没进比特流 / 基址给错 / HP 口没接" 这类问题的表现
+ * 全是"解出来是垃圾"或"done 不来", 而它们**必须在开机时炸**, 不能等到推流
+ * 中间才发现 (那时候屏上已经是花的了)。每个引擎都单独测一遍, 顺带验证
+ * DST_ADDR 的地址译码 —— 只测引擎 0 的话, "所有引擎其实是同一个"这种 BD
+ * 接线错误查不出来。
+ * 返回 0 = 全过。 */
+static int pl_selftest(void)
+{
+    const uint32_t seg = PL_ST_BYTES / PL_ENGINES_MAX;   /* 16 KB/引擎 */
+    uint8_t *ref = malloc(seg);
+    uint8_t *cmp = malloc(seg);
+    if (!ref || !cmp) { free(ref); free(cmp); return -1; }
+
+    /* 内容要**像真切片**: 大片 0 + 稀疏字节 + 短周期重复, 这样压出来既有长
+     * match 也有 offset 很小的重叠拷贝 (DESIGN.md §3 点名最易错的地方)。 */
+    memset(ref, 0, seg);
+    for (uint32_t i = 0; i < seg; i++) {
+        if (i % 97 == 0) ref[i] = (uint8_t)(i * 31u + 7u);
+        if (i >= seg / 2 && i < seg / 2 + 512) ref[i] = (uint8_t)(i & 3u);
+    }
+
+    uint32_t soff0 = 0;
+    for (int e = 0; e < g_pl_n; e++) {
+        int clen = LZ4_compress_default((const char *)ref, (char *)g_comp_virt,
+                                        (int)seg, (int)PL_COMP_BYTES);
+        if (clen <= 0) {
+            logts("WARN: PL 自检: 本地 LZ4 压缩失败 rc=%d", clen);
+            free(ref); free(cmp); return -1;
+        }
+        uint32_t dst_off = (uint32_t)e * seg;
+        memset(g_plst_virt + dst_off, 0xa5, seg);   /* 先脏化, 免得"没写"也算过 */
+        wmb_frame();
+
+        char why[192];
+        /* 不走 pl_run: 那个是"派活给任意空引擎", 而自检要**点名**每个引擎 */
+        pl_start(e, g_comp_phys + soff0, (uint32_t)clen,
+                 g_plst_phys + dst_off, seg);   /* 新鲜度由 pl_start 当场确认 */
+        long t0 = mono_ms();
+        int ok = 0;
+        for (;;) {
+            uint32_t st = pl_rd(e, PL_REG_STATUS);
+            if (st & PL_ST_ERROR) {
+                snprintf(why, sizeof why, "STATUS=0x%08x err_code=%u %s",
+                         st, PL_ST_ECODE(st), pl_errname(PL_ST_ECODE(st)));
+                logts("WARN: PL 自检: 引擎%d 报错 (%s) -> 判死", e, why);
+                g_pl_dead[e] = 1;
+                break;
+            }
+            if (st & PL_ST_DONE) { ok = 1; break; }
+            if (mono_ms() - t0 > 200) break;
+            usleep(100);
+        }
+        if (g_pl_dead[e]) continue;
+        if (!ok) {
+            logts("WARN: PL 自检: 引擎%d 200 ms 内没等到 STATUS[0]=done -> 判死 "
+                  "(基址 0x%08x, 步距 0x%x —— PL 在比特流里吗? 这个引擎存在吗? "
+                  "NENG 是不是比 --pl-engines 小?)",
+                  e, g_pl_base + (uint32_t)e * g_pl_stride, g_pl_stride);
+            g_pl_dead[e] = 1;
+            continue;
+        }
+        memcpy(cmp, g_plst_virt + dst_off, seg);    /* WC 读慢, 16 KB 只此一次 */
+        if (memcmp(cmp, ref, seg) != 0) {
+            uint32_t k = 0;
+            while (k < seg && cmp[k] == ref[k]) k++;
+            logts("WARN: PL 自检: 引擎%d 解出来与 liblz4 不一致, 第 %u 字节起 "
+                  "(got 0x%02x want 0x%02x) -> 判死 —— 数据通路有问题, 不是配置问题",
+                  e, k, cmp[k], ref[k]);
+            g_pl_dead[e] = 1;
+            continue;
+        }
+        uint32_t cyc = pl_rd(e, PL_REG_CYCLES);
+        logts("PL 自检: 引擎%d @0x%08x OK (%u B / %u cyc = %.2f B/clk)",
+              e, g_pl_base + (uint32_t)e * g_pl_stride, seg, cyc,
+              cyc ? (double)seg / cyc : 0.0);
+    }
+    free(ref); free(cmp);
+    /* 逐引擎判决, 不是一票否决: NENG 比 --pl-engines 小、或者某一个引擎接线
+     * 有问题时, 剩下的照样能用 (降级 = 掉帧, 不是黑屏)。全挂了才算自检没过。 */
+    pl_recount_live();
+    if (g_pl_live == 0) return -1;
+    if (g_pl_live < g_pl_n)
+        logts("⚠ PL 自检: %d/%d 个引擎可用, 其余已判死 —— 按 %d 个引擎降级运行 "
+              "(每帧能力 %.2fx)", g_pl_live, g_pl_n, g_pl_live,
+              (double)g_pl_live / g_pl_n);
+    return 0;
+}
+
+/* 回退原因只在**变化时**打一行: 26 fps 下逐帧打会刷屏, 但一个字都不打就成了
+ * "PL 开了却一直没生效, 日志里看不出来" —— 那正是本项目最怕的静默。 */
+static void pl_note_fallback(const char *why)
+{
+    static const char *last;
+    g_w_pl_fb++;
+    g_pl_fb_frames++;
+    if (last && strcmp(last, why) == 0) return;
+    last = why;
+    logts("PL 回退 CPU: %s", why);
+}
+
+/* 把 n 条流从 cbuf 搬进 comp 缓冲, 每条落点对齐到 PL_SRC_ALIGN, 填 soff[]。
+ * 🔴 对齐不是洁癖: lz4_axi_top 的读侧 `rd_ptr <= src_addr` 之后每拍取 8 字节、
+ *    从 rd_buf[7:0] 开始吃, 也就是**假设 src_addr 8 字节对齐**。MSTREAM 载荷
+ *    里各流是紧挨着排的, 第 2 条起偏移是任意字节 —— 直接喂过去会从对齐字的
+ *    头开始解 = 一堆垃圾, 而且不一定报错。反正这一次 memcpy 本来就要做
+ *    (压缩流得进 PL 看得见的 DDR), 顺手对齐, 这类风险就整类消失。
+ *    每条流末尾还留 8 字节余量, 因为读侧最后一拍会整拍取。 */
+static int pl_stage_streams(const uint8_t *cbuf, const face_job_t *jobs, int n,
+                            uint32_t *soff)
+{
+    uint32_t o = 0, si = 0;
+    for (int i = 0; i < n; i++) {
+        o = (o + PL_SRC_ALIGN - 1u) & ~(PL_SRC_ALIGN - 1u);
+        if ((uint64_t)o + jobs[i].src_len + 8u > PL_COMP_BYTES) return -1;
+        soff[i] = o;
+        memcpy(g_comp_virt + o, cbuf + si, jobs[i].src_len);
+        si += jobs[i].src_len;
+        o  += jobs[i].src_len;
+    }
+    wmb_frame();          /* WC 弱序: 压缩流先落地, 再谈 start */
+    return 0;
+}
+
+/* 一帧: 压缩流进 DDR -> 派给引擎 (**只发车, 不等**)。
+ * 返回 0 = 已发车 (随后要 pl_sched_wait), -3 = comp 缓冲装不下 (这不是 PL 的
+ * 错, 调用方别据此判它死刑)。 */
+static int pl_launch_frame(pl_sched_t *sch, const uint8_t *cbuf,
+                           const face_job_t *jobs, int n, uint32_t bank_phys,
+                           char *why, size_t whycap)
+{
+    uint32_t soff[PVS_MAX_STREAMS];
+    if (pl_stage_streams(cbuf, jobs, n, soff) != 0) {
+        snprintf(why, whycap, "comp 缓冲 %u B 装不下 %d 条流 (含 %u B 对齐)",
+                 (unsigned)PL_COMP_BYTES, n, (unsigned)PL_SRC_ALIGN);
+        return -3;
+    }
+    pl_sched_launch(sch, jobs, n, soff, g_comp_phys, bank_phys);
+    if (sch->rc) {                  /* 一个活引擎都没有 -> 根本没发出去 */
+        snprintf(why, whycap, "%s", sch->why);
+        return sch->rc;
+    }
+    return 0;
+}
+
+/* ==== v3.5b 流水线: 一帧在飞 ==============================================
+ * 为什么必须流水线 (2026-08-24 链路复核后的定案): 板子只有 WiFi 而且**是物理
+ * 必然** —— Zynq 跟着 LED 屏一起以 11.1 rev/s 转, 插不了网线。实测收一帧
+ * (~300 KB) 要 55-80 ms, 那就是这条 USB WiFi 的真实能力 (30-44 Mbps), 换环境
+ * 也不会变好。于是:
+ *     串行   recv(55-80) + PL(75)  = 130-155 ms => 6.5-7.7 fps
+ *     流水线 max(recv, PL)         =  75-80 ms  => 12.5-13 fps => 撞上转速上限
+ * 花 3 个引擎把 dec+cpy 的 238 ms 干掉, 再让串行 recv 吃回去 55-80 ms, 不值。
+ *
+ * 做法: 给 PL 发完车就**立刻 ACK**, 然后回去收下一帧; 下一帧收完再回来收割。
+ *   ACK 的语义因此从"已显示"变成"**已交给硬件**"。这是有意的裁定:
+ *   内容是实时动画, 出错的唯一后果是丢一帧, 而丢帧本来就是既有策略
+ *   (newest frame wins), "已交给硬件" 与 "已显示" 在这个场景没有实际差别。
+ *
+ * 🔴 错误报告因此**晚一帧**。所以日志里必须把帧号写清楚: NAK 那个字节在线上
+ *    对应的是**刚收到的这一帧**, 而真正解坏的是**上一帧**。两个 seq 都打出来,
+ *    不然现场对不上号。
+ *
+ * 🔴 bank 归属的关键次序 (这里是最容易出静默撕裂的地方):
+ *    **先把上一帧发布出去, 再认领本帧的 bank**。反过来的话 RX 会同时占着两块
+ *    (上一帧待翻 + 本帧在写), 加上 active 就是 3 块全占, 而 flip 线程正等着
+ *    翻页窗 (最坏一整圈 90 ms) 期间 active 还没换 —— 认领到的必然是**正在显示
+ *    的那块**。按"先发布再认领"走, RX 任何时刻只占一块:
+ *    上一帧若还没被翻走, bank_claim 会就地顶替它 (= 既有的最新帧赢策略)。
+ *
+ * 🔴 交叉验证的源**不能用 cbuf**: 出错是在收完下一帧之后才发现的, 那时 cbuf
+ *    已经装着下一帧了。所以用 comp 缓冲里那份 (WC 读慢, 但只在出错时读一次),
+ *    而且正因为这样, comp 缓冲**不需要双缓冲** —— 它只在 pl_stage_streams
+ *    那一刻被写, 而下一帧的 stage 必然发生在本帧收割之后 (引擎是同一套硬件,
+ *    PL(N) 本来就不能在 PL(N-1) 完成前开始)。映射窗因此一个字节都不用涨。 */
+static struct {
+    int        active;
+    unsigned   seq;                     /* 帧号: 日志要对得上 */
+    int        bank;
+    uint32_t   raw_len, n_slices, stride, face_b_off, fold_a, bpp3;
+    uint32_t   comp_len, flags;
+    int        n;
+    long       t_launch_us;
+    pl_sched_t sch;
+} g_plp;
+
+/* 收割上一帧: 等 done -> (出错则交叉验证) -> 发布。
+ * 返回 0 = 处理完了 (画面已发布或已按丢帧处理), -1 = 压缩流是坏的, 调用方 NAK。
+ * 无论返回什么, g_plp.active 都会被清掉。 */
+static int pl_pending_settle(unsigned cur_seq)
+{
+    if (!g_plp.active) return 0;
+    g_plp.active = 0;
+
+    long t_block = mono_us();
+    int prc = pl_sched_wait(&g_plp.sch);
+    t_block = mono_us() - t_block;          /* 流水线奏效时这里应该 ~0 */
+    long t_pl = mono_us() - g_plp.t_launch_us;
+
+    g_w_plw_us += (unsigned long)t_block;
+    if ((unsigned long)t_block > g_w_plw_max) g_w_plw_max = (unsigned long)t_block;
+
+    int in_buf = 0;
+    if (prc == 0) {
+        g_w_pl_us += (unsigned long)t_pl;
+        if ((unsigned long)t_pl > g_w_pl_max) g_w_pl_max = (unsigned long)t_pl;
+        g_w_pl_n++;
+    } else {
+        logts("PL 解码失败 (%s): 出错的是**帧 seq=%u**(不是刚收到的 seq=%u); %s",
+              prc == -2 ? "超时" : "STATUS[1]=error", g_plp.seq, cur_seq,
+              g_plp.sch.why);
+        if (prc == -2) {
+            /* 🔴 超时 = 引擎卡死 (已知失效模式: 流长度不对时 busy 恒 1)。
+             * **不能只是"这帧转 CPU"** —— 那个引擎还卡着, 下一帧再派给它又
+             * 超时, 一路退化。把它摘出派发池, 剩下的继续跑; 全挂了才关 PL。
+             * 必须在下面那次"CPU 结果 memcpy 回 bank"之前做完。 */
+            pl_reap_stuck(&g_plp.sch);
+        }
+        /* 交叉验证: 源用 comp 缓冲里那份 (cbuf 已经被下一帧占了), 目标是
+         * staging。解得出来 = 引擎的锅; 解不出来 = 流真的坏了。 */
+        face_job_t jb[PVS_MAX_STREAMS];
+        uint32_t doff = 0;
+        for (int i = 0; i < g_plp.n; i++) {
+            jb[i] = g_plp.sch.jobs[i];
+            jb[i].src  = g_comp_virt + g_plp.sch.soff[i];
+            jb[i].dst  = g_wr.buf + doff;
+            jb[i].prev = NULL;
+            doff += jb[i].dst_len;
+        }
+        if (dec_run(jb, g_plp.n) == 0) {
+            /* 只有 STATUS[1]=error (prc==-1) 才谈得上"引擎解错了" —— 超时那条
+             * 已经由 pl_reap_stuck 判过并摘了引擎, 别在这儿重复地把整个 PL 关掉
+             * (那正好废掉"3 个挂 1 个还能降级跑"这条路)。 */
+            if (prc == -1 && g_pl_ok) {
+                g_pl_ok = 0;
+                logts("🔴 同一份数据 CPU 用 liblz4 解出来了 ⇒ **PL 引擎有问题**, "
+                      "不是流坏。永久关闭 PL 解码, 全部回退 CPU。"
+                      "帧 seq=%u 照常上屏, 一帧都不丢。", g_plp.seq);
+            }
+            memcpy(g_bank[g_plp.bank], g_wr.buf, g_plp.raw_len);
+            wmb_frame();
+            in_buf = 1;
+        } else {
+            char w2[256];
+            dec_errline(jb, g_plp.n, w2, sizeof w2);
+            logts("NAK: 帧 seq=%u 的压缩流 PL 和 CPU 都解不出来 ⇒ 流本身是坏的 "
+                  "(%s)。⚠ 线上这个 NAK 字节对应的是 seq=%u —— 流水线让错误报告"
+                  "晚了一帧, 发送端会重连+重发 keyframe, 结果一样。",
+                  g_plp.seq, w2, cur_seq);
+            return -1;
+        }
+    }
+
+    /* 发布。⚠ 必须在调用方认领下一帧的 bank **之前** (见上面那段 🔴)。 */
+    g_wr.raw_len    = g_plp.raw_len;
+    g_wr.n_slices   = g_plp.n_slices;
+    g_wr.stride     = g_plp.stride;
+    g_wr.face_b_off = g_plp.face_b_off;
+    g_wr.fold_a     = g_plp.fold_a;
+    g_wr.bpp3       = g_plp.bpp3;
+    g_wr.bank       = g_plp.bank;
+    /* PL 帧不留 DELTA 参考帧 (输出在 WC bank 里, 读回来比省下的还贵)。回退到
+     * CPU 的那一帧数据确实在 staging 里, 但它前面/后面都可能是 PL 帧, 参考链
+     * 已经断了 —— 统一作废, 由 g_pl_delta_off 那条路负责整体退回 CPU。 */
+    g_prev_valid = 0; g_prev_len = 0; g_prev_face_b_off = 0;
+
+    uint32_t crc = 0;
+    if (g_crc_on)
+        crc = crc32(0L, in_buf ? g_wr.buf : g_bank[g_plp.bank], g_plp.raw_len);
+
+    pthread_mutex_lock(&g_mu);
+    if (g_ready_gen != g_consumed_gen) g_st_drop++;
+    { stage_t t = g_wr; g_wr = g_ready; g_ready = t; }
+    g_ready_gen++;
+    pthread_mutex_unlock(&g_mu);
+    g_st_rx++;
+    g_st_dec_us += (unsigned long)t_block;
+    g_w_dec_us += (unsigned long)t_block;
+    if ((unsigned long)t_block > g_w_dec_max) g_w_dec_max = (unsigned long)t_block;
+    g_w_dec_n++;
+
+    /* FRAME 行在**收割时**打, 不在 ACK 时打: ACK 那会儿帧还没解完, crc 算不出
+     * 来。收割永远发生在下一帧被处理之前, 所以行序仍然是 0,1,2,… 不会乱。 */
+    if (g_crc_on)
+        logts("FRAME seq=%u n=%u comp=%u flags=0x%x crc=%08x dec=%.1fms "
+              "pl=%.1fms %dstr/PL%s", g_plp.seq, g_plp.n_slices, g_plp.comp_len,
+              g_plp.flags, crc, t_block / 1000.0, t_pl / 1000.0, g_plp.n,
+              in_buf ? "->CPU" : "");
+    else
+        logts("FRAME seq=%u n=%u comp=%u flags=0x%x dec=%.1fms pl=%.1fms "
+              "%dstr/PL%s", g_plp.seq, g_plp.n_slices, g_plp.comp_len,
+              g_plp.flags, t_block / 1000.0, t_pl / 1000.0, g_plp.n,
+              in_buf ? "->CPU" : "");
+    return 0;
+}
+
 /* ---- 空闲动画 (--idle-anim FILE) -----------------------------------------
  * 需求: 上电就有画面, 一旦有人推流就显示推的内容。
  * 做法: 没有客户端连接时, 由本进程按 --idle-fps 逐帧播放一个预压缩容器;
@@ -1270,20 +2192,56 @@ static void idle_anim_step(void)
     j2[0].dst = g_wr.buf;        j2[0].dst_len = fbo ? fbo : raw_len;
     uint32_t codec = g_anim_flags & PVS_FLAGS_CODEC;   /* flag 位原样, 不是枚举 */
     j2[0].codec = codec;
+    int nj = 1;
     if (fbo) {
         j2[1].src = p0 + clen_a; j2[1].src_len = len - clen_a;
         j2[1].dst = g_wr.buf + fbo; j2[1].dst_len = raw_len - fbo;
         j2[1].codec = codec;
-        if (dec_run(j2, 2) != 0) return;
-    } else {
-        face_decode(&j2[0]);
-        if (j2[0].rc) return;
+        nj = 2;
+    }
+
+    /* v3.5: PL 模式下 bank 由本线程写 (网络帧那条路径同理, 见 serve_client)。
+     * 现有的固化容器 (anim.pvs / helix3b.pvs) 都是 **zlib**, 所以实际会走 CPU
+     * 回退 —— 想让开机固化的内容也吃到 PL, 得用 lz4 重打一份容器。 */
+    int ib = -1, in_bank = 0;
+    if (g_pl_on && g_pl_ok && (codec & PVS_FLAG_LZ4) && len <= PL_COMP_BYTES) {
+        /* 空闲动画**不流水线**: 没有网络可重叠 (载荷就在本地 mmap 里),
+         * 而且它只跑 8-11 fps。发车后立刻等, 逻辑最简单。 */
+        char why[256];
+        static pl_sched_t sch;
+        ib = bank_claim();
+        int prc = pl_launch_frame(&sch, p0, j2, nj, g_bank_phys[ib],
+                                  why, sizeof why);
+        if (prc == 0) {
+            prc = pl_sched_wait(&sch);
+            if (prc == 0) in_bank = 1;
+            else snprintf(why, sizeof why, "%s", sch.why);
+        }
+        if (prc != 0) {
+            logts("idle-anim: PL 解码失败 (%s) -> 本帧回退 CPU", why);
+            if (prc == -2) pl_reap_stuck(&sch);   /* 摘掉卡死的, 别整个关掉 */
+        }
+    } else if (g_pl_on) {
+        pl_note_fallback(!g_pl_ok        ? "PL 已被判死 (见上面的 WARN)"
+                       : !(codec & PVS_FLAG_LZ4) ? "idle-anim 容器不是 lz4"
+                                          : "idle-anim 压缩流比 comp 缓冲大");
+    }
+    if (!in_bank) {
+        if (nj == 2) { if (dec_run(j2, 2) != 0) return; }
+        else { face_decode(&j2[0]); if (j2[0].rc) return; }
+        if (g_pl_on) {
+            if (ib < 0) ib = bank_claim();
+            memcpy(g_bank[ib], g_wr.buf, raw_len);
+            wmb_frame();
+            in_bank = 1;
+        }
     }
 
     g_wr.raw_len = raw_len; g_wr.n_slices = g_anim_slices; g_wr.face_b_off = fbo;
     g_wr.stride = stride;
     g_wr.fold_a = !!(g_anim_flags & PVS_FLAG_FOLD_A);
     g_wr.bpp3   = !!(g_anim_flags & PVS_FLAG_3BIT);
+    g_wr.bank   = g_pl_on ? ib : -1;
     pthread_mutex_lock(&g_mu);
     if (g_ready_gen != g_consumed_gen) g_st_drop++;
     stage_t t = g_wr; g_wr = g_ready; g_ready = t;
@@ -1353,6 +2311,47 @@ static void *flip_thread(void *arg)
                           g_w_hdr_max / 1000.0,
                           rn ? g_w_body_us / (double)rn / 1000.0 : 0.0,
                           g_w_body_max / 1000.0);
+                    /* v3.5 PL 段单独一行 (**追加**, 不动 DIAG 行的既有字段
+                     * —— tools/phase_bench.py 的 DIAG_RE 是按顺序匹配到
+                     * body 为止的, 前面动一个字段就全废)。
+                     *   pl   PL 解码墙钟 (= 老口径的 dec)
+                     *   B/clk 实测吞吐: 输出字节 / CYCLES, 决定要几个引擎
+                     *   fb   本窗内回退 CPU 的帧数, 不为 0 就该去看上面的原因行 */
+                    if (g_pl_on) {
+                        unsigned long pn = g_w_pl_n;
+                        /* wait = RX 线程**真正阻塞**在等 done 上的时间。
+                         * 流水线奏效时它应该 ~0 (PL 藏在 recv 后面);
+                         * 它逼近 pl 就说明 recv 比解码快, 瓶颈换边了。 */
+                        double bpc = g_w_pl_cyc
+                                   ? (double)g_w_pl_out / g_w_pl_cyc : 0.0;
+                        logts("PLDIAG pl %.1f/%.1fms wait %.1f/%.1fms n=%lu "
+                              "%.2fB/clk out=%luKB eng=%d/%d fb=%lu ok=%d pipe=%s",
+                              pn ? g_w_pl_us / (double)pn / 1000.0 : 0.0,
+                              g_w_pl_max / 1000.0,
+                              pn ? g_w_plw_us / (double)pn / 1000.0 : 0.0,
+                              g_w_plw_max / 1000.0, pn, bpc,
+                              g_w_pl_out / 1024u, g_pl_live, g_pl_n,
+                              g_w_pl_fb, g_pl_ok, g_pl_serial ? "off" : "on");
+                        /* BD 交付时给了一把现成的尺子: 95 片一条流应该是
+                         * 3.63-3.77M aclk = 0.93-0.97 B/clk。明显更低就说明
+                         * 有小事务或 DDR 争用 (pair_miss 也该同时涨)。把它变成
+                         * 自动告警, 免得每次都要有人去手算 CYCLES。 */
+                        {
+                        static int bpc_low;         /* 每"次"低于线只报一行,
+                                                     * 但恢复后再掉下去会再报 */
+                        if (pn && bpc > 0.0 && bpc < PL_BPC_WARN) {
+                            if (!bpc_low++)
+                                logts("⚠ PL 吞吐 %.2f B/clk 低于预期下限 %.2f "
+                                      "(BD 基准: 95 片一条流 3.63-3.77M aclk "
+                                      "= 0.93-0.97 B/clk) —— 八成是小事务或 DDR "
+                                      "争用, 去看 pair_miss 的**增长率**(冷启动后测, "
+                                      "它的绝对值早就饱和在 65535 且没有软件清零口)",
+                                      bpc, PL_BPC_WARN);
+                        } else if (pn && bpc >= PL_BPC_WARN) {
+                            bpc_low = 0;
+                        }
+                        }
+                    }
                     /* 单独一行, 免得 DIAG 行长到串口换行。字段顺序被
                      * tools/phase_bench.py 的 PHASE_RE 依赖, 改要一起改。 */
                     unsigned long gn = g_w_gap_n;
@@ -1370,6 +2369,9 @@ static void *flip_thread(void *arg)
                 memset(g_w_arr, 0, sizeof g_w_arr);
                 g_w_gap_us = g_w_gap_max = g_w_gap_n = g_w_rev1 = g_w_rev2 = 0;
                 g_w_poll_us = g_w_adv = 0;
+                g_w_pl_us = g_w_pl_max = g_w_pl_n = 0;
+                g_w_pl_cyc = g_w_pl_out = g_w_pl_fb = 0;
+                g_w_plw_us = g_w_plw_max = 0;
             }
             stat_rx0 = rx; stat_flip0 = fl; stat_t0 = now;
         }
@@ -1381,6 +2383,13 @@ static void *flip_thread(void *arg)
             stage_t t = g_disp; g_disp = g_ready; g_ready = t;
             g_consumed_gen = g_ready_gen;
             fresh = 1;
+            /* v3.5 PL 模式: 数据已经在 bank 里, 这一刻它从 held 变成 active,
+             * 于是"两次翻页之前退下来的那块"成为 RX 下一个可认领的 bank。
+             * 必须**在同一把锁里**更新, 否则 RX 可能认领到正要上屏的这块。 */
+            if (g_disp.bank >= 0) {
+                g_bank_free = (g_disp.bank + 1) % FRAME_BANKS;
+                g_bank_held = -1;
+            }
         }
         pthread_mutex_unlock(&g_mu);
         if (!fresh) { usleep(500); continue; }
@@ -1397,11 +2406,19 @@ static void *flip_thread(void *arg)
          * 双面帧的 [面A][面B] 是连着的, 所以仍然只是一次 memcpy; 拆分只体现
          * 在两个基址寄存器上。单面 360 帧: raw_len == PVS_FRAME_RAW, 与 v2
          * 逐字节相同。 */
-        int idle = active + 1;
-        if (idle >= FRAME_BANKS) idle = 0;      /* A -> B -> C -> A 轮转 */
+        /* v3.5: bank>=0 = RX 线程(PL 直写 / CPU 回退时自己 memcpy)已经把数据
+         * 放进去了 —— 这里**一次 memcpy 都不做**, 只剩寄存器。这就是 cpy 那
+         * 80 ms 消失的地方。 */
+        int idle;
         long t_cpy = mono_us();
-        if (!g_nocopy)                          /* --diag-nocopy: 消融实验 */
-            memcpy(g_bank[idle], g_disp.buf, g_disp.raw_len);
+        if (g_disp.bank >= 0) {
+            idle = g_disp.bank;
+        } else {
+            idle = active + 1;
+            if (idle >= FRAME_BANKS) idle = 0;  /* A -> B -> C -> A 轮转 */
+            if (!g_nocopy)                      /* --diag-nocopy: 消融实验 */
+                memcpy(g_bank[idle], g_disp.buf, g_disp.raw_len);
+        }
         wmb_frame();
         t_cpy = mono_us() - t_cpy;              /* 诊断: 进 DDR bank 的耗时 */
 
@@ -1636,6 +2653,22 @@ static int serve_client(int fd, uint8_t *cbuf)
             }
         }
 
+        /* v3.5: PL 路径**不留 DELTA 参考帧** —— PL 的输出直接落在 WC 的 DDR
+         * bank 里, 而 XOR 要把上一帧原样读回来; WC 读极慢 (10 MB 读回比省下的
+         * 解码时间还多, feedback_lz4_onboard_reality_check 记过这条)。
+         * 所以一见到 DELTA 帧就把**整条连接**退回 CPU 解码路径。本帧仍然要
+         * NAK 一次 (此刻确实没有参考帧), 但 povstream 收到 delta 的 NAK 会自动
+         * **重连 + 重发 keyframe**, 那一帧走 CPU 把参考帧建起来, 之后 DELTA 链
+         * 正常 ⇒ 全程只 NAK 一次。
+         * 🔴 这个开关必须是**进程级**的, 不能做成"本连接": 板端任何 NAK 都会
+         * 关连接, 而重连后如果 PL 又打开, 下一个 delta 帧照样 NAK -> 又重连,
+         * 就成了 NAK/重连风暴。踩点就在这里。 */
+        if ((h.flags & PVS_FLAG_DELTA) && g_pl_on && !g_pl_delta_off) {
+            g_pl_delta_off = 1;
+            logts("⚠ 收到 DELTA 帧 -> 本连接退回 CPU 解码 (PL 直写 bank 不留参考帧)。"
+                  "想吃 PL 的速度就别开发送端的 --delta; 想要 DELTA 就别开 --pl-lz4。");
+        }
+
         /* DELTA 无参考帧 (连接首帧/重连后) -> NAK, 发送端降级重发关键帧 */
         if ((h.flags & PVS_FLAG_DELTA) && !g_prev_valid) {
             logts("NAK: DELTA frame with no reference (need keyframe first)");
@@ -1777,6 +2810,19 @@ static int serve_client(int fd, uint8_t *cbuf)
          * 发送端被 TCP 背压顶住, 下一帧更晚 —— 越锁越差。 */
         long t_gate = phase_gate();
 
+        unsigned my_seq = seq++;
+
+        /* ---- v3.5b 流水线: 收割上一帧 ------------------------------------
+         * 这一句以上的所有时间 (等帧头 + 收帧体, 实测 55-80 ms) 都与上一帧的
+         * PL 解码**重叠**。收割放在这里而不是更早, 就是为了把重叠拉到最大。
+         * 🔴 它必须在下面 bank_claim 之前 —— 先发布再认领, 见 g_plp 上方那段。
+         * (更早的那些 NAK/断线 return 不在这里收割: 由 main 在 serve_client
+         *  返回后统一兜底, 免得在十几个 return 点各写一遍还漏掉。) */
+        if (pl_pending_settle(my_seq) != 0) {
+            send_byte(fd, PVS_NAK);
+            return -1;
+        }
+
         g_log_stride = stride;              /* decode plan 日志按本帧片距换算 */
         long dec_t0 = mono_us();
         /* 🔴 诊断口径: **每个解码核的墙钟**, 不是"每一面"。
@@ -1786,7 +2832,126 @@ static int serve_client(int fd, uint8_t *cbuf)
          * 换成了可变长 jobs[] + dec_plan, 文本能合但编译不过。 */
         long core0_us = 0, core1_us = 0;
 
-        if (nstr || face_b_off) {
+        /* ---- v3.5: 这一帧走 PL 还是 CPU --------------------------------- */
+        int use_pl = 0;
+        if (g_pl_on) {
+            const char *no = NULL;
+            if (g_pl_delta_off)                  no = "这条流用 DELTA";
+            else if (!g_pl_ok)                   no = "PL 已被判死 (见上面的 WARN)";
+            else if (g_pl_live <= 0)             no = "没有可用的 PL 引擎";
+            else if (!(h.flags & PVS_FLAG_LZ4))  no = "PL 只认 lz4 raw block, 本帧不是";
+            else if (body_len > PL_COMP_BYTES)   no = "压缩流比 comp 缓冲还大";
+            else use_pl = 1;
+            /* 🔴 单条流"短到不可能解出 dst_len"要挡在硬件外面。引擎遇到
+             * "源字节耗尽而 raw_len 没到"会 **busy 恒 1 卡死**, 而 RTL 没有软
+             * 复位 —— 代价是一个引擎永久报废, 远大于这里几行判断。
+             * MSTREAM 的两个求和自校验**管不到单条流的 raw_len**, 所以校验过
+             * 了也不代表安全。
+             * 判据是 LZ4 raw block 的**必要条件**: 一个 token 最多靠 match 长度
+             * 扩展字节把 1 字节放大到 255 字节 ⇒ src*255 + 常数 < dst 时绝无可能。
+             * 挡下来的帧不 NAK, 而是交给 CPU —— LZ4_decompress_safe 不会卡死,
+             * 由它给出权威结论 (解不出来自然 NAK, 消息也更准确)。 */
+            if (use_pl && nstr) {
+                for (uint32_t i = 0; i < nstr; i++) {
+                    if ((uint64_t)s_clen[i] * 255ull + 64ull <
+                        (uint64_t)s_nsl[i] * stride) {
+                        no = "有流短到不可能解出 dst_len (会把引擎卡死) -> 交给 CPU 判";
+                        use_pl = 0;
+                        break;
+                    }
+                }
+            }
+            if (!use_pl) pl_note_fallback(no ? no : "?");
+        }
+
+        int pl_bank = -1;   /* >=0 = 已认领的 DDR bank (PL 模式下 RX 自己认领) */
+        int in_bank = 0;    /* 1 = 帧已经躺在 g_bank[pl_bank] 里 */
+        int in_buf  = 0;    /* 1 = 帧已经躺在 g_wr.buf 里 (老路径) */
+
+        if (use_pl) {
+            /* 与下面 CPU 分支**同一套**流切分 (nstr / 按面两条 / 单条), 只是
+             * dst 换成 bank 里的物理落点。单流帧在这里也当成 n=1 走, 不再走
+             * 那条"单面直接 LZ4_decompress_safe"的老捷径。 */
+            face_job_t jobs[PVS_MAX_STREAMS];
+            uint32_t n = nstr ? nstr : (face_b_off ? 2u : 1u);
+            uint32_t cl[2] = { clen_a, clen_b };
+            uint32_t dl[2] = { face_b_off, h.raw_len - face_b_off };
+            uint32_t soff = 0, doff = 0;
+            memset(jobs, 0, sizeof jobs);
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t clen = nstr ? s_clen[i] : (face_b_off ? cl[i] : body_len);
+                uint32_t dlen = nstr ? s_nsl[i] * stride
+                                     : (face_b_off ? dl[i] : h.raw_len);
+                jobs[i].src     = cbuf + soff;   /* CPU 交叉验证时才真的用 */
+                jobs[i].src_len = clen;
+                jobs[i].dst     = g_wr.buf + doff;
+                jobs[i].dst_len = dlen;
+                jobs[i].prev    = NULL;          /* PL 帧从不带 DELTA */
+                jobs[i].codec   = PVS_FLAG_LZ4;
+                soff += clen;
+                doff += dlen;
+            }
+            /* 🔴 先发布(上面 settle 已做)再认领 —— 这样 RX 任何时刻只占一块
+             * bank。上一帧若还没被翻走, bank_claim 就地顶替它 = 既有的
+             * "最新帧赢"策略。 */
+            pl_bank = bank_claim();
+            char why[256];
+            if (n > (uint32_t)g_pl_n) {
+                static int noted;
+                if (!noted++)
+                    logts("NOTE: 载荷 %u 条流 > %d 个引擎 —— 多出来的流要等引擎"
+                          "空出来才发得出去, 而流水线模式下那会儿 RX 正阻塞在 "
+                          "recv 里没人 poll ⇒ 它们要等到下一帧收完才起跑。"
+                          "把发送端的流数切成正好 %d 条。", n, g_pl_n, g_pl_n);
+            }
+            int prc = pl_launch_frame(&g_plp.sch, cbuf, jobs, (int)n,
+                                      g_bank_phys[pl_bank], why, sizeof why);
+            if (prc == -3) {
+                pl_note_fallback("comp 缓冲对齐后装不下这些流");
+                logts("PL 回退细节: %s", why);
+            } else {
+                /* 发车成功 -> 记成"在飞的那一帧"。几何信息要一起存下来, 因为
+                 * 收割时 h/stride/face_b_off 这些局部量早就是下一帧的了。 */
+                g_plp.active     = 1;
+                g_plp.seq        = my_seq;
+                g_plp.bank       = pl_bank;
+                g_plp.raw_len    = h.raw_len;
+                g_plp.n_slices   = n_slices;
+                g_plp.stride     = stride;
+                g_plp.face_b_off = face_b_off;
+                g_plp.fold_a     = (h.flags & PVS_FLAG_FOLD_A) ? 1u : 0u;
+                g_plp.bpp3       = (h.flags & PVS_FLAG_3BIT) ? 1u : 0u;
+                g_plp.comp_len   = h.comp_len;
+                g_plp.flags      = h.flags;
+                g_plp.n          = (int)n;
+                g_plp.t_launch_us = mono_us();
+                if (g_pl_serial) {
+                    /* --no-pipeline: 发车即收割, 语义与 v3.5 串行版逐字节一致
+                     * (ACK 仍然在"解完之后"发)。 */
+                    if (pl_pending_settle(my_seq) != 0) {
+                        send_byte(fd, PVS_NAK);
+                        return -1;
+                    }
+                } else {
+                    /* 🔴 流水线: **立刻 ACK**, 让发送端马上开始发下一帧, 它的
+                     * 55-80 ms 就藏在本帧 PL 的 75 ms 后面。ACK 的语义因此是
+                     * "已交给硬件", 不是"已显示" —— 裁定与理由见 g_plp 上方。
+                     * FRAME 行由收割时打 (那时 crc 才算得出来)。 */
+                    /* 发车本身的开销 (压缩流那次 ~300 KB 的 memcpy + 4 次
+                     * 寄存器写) 只有 ~1 ms; dec/DIAG 的账统一由收割那边记,
+                     * 免得同一帧被计两次。 */
+                    ema_add(&g_ema_svc_us, t_body + (mono_us() - dec_t0));
+                    (void)t_gate; (void)t_hdr;
+                }
+                if (send_byte(fd, PVS_ACK) != 0) return -1;
+                if (g_stop) return -1;
+                continue;
+            }
+        }
+
+        if (in_bank || in_buf) {
+            /* PL 分支已经把帧弄出来了, 跳过下面的 CPU 解码 */
+        } else if (nstr || face_b_off) {
             /* 多条独立流 -> 多个 job -> dec_plan 按片数摊到两个核。
              * 每条流各自 XOR 参考帧里**同偏移**的那一段 (参考帧布局已在头校验
              * 里确认与本帧一致); 流的边界是片边界, 逐字节 XOR 天然对齐。
@@ -1862,8 +3027,25 @@ static int serve_client(int fd, uint8_t *cbuf)
             if (h.flags & PVS_FLAG_DELTA)
                 xor_frame(g_wr.buf, g_prev, h.raw_len);
         }
+        if (!in_bank && !in_buf) in_buf = 1;   /* 上面两条 CPU 分支都写 g_wr.buf */
 
-        long dec_us = mono_us() - dec_t0;   /* 解码耗时: 不含 crc, 不含翻页 */
+        /* ---- v3.5 PL 模式收尾: bank 由 **RX 线程**负责写 ------------------
+         * 走 PL 的帧已经在 bank 里了 (PL 直写, 零拷贝)。回退到 CPU 的帧还在
+         * staging 里, 这里由 RX 自己 memcpy 进 bank —— 不能留给 flip 线程,
+         * 因为 PL 模式下 bank 轮转的所有权在 RX 手上, 两个线程各算一遍"下一个
+         * 空闲 bank"必然撞车。代价是这一帧的 memcpy 不再与收包重叠, 但这是
+         * **回退路径**, 慢一点也要先正确, 而且日志里已经说清为什么会走到这。*/
+        if (g_pl_on && !in_bank) {
+            if (pl_bank < 0) pl_bank = bank_claim();
+            memcpy(g_bank[pl_bank], g_wr.buf, h.raw_len);
+            wmb_frame();
+            in_bank = 1;
+        }
+
+        long dec_us = mono_us() - dec_t0;   /* 解码耗时: 不含 crc, 不含翻页。
+                                             * PL 模式下它含 PL 墙钟 + 回退时那次
+                                             * staging->bank 的 memcpy (PLDIAG 行
+                                             * 把纯 PL 的部分单列出来)。 */
         g_w_dec_us += (unsigned long)dec_us;
         if ((unsigned long)dec_us > g_w_dec_max) g_w_dec_max = (unsigned long)dec_us;
         g_w_c0_us += (unsigned long)core0_us;
@@ -1881,8 +3063,14 @@ static int serve_client(int fd, uint8_t *cbuf)
         (void)t_gate; (void)t_hdr;
 
         uint32_t crc = 0;
-        if (g_crc_on)
-            crc = crc32(0L, g_wr.buf, h.raw_len);
+        if (g_crc_on) {
+            /* --crc 是联调选项。PL 帧的结果只在 WC 的 DDR bank 里, 从那儿读
+             * 8-21 MB 回来做 crc 会把 PL 省下的时间全吐回去 —— 但既然是联调,
+             * 要的就是"真正落进 bank 的东西对不对", 所以照读不误, 只在日志里
+             * 标出来这一帧是从 bank 算的。量产本来就不开这个开关。 */
+            crc = crc32(0L, in_bank && !in_buf ? g_bank[pl_bank] : g_wr.buf,
+                        h.raw_len);
+        }
 
         /* 发布给 flip 线程 + 记参考帧; 旧 ready 没被消费就顶替 (丢帧计数) */
         g_wr.raw_len    = h.raw_len;
@@ -1891,10 +3079,21 @@ static int serve_client(int fd, uint8_t *cbuf)
         g_wr.face_b_off = face_b_off;
         g_wr.fold_a     = (h.flags & PVS_FLAG_FOLD_A) ? 1u : 0u;
         g_wr.bpp3       = (h.flags & PVS_FLAG_3BIT) ? 1u : 0u;
-        g_prev = g_wr.buf;
-        g_prev_len = h.raw_len;
-        g_prev_face_b_off = face_b_off;
-        g_prev_valid = 1;
+        g_wr.bank       = g_pl_on ? pl_bank : -1;
+        /* 🔴 DELTA 参考帧只有在帧**真的还在 staging 里**时才成立。PL 帧的结果
+         * 只在 WC bank 里, g_wr.buf 装的是别的帧的残骸 —— 拿它当参考帧就是
+         * 静默解出半帧垃圾。所以 PL 帧一律作废参考帧 (下一个 DELTA 会 NAK 一次,
+         * 然后连接就整体退回 CPU 路径, 见上面 pl_conn 那段)。 */
+        if (in_buf) {
+            g_prev = g_wr.buf;
+            g_prev_len = h.raw_len;
+            g_prev_face_b_off = face_b_off;
+            g_prev_valid = 1;
+        } else {
+            g_prev_valid = 0;
+            g_prev_len = 0;
+            g_prev_face_b_off = 0;
+        }
         pthread_mutex_lock(&g_mu);
         if (g_ready_gen != g_consumed_gen) g_st_drop++;
         stage_t t = g_wr; g_wr = g_ready; g_ready = t;
@@ -1910,11 +3109,11 @@ static int serve_client(int fd, uint8_t *cbuf)
 
         if (g_crc_on)
             logts("FRAME seq=%u n=%u comp=%u flags=0x%x crc=%08x dec=%.1fms%s",
-                  seq++, n_slices, h.comp_len, h.flags, crc, dec_us / 1000.0,
+                  my_seq, n_slices, h.comp_len, h.flags, crc, dec_us / 1000.0,
                   dec_tag(nstr, face_b_off));
         else
             logts("FRAME seq=%u n=%u comp=%u flags=0x%x dec=%.1fms%s",
-                  seq++, n_slices, h.comp_len, h.flags, dec_us / 1000.0,
+                  my_seq, n_slices, h.comp_len, h.flags, dec_us / 1000.0,
                   dec_tag(nstr, face_b_off));
         if (g_stop) return -1;
     }
@@ -1960,9 +3159,28 @@ static void usage(const char *argv0)
         "                 ⚠ default off, 而且**实测没用**: 本板的损失全在收包,\n"
         "                 相位可回收的量实测为 0 (drop=0/668 帧)。细节见\n"
         "                 pov_rxd.c 里 phase_gate 上方那段注释\n"
-        "  --no-rmem-fix  对照实验: 不抬 net.core.rmem_max (生产别用)\n",
+        "  --no-rmem-fix  对照实验: 不抬 net.core.rmem_max (生产别用)\n"
+        "  --pl-lz4       用 PL 硬件 lz4 解码器: 压缩流进 DDR, 引擎**直写帧 bank**\n"
+        "                 -> dec 和 cpy 一起消失 (实测 158+80 ms/帧)。默认 off。\n"
+        "                 只接 lz4 且不带 DELTA 的帧, 其它一律回退 CPU 并打原因。\n"
+        "                 开机自检不过会自动关掉 (PL 还没进比特流时就是这样)。\n"
+        "  --pl-base ADDR PL 解码器 AXI-Lite 基址 (default 0x%08x)\n"
+        "  --pl-stride N  多引擎时每个引擎的地址步距 (default 0x%x)\n"
+        "  --pl-engines N 引擎个数 1..%d (default 3 = BD 定稿的 NENG)。并行度 =\n"
+        "                 载荷里的**流数**, 发送端要用 MSTREAM 切成正好 N 条\n"
+        "                 (3 引擎 = 95/95/94 等分, 不是给双核调的 180/90/270)\n"
+        "  --pl-timeout N 一帧等 done 的上限毫秒 (default %u); 超时 = 判 PL 没接上\n"
+        "  --no-pipeline  退回串行: 发车后立刻等 done 再 ACK。默认是**流水线** ——\n"
+        "                 给 PL 发完车立刻 ACK, 收下一帧 (55-80ms WiFi) 与本帧\n"
+        "                 解码 (~75ms) 重叠, 6.5-7.7 fps -> 12.5-13 fps。\n"
+        "                 代价: ACK 语义变成'已交给硬件', 错误报告晚一帧\n"
+        "                 (日志会同时打出错帧和当前帧的 seq)。出问题二分用\n"
+        "  --pl-fault M:N 故障注入, **只有 x86 SIM 的引擎模型认**: error:N 让第 N 次\n"
+        "                 start 起报 STATUS[1]; hang:N 让 done 永远不来。用来在\n"
+        "                 x86 上把两条回退路径真跑一遍\n",
         argv0, PVS_PORT, FRAME_PHYS_DEFAULT, REG_PHYS_DEFAULT, PVS_N_SLICES,
-        OE_W1_DEFAULT, OE_W2_DEFAULT, OE_W0_3BIT_HINT);
+        OE_W1_DEFAULT, OE_W2_DEFAULT, OE_W0_3BIT_HINT,
+        PL_BASE_DEFAULT, (unsigned)PL_STRIDE_DEFAULT, PL_ENGINES_MAX, 400u);
 }
 
 int main(int argc, char **argv)
@@ -1982,6 +3200,30 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--fake") && i + 1 < argc)
             fake_rps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--ring-bcm")) g_ring_bcm = 1;
+        else if (!strcmp(argv[i], "--pl-lz4")) g_pl_on = 1;
+        else if (!strcmp(argv[i], "--no-pipeline")) g_pl_serial = 1;
+        else if (!strcmp(argv[i], "--pl-base") && i + 1 < argc)
+            g_pl_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--pl-stride") && i + 1 < argc)
+            g_pl_stride = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--pl-engines") && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v < 1 || v > PL_ENGINES_MAX) { usage(argv[0]); return 2; }
+            g_pl_n = v;
+        }
+        else if (!strcmp(argv[i], "--pl-timeout") && i + 1 < argc)
+            g_pl_timeout_ms = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pl-fault") && i + 1 < argc) {
+            const char *m = argv[++i];
+            unsigned at = 1;
+            if (!strncmp(m, "error", 5))     g_pl_fault_mode = 1;
+            else if (!strncmp(m, "hang", 4)) g_pl_fault_mode = 2;
+            else if (!strcmp(m, "off"))      g_pl_fault_mode = 0;
+            else { usage(argv[0]); return 2; }
+            const char *c = strchr(m, ':');
+            if (c && c[1]) at = (unsigned)strtoul(c + 1, NULL, 0);
+            g_pl_fault_at = at ? at : 1;
+        }
         else if (!strcmp(argv[i], "--half-scan")) g_half_scan = 1;
         else if (!strcmp(argv[i], "--flip-timeout") && i + 1 < argc)
             g_flip_timeout_ms = (unsigned)atoi(argv[++i]);
@@ -2039,13 +3281,23 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    /* v3.5: --pl-lz4 要在帧区尾部多留两块 (comp 缓冲 + 自检落点), 所以映射
+     * 长度必须在 hw_init **之前**定下来。关着时按老值映射 —— 老 povmem 配置
+     * 可能刚好只给到 0x5500000, 多要 2 MB 就会 mmap -EINVAL 静默退回 SO。 */
+    if (g_pl_on) {
+        /* 每个引擎至少占 0x100 (寄存器只译码 [7:0]); 给得比这还小 = 两个引擎
+         * 会踩在同一组寄存器上, 静默的灾难 -> 直接钳回默认值。 */
+        if (g_pl_stride < 0x100u) g_pl_stride = PL_STRIDE_DEFAULT;
+        g_map_len = FRAME_MAP_PL;
+    }
+
     /* v3.1 帧区从 9.3 MB 涨到 24.4 MB, --base 给歪了就会写到内核 RAM 上,
      * 这里先按 mem=256M 的保留区 (0x10000000..0x1FFFFFFF) 体检一遍 */
     if (frame_phys < FRAME_REGION_BASE ||
-        (uint64_t)frame_phys + FRAME_MAP_LEN > FRAME_REGION_END) {
+        (uint64_t)frame_phys + g_map_len > FRAME_REGION_END) {
         logts("WARN: frame window 0x%08x+0x%x escapes the mem=256M reserve "
               "0x%08x..0x%08x - check --base / kernel cmdline",
-              frame_phys, (unsigned)FRAME_MAP_LEN,
+              frame_phys, (unsigned)g_map_len,
               (unsigned)FRAME_REGION_BASE, (unsigned)(FRAME_REGION_END - 1));
     }
     if (frame_phys & 0xfffffu)
@@ -2059,13 +3311,13 @@ int main(int argc, char **argv)
           (unsigned)BANK_STRIDE, (unsigned)BANK_BYTES, reg_phys);
     logts("frame map: %s (%u B = 0x%x), crc=%s, flip-window=%s",
           g_frame_wc ? "WC via " POVMEM_DEV : "SO via /dev/mem",
-          (unsigned)FRAME_MAP_LEN, (unsigned)FRAME_MAP_LEN,
+          (unsigned)g_map_len, (unsigned)g_map_len,
           g_crc_on ? "on" : "off", g_win_dual ? "dual" : "single");
     /* 无条件打出 povmem 最小 size: 三缓冲后默认值 (0x1900000) 又不够了 */
     logts("povmem needs size>=0x%x (%u B); if the WC mmap failed above, "
           "`insmod povmem.ko base=0x%08x size=0x%x`",
-          (unsigned)POVMEM_MIN_SIZE, (unsigned)POVMEM_MIN_SIZE,
-          POVMEM_PHYS_BASE, (unsigned)POVMEM_MIN_SIZE);
+          (unsigned)g_map_len, (unsigned)g_map_len,
+          POVMEM_PHYS_BASE, (unsigned)g_map_len);
     logts("frames: n_slices 1..%d, raw<=%u B; dual-face -> 0x18/0x28, "
           "fold-a -> 0x10[6], PHASE_B(0x1C) shadow=%u (RTL 复位值, 读不回来)",
           PVS_N_SLICES_MAX, (unsigned)PVS_FRAME_RAW_MAX, g_phase_b);
@@ -2083,6 +3335,59 @@ int main(int argc, char **argv)
           (unsigned)BCM_REASSERT_EVERY);
     logts("engine STATUS=0x%08x POV_CTRL=0x%08x",
           reg_rd(REG_STATUS), reg_rd(REG_POV_CTRL));
+
+    /* ---- v3.5 PL lz4 解码器: 落地址 + 自检 -------------------------------- */
+    if (g_pl_on) {
+        g_comp_virt = g_frame_virt + PL_COMP_OFF;
+        g_comp_phys = frame_phys   + PL_COMP_OFF;
+        g_plst_virt = g_frame_virt + PL_ST_OFF;
+        g_plst_phys = frame_phys   + PL_ST_OFF;
+        logts("PL lz4: %d 引擎 @0x%08x 步距 0x%x; comp 缓冲 0x%08x+0x%x, "
+              "自检落点 0x%08x+0x%x, 每帧超时 %u ms",
+              g_pl_n, g_pl_base, g_pl_stride,
+              g_comp_phys, (unsigned)PL_COMP_BYTES,
+              g_plst_phys, (unsigned)PL_ST_BYTES, g_pl_timeout_ms);
+        if (!g_frame_wc)
+            logts("⚠ PL lz4: 帧区没走 povmem 的 WC 窗 (回退到 /dev/mem 的 SO)。"
+                  "PL 自己读写 DDR 不受影响, 但压缩流那次 memcpy 会慢几倍, "
+                  "而且 --crc 会慢到没法用。先把 povmem 装上。");
+        pl_recount_live();          /* 自检之前先当作全活 */
+        if (pl_selftest() != 0) {
+            logts("🔴 PL lz4 自检没过 ⇒ **关掉 --pl-lz4**, 本次运行全部走 CPU 解码。"
+                  "先确认: 比特流里有没有 lz4_axi_top? AXI-Lite 基址是不是 0x%08x? "
+                  "AXI4 主口接到 HP 了吗? 时钟/复位接了吗?", g_pl_base);
+            g_pl_on = 0;
+            g_pl_ok = 0;
+        } else {
+            g_pl_ok = 1;
+            logts("PL lz4 自检通过: 数据通路走 收包 -> comp 缓冲 -> PL 直写 bank "
+                  "-> 翻页 (**没有 staging->bank 的 memcpy**)");
+            logts("PL lz4 并行度 = 载荷里的**流数** (PL 拆不开单条 lz4 流): "
+                  "发送端要用 PVS_FLAG_MSTREAM 切成**正好 %d 条等分流** "
+                  "(3 引擎 = 95/95/94 片); 单流帧只有 1 个引擎在干活。"
+                  "⚠ 老的 --stream-split balanced 是当年给两个 CPU 核调的 "
+                  "180/90/270 不等分, 对同构硬件引擎是错的", g_pl_live);
+            logts("PL lz4 引擎卡死的处理: 一条流长度不对时引擎会 busy 恒 1 且"
+                  "既不 done 也不 error, 而 RTL **没有软复位** ⇒ 本进程靠"
+                  "--pl-timeout %u ms 兜底, 超时就把那个引擎**摘出派发池**"
+                  "(剩下的继续跑, 掉帧不黑屏), 全挂了才永久关 PL",
+                  g_pl_timeout_ms);
+            logts("PL lz4 不接的帧一律回退 CPU 并打一行原因: zlib/RLE/raw (PL 只认 "
+                  "lz4)、DELTA 帧 (直写 bank 不留参考帧)、压缩流 > 0x%x",
+                  (unsigned)PL_COMP_BYTES);
+            logts("PL lz4 %s: %s。板子只有 WiFi (跟着屏一起转, 插不了网线), "
+                  "收一帧实测 55-80 ms —— 不与解码重叠的话这 55-80 ms 会把 PL "
+                  "省下的一半吃回去",
+                  g_pl_serial ? "串行 (--no-pipeline)" : "流水线",
+                  g_pl_serial ? "发车后立刻等 done 再 ACK (ACK = 已显示)"
+                              : "发车即 ACK, 收下一帧与本帧解码重叠 "
+                                "(ACK = 已交给硬件; 错误报告晚一帧, 日志会把两个 "
+                                "seq 都打出来)");
+        }
+        if (g_pl_fault_mode)
+            logts("⚠ --pl-fault %s:%u 已开 (只有 SIM 的引擎模型认它, 板上无效)",
+                  g_pl_fault_mode == 1 ? "error" : "hang", g_pl_fault_at);
+    }
 
     /* start on bank A, 面B 基址清 0 (= PL 回落到 0x18 的单面老行为);
      * POV_CTRL is left alone unless --fake */
@@ -2112,6 +3417,14 @@ int main(int argc, char **argv)
     if (!cbuf || !g_wr.buf || !g_ready.buf || !g_disp.buf) {
         perror("malloc"); return 1;
     }
+    /* 🔴 stage_t.bank 的"没有 bank"是 **-1**, 而静态区零初始化给的是 0 = bank A。
+     * 不显式置 -1 的话, 老路径的第一帧会被 flip 线程当成"数据已经在 bank A 里"
+     * 而**跳过 memcpy** —— 屏上是上一次开机的残留, 而且一行日志都没有。 */
+    g_wr.bank = g_ready.bank = g_disp.bank = -1;
+    /* PL 模式的 bank 归属初值: main 上面已经把 bank A 送上屏 => active = 0,
+     * 于是 RX 第一个可认领的是 bank B。 */
+    g_bank_free = 1;
+    g_bank_held = -1;
 
     dec_pool_start();
 
@@ -2224,6 +3537,11 @@ int main(int argc, char **argv)
         setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &rto, sizeof rto);
         logts("client %s:%d connected", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
         serve_client(cfd, cbuf);
+        /* 🔴 兜底收割: serve_client 有十几个 NAK/断线的 return 点, 任何一个都
+         * 可能把一帧留在 PL 里还在跑。不收的话 (a) 那一帧白解不上屏, (b) 更糟:
+         * 引擎还在往某块 bank 里写, 而下一个连接 / 空闲动画马上就会去认领 bank。
+         * 放在这里 = 一个点覆盖所有出口。 */
+        pl_pending_settle(0);
         close(cfd);
         logts("client disconnected");
     }
@@ -2234,6 +3552,9 @@ int main(int argc, char **argv)
     logts("STAT rx=%u flip=%u drop=%u forced=%u dec_avg=%.1fms (final)",
           g_st_rx, g_st_flip, g_st_drop, g_st_forced,
           g_st_rx ? (double)g_st_dec_us / g_st_rx / 1000.0 : 0.0);
+    if (g_pl_on || g_pl_fb_frames)
+        logts("STAT pl: %s, 回退 CPU %u 帧 (回退原因见上面的 'PL 回退 CPU:' 行)",
+              g_pl_ok ? "在用" : "**没在用**", g_pl_fb_frames);
     logts("exiting (signal)");
     return 0;
 }

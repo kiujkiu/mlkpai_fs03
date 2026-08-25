@@ -53,13 +53,14 @@ STRIDE_3BIT = pack_obs.SLICE_STRIDE_3BIT          # 0x9000
 FRAME_RAW_MAX = 8847360                           # 一个 DDR bank
 
 
-def render_face(vox, axis_off, n_slices, sub, thresh, dither, mirror_u, gamma, tag):
+def render_face(vox, axis_off, n_slices, sub, thresh, dither, mirror_u, gamma, tag,
+                dark_floor=False):
     """一个面 → [n_slices 片 3-bit 打包字节], 顺带返回码值直方图。"""
     d_step = 2 * math.pi / n_slices
     bufs, hist = [], np.zeros(8, np.int64)
     for i in range(n_slices):
         img = gas.render_slice(vox, i * d_step, sub, d_step, axis_off, mirror_u)
-        code = gas.to_3bit(img, thresh, dither, i, gamma)
+        code = gas.to_3bit(img, thresh, dither, i, gamma, dark_floor=dark_floor)
         hist += np.bincount(code.ravel(), minlength=8)
         buf = pack_obs.pack_slice(code, bpp=3)
         assert len(buf) == STRIDE_3BIT, len(buf)
@@ -100,6 +101,10 @@ def main():
     ap.add_argument('--no-dither', action='store_true')
     ap.add_argument('--gamma-led', type=float, default=gas.LED_GAMMA,
                     help='码值→线性光的解码 gamma (to_3bit)')
+    ap.add_argument('--dark-floor', action='store_true',
+                    help='存在性下限: 被覆盖的体素保证 code>=1 (真空仍 0), '
+                         'max 通道定标保色相。gamma 2.2 下亮度 <41%% 的面'
+                         '会被抖动打成稀疏点阵, 开了洞率归零')
     ap.add_argument('--gap-mm', type=float, default=13.8)
     ap.add_argument('--brighten', type=float, default=1.5)
     ap.add_argument('--gamma', type=float, default=0.9)
@@ -138,7 +143,8 @@ def main():
     for name, axis_off, n_out, how in faces:
         gas.print_geom(axis_off, a.mirror_u, f'面{name}: {how}')
         b, h = render_face(vox, axis_off, n_out, a.sub, a.thresh,
-                           not a.no_dither, a.mirror_u, a.gamma_led, f'面{name}')
+                           not a.no_dither, a.mirror_u, a.gamma_led, f'面{name}',
+                           dark_floor=a.dark_floor)
         bufs += b
         hists.append(h)
 

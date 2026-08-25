@@ -19,3 +19,8 @@ stream/board/anime_dual720.bin
 stream/board/pov_rxd_sw
 stream/board/anime_dual3b100.bin
 tools/boot3b_preview.png
+# 运行时 PL 加载: .bin/.dtbo 入库 (是配方), .bit 不入 (8MB 且可从 build_panel 重建)
+stream/boot/plbin/*.bit
+stream/boot/__pycache__/
+stream/board/pov_rxd.prev_cpu
+stream/boot/mk2.bat

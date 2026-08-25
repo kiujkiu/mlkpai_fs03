@@ -310,7 +310,9 @@ def stream_plan(n_slices, geom_flags, mode='face', workers=DEC_WORKERS):
 
     mode='face'     : 恒返回 None = 老行为 (默认, 保住所有已有 frames_* 的等价性)。
     mode='balanced' : 在面边界的基础上再按 w/workers 的累计片数位置切一刀, 让
-                      板端**连续分组**后每个核拿到的片数尽量相等。
+                      板端**连续分组**后每个核拿到的片数尽量相等 (板端 2 个 CPU 核)。
+    mode='even'     : workers 条等片数流, **不受面边界约束** (板端 N 个同构 PL 引擎)。
+                      142 槽双面 = 284 片, workers=3 → 94/95/95。
 
     为什么不能只按面切 (fold540 = 面A 折 180 + 面B 360 的实测):
         按面切 180/360  两核 makespan = 20.6 ms (被面B 的 360 片封顶)
@@ -326,6 +328,19 @@ def stream_plan(n_slices, geom_flags, mode='face', workers=DEC_WORKERS):
              else [n_slices])
     if mode == 'face':
         return None
+    if mode == 'even':
+        # PL 硬件解码器: workers 条**等片数**流, 面边界不再是流边界。
+        # 之所以能跨面切: 板端 MSTREAM 的落点是纯累加 (pov_rxd.c
+        #   dlen = s_nsl[i]*stride; jobs[i].dst = buf + doff; doff += dlen)
+        # 完全不看 face_b_off, 而 bank 里 A/B 两面本来就是连续排布的。
+        # ⚠ 不能用 'balanced': 它强制面边界为流边界, 284 片 3 分会切成
+        #   [94,48,47,95] 四条不均匀的流 —— 对 N 个**同构**引擎是错的
+        #   (balanced 当年是给板端两个 CPU 核调的, 那时两核工作量才是约束)。
+        segs = [n_slices * (w + 1) // workers - n_slices * w // workers
+                for w in range(workers)]
+        if len(segs) > MAX_STREAMS:
+            raise ValueError(f'流数 {len(segs)} > {MAX_STREAMS} (protocol.h 上限)')
+        return None if len(segs) == 1 else segs
     if mode != 'balanced':
         raise ValueError(f'未知的流切分模式 {mode!r}')
     cuts, acc = set(), 0
@@ -490,7 +505,7 @@ def frame_files_from_dir(d):
 
 def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
                   codec='zlib', lz4_level=DEFAULT_LZ4_LEVEL,
-                  stream_split='face'):
+                  stream_split='face', stream_workers=None):
     """--dir 整目录预压缩到内存: [FrameEntry]. delta=True 时每帧还预算
     对流序前一帧的 XOR+压缩 delta 链; 帧 0 的 delta 参考最后一帧 (loop 回
     绕), 非 loop/首连时帧 0 由发送策略强制走 key payload, 回绕 delta 只在
@@ -499,7 +514,8 @@ def build_precomp(d, zlevel=6, delta=False, jobs=0, geom_flags=0,
     n = len(files)
     split = face_split_bytes(geom_flags)       # DUAL_FACE → 预压缩也出双流
     n_sl0 = slices_of(os.path.getsize(files[0]), f'{files[0]}: ')
-    streams = stream_plan(n_sl0, geom_flags, stream_split)
+    streams = stream_plan(n_sl0, geom_flags, stream_split,
+                          stream_workers or DEC_WORKERS)
     if streams:
         print(f'[precomp] 多流切分 {streams} 片 (MSTREAM), 板端 {DEC_WORKERS} 核'
               f'连续分组后每核 ≈{sum(streams) // DEC_WORKERS} 片', flush=True)
@@ -575,7 +591,7 @@ def _to_half_screen(q, aspect=False):
 
 def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
                         freeze_phase=False, axis_off=0.0, mirror_u=True, gain=None,
-                        n_out=N_SLICES, led_gamma=gas.LED_GAMMA):
+                        n_out=N_SLICES, led_gamma=gas.LED_GAMMA, dark_floor=False):
     """体素格 → 单面 n_out×SLICE_STRIDE 数据块 (默认 n_out=360 = 完整一面).
 
     色深走模块全局 BPP (见 _apply_bpp):
@@ -619,7 +635,8 @@ def render_packed_frame(vox, frame_idx, render_slices, sub, thresh, dither,
             if BPP == 1:
                 q = gas.to_1bit(img, thresh, dither, phase)
             else:
-                q = gas.to_3bit(img, thresh, dither, phase, gamma=led_gamma)
+                q = gas.to_3bit(img, thresh, dither, phase, gamma=led_gamma,
+                                dark_floor=dark_floor)
             if HALF_SCREEN:
                 q = _to_half_screen(q, HALF_ASPECT)
             parts.append(pack_obs.pack_slice(q, bpp=BPP, pad=True))
@@ -1289,7 +1306,8 @@ def gen_packed_frames(args):
                                 axis_off=f.axis_off,
                                 mirror_u=args.mirror_u,
                                 n_out=f.n_slices, gain=gains[f.name],
-                                led_gamma=getattr(args, 'led_gamma', gas.LED_GAMMA))
+                                led_gamma=getattr(args, 'led_gamma', gas.LED_GAMMA),
+                                dark_floor=getattr(args, 'dark_floor', False))
             for f in faces)
         print(f'[render] frame {i}/{args.frames} {time.time() - t0:.1f}s', flush=True)
         yield raw
@@ -1318,6 +1336,10 @@ def cmd_render(args):
             'bpp': BPP,
             'led_gamma': (getattr(args, 'led_gamma', gas.LED_GAMMA)
                           if BPP == 3 else None),
+            # 存在性下限: 影响每个体素的码值, 预渲染目录必须自描述
+            # (否则 stream --dir 分不清这批帧是开着还是关着渲的)
+            'dark_floor': (bool(getattr(args, 'dark_floor', False))
+                           if BPP == 3 else None),
             'n_slices': sum(f.n_slices for f in faces), 'geom_flags': geom_flags,
             'faces': [{'name': f.name, 'axis_off_px': round(f.axis_off, 4),
                        'n_slices': f.n_slices} for f in faces],
@@ -1368,12 +1390,13 @@ class Streamer:
                  link_mbps=DEFAULT_LINK_MBPS, stats_interval=5.0,
                  max_frames=0, on_frame=None, on_status=None, on_stats=None,
                  stop=None, geom_flags=0, lz4_level=DEFAULT_LZ4_LEVEL,
-                 stream_split='face'):
+                 stream_split='face', stream_workers=None):
         self.host, self.port = host, port
         self.fps, self.loop = fps, loop
         self.codec, self.zlevel = codec, zlevel
         self.lz4_level = lz4_level
         self.stream_split = stream_split
+        self.stream_workers = stream_workers
         self.reconnect, self.retry_interval = reconnect, retry_interval
         self.ack_timeout = ack_timeout
         self.delta, self.keyint = delta, max(int(keyint), 1)
@@ -1428,7 +1451,8 @@ class Streamer:
         raw = item                       # 现场压缩路径 (bytes)
         split = face_split_bytes(self.geom_flags)   # DUAL_FACE → 两条独立流
         streams = stream_plan(len(raw) // SLICE_STRIDE,
-                              self.geom_flags, self.stream_split)
+                              self.geom_flags, self.stream_split,
+                              self.stream_workers or DEC_WORKERS)
         if (self.delta and not want_key and self._prev_raw is not None
                 and len(self._prev_raw) == len(raw)
                 and self.codec in DELTA_CODECS):
@@ -1799,7 +1823,8 @@ def cmd_stream(args):
                                 delta=args.delta, jobs=args.jobs,
                                 geom_flags=geom_flags, codec=args.codec,
                                 lz4_level=args.lz4_level,
-                                stream_split=args.stream_split)
+                                stream_split=args.stream_split,
+                                stream_workers=args.stream_workers)
 
     def make_iter():
         if entries is not None:
@@ -1821,7 +1846,8 @@ def cmd_stream(args):
     s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop,
                  window=args.window,
                  codec=args.codec, zlevel=args.zlevel, lz4_level=args.lz4_level,
-                 stream_split=args.stream_split, reconnect=args.reconnect,
+                 stream_split=args.stream_split,
+                 stream_workers=args.stream_workers, reconnect=args.reconnect,
                  delta=args.delta, keyint=args.keyint, link_mbps=args.link_mbps,
                  max_frames=args.max_frames, geom_flags=geom_flags,
                  on_frame=on_frame, on_status=on_status)
@@ -1911,6 +1937,12 @@ def add_render_opts(ap):
                          '方案推荐每面 60 槽')
     # LED 是线性发光 (BCM 权重 27/54/108 = 1:2:4), 人眼与素材都是 ~2.2 次方的
     # 感知域 ⇒ 量化前必须先解码到线性光。取值理由见 gas.to_3bit / 下面 help。
+    ap.add_argument('--dark-floor', action='store_true',
+                    help='[--bpp 3] 存在性下限: 被几何覆盖的体素保证 code>=1, 真空仍为 0。'
+                         'gamma 2.2 下亮度 <41%% 的面会被抖动打成稀疏点阵 '
+                         '(v=20%% 时 80%% 的体素完全不亮), 开了洞率归零。'
+                         '用 max 通道定标其余按比例 ⇒ 色相不变。'
+                         '代价: 最暗的物体固定在 1/7=14%% 亮度')
     ap.add_argument('--led-gamma', type=float, default=gas.LED_GAMMA,
                     help=f'[--bpp 3] 量化前的 gamma 解码指数 (默认 {gas.LED_GAMMA}): '
                          'code = 7·(v/255)^gamma。素材是 sRGB (γ≈2.2) 编码而 LED '
@@ -2038,7 +2070,11 @@ def main():
                    help=f'--codec lz4 的 LZ4_compress_HC 级别 1..12 '
                         f'(默认 {DEFAULT_LZ4_LEVEL}; ⚠ 10 实测比 9 还差 6%%, '
                         f'用 9/11/12)')
-    s.add_argument('--stream-split', choices=['face', 'balanced'], default='face',
+    s.add_argument('--stream-workers', type=int, default=None, metavar='N',
+                   help='[--stream-split even/balanced] 切成几条流 '
+                        f'(默认 {DEC_WORKERS} = 板端 CPU 核数; '
+                        'PL 硬件解码要填引擎数, 现役 bitstream 是 3)')
+    s.add_argument('--stream-split', choices=['face', 'balanced', 'even'], default='face',
                    help='载荷拆成几条独立压缩流 (板端并行解码的粒度)。'
                         'face = 按面切 (默认, 与老固件/老行为逐字节一致); '
                         'balanced = 按板端两核的**工作量**切 (PVS_FLAG_MSTREAM), '

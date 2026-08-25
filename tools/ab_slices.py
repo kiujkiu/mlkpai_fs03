@@ -48,7 +48,14 @@ def show(p):
     print(f'  status(0x00)   = 0x{st:08X}  base_b_act={(st >> 16) & 1} '
           f'dual_en={(st >> 11) & 1} pov_en={(st >> 9) & 1} locked={(st >> 8) & 1} '
           f'overlap={(st >> 6) & 1} use_fb={(st >> 5) & 1} auto={(st >> 4) & 1}')
-    print(f'  PHASE_B(0x1C)  idx_b_live={(rd(0x1C) >> 1) & 0x1ff}  pair_miss={rd(0x1C) & 1}')
+    # 🔴 位域按 pov_dual_top.v:76 —— R 0x1C = {locked, 6'b0, idx_B[8:0], pair_miss[15:0]}
+    # 2026-08-24 修: 原来写成 idx=(v>>1)&0x1ff / pair_miss=v&1, 把**16 位的饱和计数器
+    # 当成 1 位**在读。pair_miss=4000(0xFA0, bit0=0) 时会打印 0 —— 面板带宽预算的
+    # 唯一哨兵读的是噪声。加 lz4 解码器之前必须拿它的干净基线, 否则加完之后
+    # pair_miss 不为 0, 分不清是 lz4 干的还是 3-bit 本来就这样。
+    _v = rd(0x1C)
+    print(f'  0x1C = 0x{_v:08X}  locked={(_v >> 31) & 1}  '
+          f'idx_b_live={(_v >> 16) & 0x1ff}  pair_miss={_v & 0xFFFF}')
     if rev and rev != 0xFFFFFFFF:
         print(f'  转速: rev_period(0x14) = {rev} 拍 @{ACLK_HZ // 1000000}MHz = '
               f'{rev / ACLK_HZ * 1000:.1f} ms/圈 = {ACLK_HZ / rev:.2f} rps = '

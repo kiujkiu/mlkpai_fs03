@@ -1,0 +1,10 @@
+/dts-v1/;
+/plugin/;
+// Zynq 的 FPGA region 节点是 /fpga-full (不是 DR1 的 base_fpga_region)。
+// 🔴 绝不能写 #address-cells / #size-cells —— 目标节点已有, overlay 改它们会被拒:
+//    "OF: overlay: ERROR: changing value of #address-cells is not allowed"
+//    而且那个错极具迷惑性: 报错时 FPGA 其实已经烧进去了 (编程发生在 pre-apply
+//    通知里, 早于设备树合法性检查), 但 create_overlay 返回 -22 让人以为失败。
+&{/fpga-full} {
+    firmware-name = "pl_prelz4.bit.bin";
+};

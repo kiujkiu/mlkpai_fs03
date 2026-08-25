@@ -223,6 +223,59 @@ def test_to_3bit_pack_roundtrip():
     print('[ok] ⑤ to_3bit → pack_slice(bpp=3) → unpack_slice 端到端码值一致')
 
 
+def test_to_3bit_dark_floor():
+    """⑥ 存在性下限 (dark_floor=True): 覆盖⇒必亮, 真空⇒必灭, 亮部不动, 色相保持。
+
+    背景: gamma 2.2 下亮度 <41% 的面会被残差抖动打成稀疏点阵 (洞率 1-7·v^gamma,
+    v=20% 时 80% 的体素完全不亮), 大面积中低亮度的面会整片碎掉。
+    """
+    try:
+        import gen_anime_slices as gas
+    except ImportError:
+        print('[skip] ⑥ dark_floor')
+        return
+    rs = _rs(11)
+    img = (rs.rand(H, W, 3) * 70).astype(np.float32)      # 暗色: 默认会全塌成 0
+    vac = rs.rand(H, W) < 0.3
+    img[vac] = 0.0
+    cov = ~vac
+
+    # ① 默认必须逐字节不变 —— 这个开关绝不能悄悄改变既有行为
+    a = gas.to_3bit(img, 128, True, 3)
+    b = gas.to_3bit(img, 128, True, 3, dark_floor=False)
+    assert np.array_equal(a, b), 'dark_floor=False 必须与不传参完全一致'
+
+    for dither in (False, True):
+        c = gas.to_3bit(img, 128, dither, 3, dark_floor=True)
+        lit = c.max(axis=2) > 0
+        # ② 被几何覆盖的体素**一个都不能灭**
+        assert lit[cov].all(), f'dither={dither}: {int((~lit[cov]).sum())} 个覆盖体素仍是 0'
+        # ③ 真空**一个都不能亮** (亮了就是物体凭空变胖)
+        assert not lit[vac].any(), f'dither={dither}: {int(lit[vac].sum())} 个真空体素被点亮'
+
+    # ④ 亮部不受影响: 满量程仍是 7, 且高亮区码值不应被压低
+    bright = np.full((H, W, 3), 255.0, np.float32)
+    assert gas.to_3bit(bright, 128, False, 0, dark_floor=True).min() == 7
+
+    # ⑤ 色相: 必须显著优于"逐通道硬垫底" (那种做法会把暗色压成灰白)
+    tgt = np.power(np.clip(img / 255.0, 0, 1), gas.LED_GAMMA)
+    tmax = tgt.max(axis=2)
+    def hue_err(code):
+        m = cov & (code.max(axis=2) > 0)
+        rt = tgt[m] / tmax[m][:, None]
+        rq = code[m].astype(np.float64)
+        rq /= rq.max(axis=1, keepdims=True)
+        return float(np.median(np.abs(rt - rq).max(axis=1)))
+    mine = gas.to_3bit(img, 128, False, 3, dark_floor=True)
+    hard = gas.to_3bit(img, 128, False, 3)
+    hard = np.where(cov[:, :, None] & (hard.max(axis=2) == 0)[:, :, None],
+                    1, hard).astype(np.uint8)          # 逐通道 max(1,·)
+    e_mine, e_hard = hue_err(mine), hue_err(hard)
+    assert e_mine < e_hard / 2, f'色相未显著优于硬垫底: {e_mine:.3f} vs {e_hard:.3f}'
+    print(f'[ok] ⑥ dark_floor: 覆盖全亮/真空全灭/亮部不动; '
+          f'色比误差 {e_mine:.3f} vs 逐通道硬垫底 {e_hard:.3f}')
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith('test_')]  # 定义序
     for t in tests:
