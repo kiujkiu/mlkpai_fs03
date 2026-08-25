@@ -101,6 +101,27 @@ AXI4 主口  每引擎独占一个 HP —— 顺序 HP3 → HP1 → HP2 (HP0 留
 `--pl-engines` 默认就是 **3**。写多了也不怕：自检**逐引擎判决**，不存在的那些
 会被单独判死并降级运行，不会一票否决掉整条 PL 通路。
 
+#### 🆕 2026-08-25：另有一份 **4 引擎** bitstream（还没上板）
+
+3 引擎实测解一帧 **74.1 ms**，而 969 RPM 的圈周期只有 **62 ms** —— 解完时翻页
+窗口刚过去，只能等下一圈 ⇒ 实际 74+62 = 136 ms ⇒ **7.3 fps**（实测 flip 2-7/s）。
+4 引擎把单帧压到 74×3/4 = **55.5 ms < 62 ms** ⇒ 每圈都能翻 ⇒ **16 fps**。
+
+```
+AXI-Lite   lz4_0/1/2/3 @ 0x40020000/30000/40000/**50000**   (panel 仍 0x40010000)
+AXI4 主口  lz4_1→HP1, lz4_2→HP2, lz4_0 与 lz4_3 **共享 HP3**（一个 NUM_SI=2 的
+           SmartConnect 汇聚）。HP 口只有 4 个且 HP0 被面板占死，第 4 个引擎没有
+           独占口可用；选 HP3 共享是因为 DDRC 那一级 HP1/HP2 本来就共一个入口，
+           放 HP3 才是 2:2 均衡。完整取舍见 vivado/create_panel_proj_v6.tcl 的
+           HP_ORDER 处。
+时钟       仍是 FCLK_CLK0 50 MHz 单域（没新开时钟域）
+PS7 配置   与 3 引擎**逐字相同** ⇒ ps7_init 不变 ⇒ **fsbl.elf / BOOT.BIN 不用重做**
+```
+
+产物：`stream/boot/plbin/pl_lz4x4.{bit,bit.bin,dts,dtbo}`（3 引擎的 `pl_lz4x3.*`
+原样保留，是回退路径）。跑起来加 `--pl-engines 4`，并且**发送端要切成 4 条等分流**
+（284 片 ⇒ 71/71/71/71），否则第 4 个引擎拿不到活、白加。
+
 集成好之后要把它加进 `systemd/povrxd.service.d-*.conf` 的 `ExecStart`，
 和 `--half-scan --oe-w` 一样，**否则服务重启就回到 CPU 路径**。
 

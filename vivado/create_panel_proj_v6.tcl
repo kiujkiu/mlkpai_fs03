@@ -7,12 +7,19 @@
 #   - 外部口: v5 的 P1/P3 镜像 → A/B 独立 (端口名不变: 原名=A/P1, _2=B/P3,
 #     panel_pins.xdc 零改动)
 #
-# [2026-08-24 feature/3bit-color] 加 PL lz4 解码引擎 (NENG 见下, 默认 3):
+# [2026-08-24 feature/3bit-color] 加 PL lz4 解码引擎 (NENG 见下):
 #   - RTL: vivado/hdl/lz4/{lz4_decode_core,lz4_axi_top}.v = dr1v90/lz4hw/rtl 原样复制
 #          + lz4_engine_axi.v (本工程新写的适配壳, 理由见该文件头)
-#   - 每引擎独占一个 HP slave 口, 顺序 HP3→HP1→HP2 (DDRC 那一级 HP1/HP2 共口,
-#     理由见 HP_ORDER 处), AXI-Lite 在 0x40020000/30000/40000
 #   - NENG=0 一行切回加 lz4 之前的行为 (PS7 配置逐字不变)
+#
+# [2026-08-25] NENG 3 → **4** (上板实测 74.1 ms/帧 > 62 ms 圈周期 ⇒ 只能隔圈翻页,
+#   7.3 fps; 4 引擎 55.5 ms < 62 ms ⇒ 每圈翻 ⇒ 16 fps, 完整推导见 NENG 处):
+#   - HP 口只有 4 个且 HP0 被面板占死 ⇒ lz4_0 与 lz4_3 **共享 HP3**
+#     (经一个 NUM_SI=2 的 SmartConnect), lz4_1→HP1, lz4_2→HP2。
+#     选 HP3 共享是因为 DDRC 那一级 HP1/HP2 本来就共口, 放 HP3 才能 2:2 均衡 ——
+#     完整取舍 (含否决掉的 S_AXI_GP / ACP 方案) 写在 HP_ORDER 处。
+#   - AXI-Lite: panel 0x40010000, lz4_0..3 = 0x40020000/30000/40000/**50000**
+#   - PS7 配置与 NENG=3 逐字相同 ⇒ ps7_init 不变 ⇒ fsbl.elf / BOOT.BIN 不用重做
 #
 #   - 跑法同 v5:
 #     cmd.exe /c "cd /d D:\claude_workspace\pov3d\mlkpai_fs03 && \
@@ -38,30 +45,71 @@ set PART  xc7z020clg484-1
 set DIR   [file normalize [file dirname [info script]]/..]
 set BUILD $DIR/build_panel
 
-# ---- PL lz4 解码引擎数 (2026-08-24) --------------------------------------
+# ---- PL lz4 解码引擎数 (2026-08-24; 2026-08-25 扩到 4) --------------------
 # 0 = 完全不加 lz4, 逐位回到加 lz4 之前的 v6 (回归/对照用一行就能切)
-# 1..3 = 每个引擎独占一个 HP **slave 口**
+# 1..3 = 每个引擎独占一个 HP **slave 口** (2026-08-24 上板版就是 NENG=3)
+# 4    = 其中一对引擎**共享**一个 HP 口 (HP_ORDER 里出现重复项 = 共享)
 #
-# 🔴 上限 3 的理由 —— 见 feedback_pov_4x_ip_breaks_hdmi: 当年 4 个 HLS IP × 2 master
+# 🔴 为什么要第 4 个 (2026-08-25 上板实测):
+#    3 引擎解一帧 74.1 ms (0.95 B/clk, 稳定), 而转速已提到 969 RPM = 16.15 rev/s
+#    ⇒ 圈周期 62 ms。74 > 62 ⇒ 每帧解完时翻页窗口刚过去, 只能等下一圈,
+#    实际周期 74+62 = 136 ms ⇒ 7.3 fps (实测 flip 2-7/s, 对得上)。
+#    4 引擎 ⇒ 74 × 3/4 = 55.5 ms < 62 ms ⇒ 每圈都能翻 ⇒ 16 fps。
+#    ⚠ 本文件末尾原来写着 "不要靠加第 4 个引擎, 去提频" —— 那条建议的前提是
+#      "瓶颈是总带宽"。实测瓶颈不是带宽 (pair_miss 增长率 0.0/s, 零丢对),
+#      而是**单帧墙钟 74 ms vs 圈周期 62 ms** 这条门限。提频和加引擎等价地
+#      都能过线, 但提频要新开第二个 BUFG 时钟域, 对 WHS 只有 0.020 ns 的
+#      本设计风险更大 ⇒ 这次选加引擎。提频路线仍留在文件末尾。
+#
+# 🔴 "上限 3" 的老理由 —— feedback_pov_4x_ip_breaks_hdmi: 当年 4 个 HLS IP × 2 master
 #    = **NUM_SI=8 挤在一个 axi_smc 上打 HP1**, 单独跑每个都对, 一起跑 HDMI 变噪点,
-#    至今没定位、没修复, 只能退回 1× IP。这里每个引擎独占一个 HP 口、每个 smc 都是
-#    1:1 直通 ⇒ **SmartConnect 这一级零共享仲裁**, 结构上不可能复现那个配置。
+#    至今没定位、没修复, 只能退回 1× IP。原脚本据此立了条不变式:
+#    "每个引擎独占一个 HP 口 ⇒ SmartConnect 这一级零共享仲裁"。
+#    ⇒ 本版**确实破了这条不变式**, 老实写在这里: 有一个口是 NUM_SI=2。
+#      但离当年那个 8:1 差了两个数量级 (2 个主端、同一时钟域、同位宽、无跨域,
+#      而当年是 8 个主端 + HLS 自己的多口), 且另外两个口仍是 1:1 直通。
+#      共享口选在哪、共享谁, 下面写死了理由; 上板后要盯的第一个量仍是 pair_miss。
 #
-# 🔴 但"独占 HP 口"**不等于**"独占 DDR 通路" —— AMD 文档 (Embedded Design Tutorials,
-#    Evaluating High-Performance Ports) 明写:
+# 🔴 HP 口只有 4 个, HP0 被面板 (ddr_slice_fetch256, 110.8 MB/s **纯读**) 独占且不能动
+#    ⇒ 4 个引擎必然有两个共享一个口。选哪个口由 **DDRC 那一级**决定, 不是 HP 那一级:
+#    AMD 文档 (Embedded Design Tutorials, Evaluating High-Performance Ports):
 #      "Throughput of HP1 and HP2 is lower than HP0 and HP3.
 #       It is because **HP1 and HP2 shares one DDR input port**."
 #      "read channels have higher priority than write channels when DDRC has congestions."
-#    ⇒ DDRC 那一级只有 3 个入口: {HP0}, {HP1,HP2}, {HP3}。
-#    所以端口分配顺序是 **HP3 → HP1 → HP2**, 不是 1/2/3:
-#      NENG=1: HP3        (独立 DDRC 口, 与面板的 HP0 最大隔离)
-#      NENG=2: HP3 + HP1  (三个 DDRC 口占了两个, 绝不配 HP1+HP2 那一对)
-#      NENG=3: HP3+HP1+HP2 (只能如此; HP1/HP2 共口是这一档已知的、可接受的代价)
-#    利好: 面板在 HP0 且是**纯读**, 解码器 96% 是写, 而 DDRC 拥塞时读优先于写
-#    ⇒ 结构上面板是被偏袒的一方。但这仍然只是"结构上更安全", 不是保证。
-set NENG 3
-set HP_ORDER {3 1 2}
-set LZ4_CONV protocol_converter   ;# 或 smartconnect (见下面 LZ4_CONV 处的实测理由)
+#    ⇒ DDRC 入口只有 3 个: {HP0}, {HP1,HP2}, {HP3}。4 引擎 ≈ 4 × 46.5 = 186 MB/s 写。
+#      共享口放 HP3: DDRC 分布 = 面板 110.8(读) | {HP1,HP2} 两引擎 93 | {HP3} 两引擎 93
+#                    ⇒ 解码侧的两个 DDRC 入口 **2:2 均衡**            ← 选这个
+#      共享口放 HP1: DDRC 分布 = 面板 110.8(读) | {HP1,HP2} **三**引擎 139 | {HP3} 一引擎 46.5
+#                    ⇒ 把 3/4 的写流量压在 AMD 明说"吞吐更低"的那个共享 DDRC 口上。差。
+#    HP 口那一级不是瓶颈: 64 bit @ 50 MHz = 400 MB/s 理论, 共享口上两个引擎才 93 MB/s,
+#    4.3× 余量 ⇒ 2:1 仲裁是**延迟**风险而不是带宽风险, 而解码器有 FIFO 扛延迟。
+#    利好没变: 面板在 HP0 且纯读, 解码器绝大部分是写, DDRC 拥塞时读优先于写。
+#
+# 评估过但**否决**的其它拓扑 (留着免得下次再想一遍):
+#   - S_AXI_GP0/GP1: 走中央互连, 是真正的**第 4 个独立 DDRC 入口**, 看着最诱人。
+#     否决理由: 口宽只有 32 bit ⇒ 必须加位宽转换器 (又几百 LUT/FF 挂到 BUFG 网上,
+#     而 WHS 就是被这根网的偏斜卡住的), 且 64→32 让**事务数翻倍** —— "小事务打 DDR
+#     的真实效率" 正是本次集成最没底的一项。更要命的是中央互连与 CPU 访外设/访 DDR
+#     同路, 会把风险引到一条从没测过的通路上, 而面板是硬实时的。
+#   - S_AXI_ACP: 64 bit 且延迟低, 但写会在 L2 里分配/命中 ⇒ 面板经 HP0 直读 DDR
+#     会读到**旧数据**。这是正确性问题不是性能问题, 除非改 RTL 里的 AxCACHE。否决。
+#   - 把面板挪出 HP0 腾口给引擎: 面板是全系统唯一的硬实时门限, 不动。否决。
+#
+# HP_ORDER[i] = 第 i 个引擎挂哪个 HP 口。**允许重复**, 重复即共享 (N:1 汇聚)。
+#   ⚠ NENG<=3 时取 [lrange $HP_ORDER 0 NENG-1] = {3 1 2}, 与 2026-08-24 上板版
+#     **逐字相同、全 1:1**, 单元名也不变 ⇒ 一行改回 3 就是完整回退路径。
+#   NENG=4 追加的 lz4_3 挂回 HP3 与 lz4_0 共享 ⇒ lz4_0..2 的口分配一个字没改,
+#   AXI-Lite 也不动 (0x40020000/30000/40000), 新引擎在 **0x40050000**。
+#   ⚠ PS7 侧配置与 NENG=3 **完全一致** (HP0..HP3 本来就全开、全 64 bit) ⇒
+#     ps7_init 不变 ⇒ **fsbl.elf / BOOT.BIN 不用重做**, 换 PL bit 即可。
+set NENG 4
+set HP_ORDER {3 1 2 3}
+set LZ4_CONV protocol_converter   ;# 独占口的 1:1 转换器 (理由见下面 LZ4_CONV 处)
+# 共享口的 N:1 汇聚器: smartconnect | axi_interconnect
+#   smartconnect      : 本工程验证过的 IP (1:1 时 1716 LUT/1646 FF, 2:1 更大)。默认。
+#   axi_interconnect  : 配 STRATEGY=1 (minimize area = SASD 共享总线) 时 LUT 少得多,
+#                       但本工程没验证过 ⇒ 只有 WHS 收不住时才换过去。
+set LZ4_SHARE_CONV smartconnect
 # --------------------------------------------------------------------------
 
 file delete -force $BUILD
@@ -85,11 +133,14 @@ add_files -fileset constrs_1 -norecurse $DIR/vivado/panel_pins_v5.xdc
 create_bd_design system
 
 # ---- PS7 ----
-# ⚠ v5/v6 原注释是 "ps7_init 不变 → fsbl.elf 可复用"。**NENG>0 时这句话是假的**:
-#   置 PCW_USE_S_AXI_HP1/2/3 会改 ps7_init 里的 AFI 配置。必须:
+# ⚠ v5/v6 原注释是 "ps7_init 不变 → fsbl.elf 可复用"。**NENG 从 0 变到 >0 时这句是假的**:
+#   置 PCW_USE_S_AXI_HP1/2/3 会改 ps7_init 里的 AFI 配置。那一次必须:
 #   重导 XSA → 重建 FSBL → 核对 ELF 里 HP0 那 3 处 0xF8008000 mask-write 还在
 #   (那是 HP0 的 32-bit AFI 配置, 丢了就宽度错) → 重打 BOOT.BIN → 冷启动。
 #   NENG=0 时下面这段与改动前逐字相同, 老 fsbl.elf 仍可复用。
+#   🔴 但 **NENG 3 → 4 不触发这件事**: 4 个引擎用的还是 HP1/HP2/HP3 那三个口
+#   (第 4 个是与 lz4_0 共享 HP3, 共享发生在 **PL 侧**的汇聚器里, PS7 看不见),
+#   下面这段 set_property 逐字不变 ⇒ ps7_init 不变 ⇒ 现役 fsbl.elf/BOOT.BIN 继续用。
 set ps [create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0]
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
   -config {make_external "FIXED_IO, DDR" apply_board_preset "0" Master "Disable" Slave "Disable"} $ps
@@ -122,10 +173,11 @@ set_property -dict [list \
   CONFIG.PCW_FCLK_CLK0_BUF {TRUE} \
 ] $ps
 
-# ---- lz4 引擎用的 HP 口: 每引擎独占一口, 64-bit (顺序见 HP_ORDER) ----
+# ---- lz4 引擎用的 HP 口, 全 64-bit (哪个引擎挂哪个口见 HP_ORDER) ----
+# lsort -unique: HP_ORDER 允许重复(共享口), 同一个口只能 set_property 一次
 if {$NENG > 0} {
     set hp_cfg {}
-    foreach i [lrange $HP_ORDER 0 [expr {$NENG - 1}]] {
+    foreach i [lsort -unique [lrange $HP_ORDER 0 [expr {$NENG - 1}]]] {
         lappend hp_cfg CONFIG.PCW_USE_S_AXI_HP$i {1}
         # 64-bit: 核每 8 字节发一笔单拍事务, 32-bit 会让事务数翻倍 —— 而
         # "小事务打 DDR 的真实效率" 正是本次集成最没底的一项, 不要主动加倍
@@ -159,17 +211,16 @@ set rst_cell [lindex [get_bd_cells -filter {VLNV =~ "xilinx.com:ip:proc_sys_rese
 set rst_net  [get_bd_nets -of_objects [get_bd_pins $rst_cell/peripheral_aresetn]]
 connect_bd_net -net $rst_net [get_bd_pins axi_smc_hp0/aresetn]
 
-# ---- PL lz4 解码引擎 ×NENG (2026-08-24) ----------------------------------
+# ---- PL lz4 解码引擎 ×NENG (2026-08-24; 2026-08-25 加共享 HP 口支持) ------
 # 每个引擎:
 #   s_axi (AXI4-Lite) → ps7_0_axi_periph (GP0), 窗口 0x40020000 + i*0x10000, 64K
-#   m_axi (AXI4 64b)  → axi_smc_lz4_$i (1:1) → ps7_0/S_AXI_HP[lindex $HP_ORDER $i]
+#   m_axi (AXI4 64b)  → 该 HP 口的转换器/汇聚器 → ps7_0/S_AXI_HP[lindex $HP_ORDER $i]
 # 时钟/复位一律用 FCLK_CLK0 (50 MHz) 与 panel 同域 —— **不新开时钟域**:
 #   05_3bit_bcm.md §11 记着 hold 余量只有 0.036 ns、build 日志里 WHS 见过 +0.015,
 #   而且 XDC 里一条 create_clock/set_output_delay 都没有 (ODDR→pad 从没被分析过)。
 #   在这种状态下多开一个 BUFG 域纯属给自己找事。lz4 OOC Fmax 136.8 MHz,
 #   跑 50 MHz 是 2.7× 余量, setup 侧完全不是问题。
 for {set i 0} {$i < $NENG} {incr i} {
-    set hp  [lindex $HP_ORDER $i]
     set cel [create_bd_cell -type module -reference lz4_engine_axi lz4_$i]
     if {[llength [get_bd_intf_pins -quiet lz4_$i/s_axi]] == 0} {
         puts "FATAL: lz4_$i/s_axi 接口没推断出来"; exit 1 }
@@ -187,37 +238,101 @@ for {set i 0} {$i < $NENG} {incr i} {
                 [get_bd_pins lz4_$i/s_axi_aclk] }
     apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config \
         [list Master {/ps7_0/M_AXI_GP0} Clk {Auto}] [get_bd_intf_pins lz4_$i/s_axi]
+}
 
-    # ---- AXI4 → AXI3(HP 口) 协议转换 ----
-    # 🔴 这里**不用 SmartConnect**, 用 axi_protocol_converter。理由是实测的:
-    #    3 个 1:1 SmartConnect 每个 **1716 LUT / 1646 FF**, 三个加起来 5148 LUT ——
-    #    比三个解码引擎本身(3×1187)还大, 而且那 4938 个 FF 全挂在 50 MHz 的
-    #    BUFG 网上。本设计的 WHS 几乎完全由这根网的**时钟偏斜**决定
-    #    (最差路径: 0 逻辑级 FDRE→SRLC32E, 数据延迟 0.475 ns, 偏斜 0.282 ns),
-    #    fanout 越大偏斜越大 ⇒ 少挂几千个负载是直接的 hold 余量。
-    #    SmartConnect 的仲裁/位宽转换本设计一样都不需要 (1:1, 同位宽, 同时钟),
-    #    它唯一干的活就是 AXI4→AXI3, 那正是 protocol_converter 的本职。
-    #    ⚠ 想退回 SmartConnect 就把下面 LZ4_CONV 改成 smartconnect (两条路都留着)。
-    if {$LZ4_CONV eq "smartconnect"} {
-        set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 axi_smc_lz4_$i]
-        set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $sc
-        set si S00_AXI; set mi M00_AXI
-        connect_bd_net -net $rst_net [get_bd_pins axi_smc_lz4_$i/aresetn]
-        connect_bd_net -net $clk_net [get_bd_pins axi_smc_lz4_$i/aclk]
+# ---- 按 HP 口分组: 同一个口上的引擎共用一个汇聚器 ----
+# HP_ORDER 里出现一次 ⇒ 1:1 直通转换器 (单元名 axi_smc_lz4_$i, 与 2026-08-24 版一致);
+# 出现 N>1 次      ⇒ 一个 NUM_SI=N 的汇聚器 (单元名 axi_smc_lz4_share_hp$hp)。
+array unset HP_ENG
+set hp_uniq {}
+for {set i 0} {$i < $NENG} {incr i} {
+    set hp [lindex $HP_ORDER $i]
+    if {![info exists HP_ENG($hp)]} { set HP_ENG($hp) {} ; lappend hp_uniq $hp }
+    lappend HP_ENG($hp) $i
+}
+foreach hp $hp_uniq {
+    set engs [set HP_ENG($hp)]
+    set n    [llength $engs]
+
+    if {$n == 1} {
+        # ---- 独占口: AXI4 → AXI3(HP 口) 协议转换 ----
+        # 🔴 这里**不用 SmartConnect**, 用 axi_protocol_converter。理由是实测的:
+        #    3 个 1:1 SmartConnect 每个 **1716 LUT / 1646 FF**, 三个加起来 5148 LUT ——
+        #    比三个解码引擎本身(3×1187)还大, 而且那 4938 个 FF 全挂在 50 MHz 的
+        #    BUFG 网上。本设计的 WHS 几乎完全由这根网的**时钟偏斜**决定
+        #    (最差路径: 0 逻辑级 FDRE→SRLC32E, 数据延迟 0.475 ns, 偏斜 0.282 ns),
+        #    fanout 越大偏斜越大 ⇒ 少挂几千个负载是直接的 hold 余量。
+        #    实测对照 (同一份 RTL, 只差这一项): smartconnect 12432 LUT / WHS 0.010,
+        #    protocol_converter 8010 LUT / WHS **0.020** —— hold 余量直接翻倍。
+        #    SmartConnect 的仲裁/位宽转换独占口一样都不需要 (1:1, 同位宽, 同时钟),
+        #    它唯一干的活就是 AXI4→AXI3, 那正是 protocol_converter 的本职。
+        #    ⚠ 想退回 SmartConnect 就把上面 LZ4_CONV 改成 smartconnect (两条路都留着)。
+        set i     [lindex $engs 0]
+        set cname axi_smc_lz4_$i
+        if {$LZ4_CONV eq "smartconnect"} {
+            set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 $cname]
+            set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $sc
+            set silist S00_AXI; set mi M00_AXI
+            connect_bd_net -net $rst_net [get_bd_pins $cname/aresetn]
+            connect_bd_net -net $clk_net [get_bd_pins $cname/aclk]
+        } else {
+            set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_protocol_converter:2.1 $cname]
+            set_property -dict [list CONFIG.SI_PROTOCOL {AXI4} CONFIG.MI_PROTOCOL {AXI3} \
+                                     CONFIG.TRANSLATION_MODE {2}] $sc
+            set silist S_AXI; set mi M_AXI
+            connect_bd_net -net $rst_net [get_bd_pins $cname/aresetn]
+            connect_bd_net -net $clk_net [get_bd_pins $cname/aclk]
+        }
     } else {
-        set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_protocol_converter:2.1 axi_smc_lz4_$i]
-        set_property -dict [list CONFIG.SI_PROTOCOL {AXI4} CONFIG.MI_PROTOCOL {AXI3} \
-                                 CONFIG.TRANSLATION_MODE {2}] $sc
-        set si S_AXI; set mi M_AXI
-        connect_bd_net -net $rst_net [get_bd_pins axi_smc_lz4_$i/aresetn]
-        connect_bd_net -net $clk_net [get_bd_pins axi_smc_lz4_$i/aclk]
+        # ---- 共享口: N:1 汇聚 (本版只会走到 N=2, HP3) ----
+        # 🔴 protocol_converter 干不了这活 —— 它是 1:1 的, 没有仲裁器。共享口必须用
+        #    带 crossbar 的 IP。两条路都实现了, 由 LZ4_SHARE_CONV 选:
+        #    smartconnect     : 本工程唯一验证过的互连 IP。已知代价是 FF 多、BUFG
+        #                       fanout 涨 ⇒ 吃 WHS。但 2026-08-24 那次全 smartconnect
+        #                       的构建 (12432 LUT / 11842 FF / fanout 14423) WHS 仍有
+        #                       +0.010 ⇒ 只多加**一个** 2:1 的量级是能兜住的。
+        #    axi_interconnect : STRATEGY=1 = minimize area = SASD 共享总线, 面积小得多,
+        #                       代价是读写共用一条地址通路、串行化。本工程 93 MB/s 打
+        #                       400 MB/s 的口, 串行化不是问题。没验证过, 作后备。
+        set cname axi_smc_lz4_share_hp$hp
+        if {$LZ4_SHARE_CONV eq "axi_interconnect"} {
+            set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 $cname]
+            set_property -dict [list CONFIG.NUM_SI $n CONFIG.NUM_MI {1} \
+                                     CONFIG.STRATEGY {1}] $sc
+            connect_bd_net -net $clk_net [get_bd_pins $cname/ACLK]
+            connect_bd_net -net $rst_net [get_bd_pins $cname/ARESETN]
+            connect_bd_net -net $clk_net [get_bd_pins $cname/M00_ACLK]
+            connect_bd_net -net $rst_net [get_bd_pins $cname/M00_ARESETN]
+            set silist {}
+            for {set k 0} {$k < $n} {incr k} {
+                set sn [format S%02d $k]
+                connect_bd_net -net $clk_net [get_bd_pins $cname/${sn}_ACLK]
+                connect_bd_net -net $rst_net [get_bd_pins $cname/${sn}_ARESETN]
+                lappend silist ${sn}_AXI
+            }
+            set mi M00_AXI
+        } else {
+            set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 $cname]
+            set_property -dict [list CONFIG.NUM_SI $n CONFIG.NUM_MI {1}] $sc
+            connect_bd_net -net $rst_net [get_bd_pins $cname/aresetn]
+            connect_bd_net -net $clk_net [get_bd_pins $cname/aclk]
+            set silist {}
+            for {set k 0} {$k < $n} {incr k} { lappend silist [format S%02d_AXI $k] }
+            set mi M00_AXI
+        }
     }
-    connect_bd_intf_net [get_bd_intf_pins lz4_$i/m_axi] \
-                        [get_bd_intf_pins axi_smc_lz4_$i/$si]
-    connect_bd_intf_net [get_bd_intf_pins axi_smc_lz4_$i/$mi] \
+
+    # 引擎 m_axi → 汇聚器各 SI (顺序 = HP_ORDER 里出现的顺序)
+    if {[llength $silist] != $n} {
+        puts "FATAL: HP$hp 汇聚器 SI 数 [llength $silist] != 引擎数 $n"; exit 1 }
+    foreach i $engs si $silist {
+        connect_bd_intf_net [get_bd_intf_pins lz4_$i/m_axi] \
+                            [get_bd_intf_pins $cname/$si]
+    }
+    connect_bd_intf_net [get_bd_intf_pins $cname/$mi] \
                         [get_bd_intf_pins ps7_0/S_AXI_HP$hp]
     connect_bd_net -net $clk_net [get_bd_pins ps7_0/S_AXI_HP${hp}_ACLK]
-    puts "LZ4: lz4_$i -> axi_smc_lz4_$i -> S_AXI_HP$hp"
+    puts "LZ4: lz4_{$engs} -> $cname (NUM_SI=$n) -> S_AXI_HP$hp"
 }
 
 assign_bd_address
@@ -365,9 +480,20 @@ write_hw_platform -fixed -include_bit -force $DIR/mlkpai_panel.xsa
 puts "BUILD_OK: $BUILD/$PROJ.runs/impl_1/system_wrapper.bit"
 
 #=============================================================================
-# 提频路线 (如果 3 引擎 @50 MHz 实测不够, 这是下一步, 不要靠加第 4 个引擎)
+# 2026-08-25 更新: 下面这条 "不要靠加第 4 个引擎" 的旧建议**已被实测推翻一半**。
+#   旧建议的前提是 "瓶颈是总带宽" ⇒ 提频比加引擎划算。
+#   实测的瓶颈不是带宽 (3 引擎 + 面板, pair_miss 增长率 0.0/s, 零丢对),
+#   而是**单帧墙钟 74.1 ms > 圈周期 62 ms (969 RPM)** 这条门限: 解完时翻页窗口
+#   刚过, 只能等下一圈 ⇒ 实际 74+62=136 ms ⇒ 7.3 fps。
+#   过这条门限只需要把单帧墙钟压到 62 ms 以下, **加引擎和提频等价**:
+#     4 引擎 @50 MHz ⇒ 74×3/4 = 55.5 ms ✓   (本版走这条: 不新开时钟域)
+#     3 引擎 @75 MHz ⇒ 74×2/3 = 49.4 ms ✓   (要新开 BUFG 域, 对 WHS=0.020 的
+#                                            本设计风险更大, 见下)
+#   两条路不互斥, 真需要 30 fps 时可以叠 (4 引擎 @75 MHz ⇒ 37 ms)。
+#
+# 提频路线 (仍然有效, 作为下一步)
 #   3 引擎 @50 MHz  = 139–144 MB/s   (需求 116.2 MB/s, 余量 1.20×)
-#   3 引擎 @75 MHz  = 209–216 MB/s   (余量 1.8×)   ← 优先走这条
+#   3 引擎 @75 MHz  = 209–216 MB/s   (余量 1.8×)
 #   3 引擎 @100 MHz = 279–288 MB/s   (余量 2.4×)
 # 做法: PS7 加 CONFIG.PCW_FPGA1_PERIPHERAL_FREQMHZ {75} + PCW_EN_CLK1_PORT,
 #   lz4_* 与 axi_smc_lz4_* 与 S_AXI_HP{1,2,3}_ACLK 全部改接 FCLK_CLK1,
