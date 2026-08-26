@@ -65,7 +65,23 @@ sudo sed -i "s/\bpov\b/$NEWHOST/g" $R/etc/hosts
 sudo truncate -s 0 $R/etc/machine-id                    # systemd 首启重新生成
 sudo rm -f $R/var/lib/dbus/machine-id
 sudo ln -sf /etc/machine-id $R/var/lib/dbus/machine-id
-sudo rm -f $R/etc/ssh/ssh_host_*                        # sshd 首启重新生成
+sudo rm -f $R/etc/ssh/ssh_host_*
+# 🔴 删 host key 还不够: sshd 首启**不一定**自动生成 (2026-08-26 pov2 就没生成,
+#    SSH active 但一握手就 abort, 只能靠串口救)。装一个 oneshot 服务强制生成。
+sudo tee $R/etc/systemd/system/regen-sshkeys.service >/dev/null <<'UNIT'
+[Unit]
+Description=Regenerate SSH host keys on first boot
+Before=ssh.service
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+ExecStartPost=/bin/systemctl try-restart ssh.service
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo ln -sf /etc/systemd/system/regen-sshkeys.service \
+    $R/etc/systemd/system/multi-user.target.wants/regen-sshkeys.service
 sudo rm -f $R/home/uisrc/*.log $R/home/uisrc/.bash_history $R/root/.bash_history
 sudo rm -rf $R/home/uisrc/rfsbak $R/var/lib/dhcp/*
 sudo rm -f $R/etc/udev/rules.d/70-persistent-net.rules  # 否则网卡名钉在旧机器 MAC 上

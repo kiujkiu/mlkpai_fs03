@@ -17,7 +17,15 @@ set -u
 
 PLINK='/mnt/c/Program Files/PuTTY/plink.exe'
 PSCP='/mnt/c/Program Files/PuTTY/pscp.exe'
-HOSTKEY='SHA256:u14U8c0RuKnVinQuaGH5ey6OKScaPOlRF3vMNqSnEGI'
+# 每台板子一个 SSH 主机指纹。BOARD_HOSTKEY= 可覆盖; 否则按 BOARD_IP 选。
+#   pov  10.10.20.239  第一台 (ICND2047 双面偏心)
+#   pov2 10.10.21.226  第二台 (2026-08-26 装, ICND2049 单面)
+HOSTKEY_pov='SHA256:u14U8c0RuKnVinQuaGH5ey6OKScaPOlRF3vMNqSnEGI'
+HOSTKEY_pov2='SHA256:5vecxNPqL1xs3uu4sRAHwIk+RxuueCg9CMePo1RNicQ'
+case "${BOARD_IP:-}" in
+    10.10.21.226) HOSTKEY="${BOARD_HOSTKEY:-$HOSTKEY_pov2}" ;;
+    *)            HOSTKEY="${BOARD_HOSTKEY:-$HOSTKEY_pov}"  ;;
+esac
 BUSER="${BOARD_USER:-uisrc}"
 BPW="${BOARD_PW:-root}"
 
