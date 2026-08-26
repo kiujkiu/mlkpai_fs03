@@ -3399,8 +3399,11 @@ int main(int argc, char **argv)
          * 是"载荷有几片", 与引擎一圈几片是两回事, 见 0x10 的注释)。 */
         uint32_t period = (uint32_t)((double)ACLK_HZ / (fake_rps * fake_slices) + 0.5);
         reg_wr(REG_FAKE_PERIOD, period);
-        /* pov_ctrl_write 会先保证 PHASE_B < n_slices 再落 0x10 */
-        pov_ctrl_write(fake_slices, (1u << 1) | 1u);
+        /* pov_ctrl_write 会先保证 PHASE_B < n_slices 再落 0x10。
+         * 🔴 dual_en(bit2) 必须带上 —— 否则偏心双屏只驱动面 A, 面 B 全黑。
+         * 2026-08-26 pov2(2047 双屏) 台面无电机自检时踩到: 屏黑, 查了半天
+         * 才发现 --fake 从来只按单屏调 (老默认 --fake-slices 360)。 */
+        pov_ctrl_write(fake_slices, (1u << 2) | (1u << 1) | 1u);
         logts("fake-spin: %.2f rps x %u 片/圈 -> fake_period=%u ticks/slice, "
               "POV_CTRL set", fake_rps, fake_slices, period);
     }

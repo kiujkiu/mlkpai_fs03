@@ -333,13 +333,15 @@ def apply_marks(code, idx):
     return code
 
 
-def build_colors8_seq(levels, marks):
+def build_colors8_seq(levels, marks, which=None):
     """→ [(标签, 码值图)] 播放序列: 每色按 levels 逐档, **同色相邻**。
 
     黑色的每一档都是全 0 ⇒ 黑帧长度自动 = len(levels) 倍, 正好当循环起点标记。
+    which: None=全 8 色; 否则是英文名列表 (如 ['red','green','blue']) 只出这几色。
     """
     seq = []
-    for idx, (cn, en, mask) in enumerate(COLORS8):
+    pal = COLORS8 if which is None else [c for c in COLORS8 if c[1] in which]
+    for idx, (cn, en, mask) in enumerate(pal):
         for lv in levels:
             code = np.zeros((H, W, 3), np.uint8)
             for c in range(3):
@@ -548,6 +550,10 @@ def main():
     ap.add_argument('--blank-face', choices=['none', 'a', 'b'], default='none',
                     help='--faces 2 时把其中一面整片压黑 —— 几何/时序与双面完全一致, '
                          '只有一块屏亮 ⇒ 用来判定坏点长在 A 屏还是 B 屏')
+    ap.add_argument('--colors', default=None, metavar='C,C,...',
+                    help='[colors8] 只出这几色 (逗号分隔英文名: '
+                         'black,red,green,blue,yellow,cyan,magenta,white)。'
+                         '默认全 8 色。例: --colors red,green,blue = RGB 三色循环')
     ap.add_argument('--dwell', type=float, default=0.5, metavar='S',
                     help='colors8: 每帧停留秒数 (默认 0.5 s ≈ 8 转 @969RPM); '
                          '推流 fps = 1/dwell, 只用于算推流命令与预览标注')
@@ -579,7 +585,8 @@ def main():
             sys.exit(f'--levels {a.levels!r} 解析失败')
         if not levels or any(not 0 <= v <= LEVELS - 1 for v in levels):
             sys.exit(f'--levels 每档须在 0..{LEVELS - 1}')
-        seq = build_colors8_seq(levels, a.marks)
+        which = [c.strip() for c in a.colors.split(",")] if a.colors else None
+        seq = build_colors8_seq(levels, a.marks, which)
         # 🔴 量化统一走 gas.to_3bit(dither=False) —— 见 codes_via_to_3bit 的说明
         if a.bpp == 3:
             seq = [(lb, codes_via_to_3bit(c, a.gamma)) for lb, c in seq]
