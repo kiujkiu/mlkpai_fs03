@@ -128,6 +128,81 @@ FPGA Manager + configfs overlay, 板子转着不用断电。配方见
 - ⚠ 另一个教训: 用 `ls` 看 WSL 挂载的 SD 卡**会撒谎** (显示空目录, 实际有文件)。
   判断卡上有什么要**直接读原始扇区**或用 Windows 侧确认。
 
+---
+
+# 🎯 最省事的路: 做镜像 + Etcher (2026-08-26 实战验证)
+
+正文那套手工分区/挂载的流程**在 WSL 下走不通** (见附四)。实际可行的是:
+**在 WSL 内部做一个完整磁盘镜像, 再用 Etcher 烧到卡上。**
+
+## 一条命令做完镜像 (tools/make_card_image.sh)
+
+```bash
+bash stream/boot/make_card_image.sh          # 产出 D:\claude_workspace\pov3d\fs03_card.img.gz
+```
+
+它做的事: `truncate 2600M` → `parted` 分区 (105MB FAT32 boot 标志 + 剩余 ext4)
+→ `losetup -fP` → `mkfs.vfat`/`mkfs.ext4` → 灌 4 个 boot 文件 → 解 rootfs
+→ **重置机器标识** (见下) → `e2fsck` → `gzip -1`。
+
+全程在 WSL 的 loop 设备上, **不碰宿主磁盘**, 所以普通权限就够。
+
+## 烧录 (这一步必须人来)
+
+balenaEtcher (https://etcher.balena.io/) → Flash from file 选 `.img.gz`
+(它直接认 gz, 不用解压) → 选卡 → Flash。实测 26.8 MB/s, 2.6GB 约 2 分钟, 自动校验。
+
+⚠ 烧完 Windows 会弹「需要格式化此磁盘」—— **点取消**。那是它读不懂 ext4 分区。
+
+## 🔴 装第二台机器必须重置的三样东西
+
+直接克隆 rootfs 会让两台机器**打架**, 尤其第二条:
+
+| | 症状 | 处理 |
+|---|---|---|
+| `/etc/hostname` | 两台同名 `pov` | 改成 `pov2`, 同时改 `/etc/hosts` |
+| **`/etc/machine-id`** | 🔴 **DHCP 用它当标识 ⇒ 两台抢同一个 IP** | `truncate -s 0`, systemd 首启重新生成; `/var/lib/dbus/machine-id` 做软链指过去 |
+| `/etc/ssh/ssh_host_*` | 两台同密钥, 安全问题 + 客户端告警 | 全删, sshd 首启重新生成 |
+
+顺带清掉: `*.log`、`.bash_history`、`/var/lib/dhcp/*`、
+`/etc/udev/rules.d/70-persistent-net.rules` (网卡名会被钉在旧机器的 MAC 上)。
+
+## 附四: 为什么 WSL 直接写卡走不通
+
+实测四种方式**全部** `Permission denied`, 且**与卡和读卡器无关** (换卡、换访问路径都一样):
+
+```
+WSL  cp (drvfs 9p)            → 拒绝
+WSL  sudo cp                  → 拒绝   (Linux 的 root 管不到 Windows 文件系统驱动)
+WSL  重挂 umask=000           → 拒绝
+Windows PowerShell (从 WSL 调) → UnauthorizedAccessException
+```
+
+根因: WSL2 访问 Windows 盘走 **9p 协议** (`mount` 里看得到 `type 9p`),
+对可移动介质的写入受宿主侧限制。而且**就算能写也只解决一半** —— ext4 需要
+块设备级访问, 9p 根本不提供; `lsblk` 在 WSL 里也看不到 U 盘 (只有 WSL 自己的虚拟盘)。
+
+唯一的块设备路径是 `wsl --mount \\.\PHYSICALDRIVE<N> --bare`, **需要管理员权限**。
+⇒ 所以要么人跑一条提权命令, 要么走镜像 + Etcher。**后者更稳** (Etcher 自动隐藏
+系统盘并写后校验; `dd` 打错一个字母就把系统盘写了)。
+
+## 🔴 附五: 判断介质可写, 必须实写实校
+
+这次栽了一跤: `touch` 成功 → 判定"卡能写" → 实际 `cp` 全部失败。
+更狠的是**快速格式化也成功**, 于是一度误判成"卡是好的"、再误判成"卡坏了"。
+
+原因: `touch` 和快速格式化**只写元数据区** (目录项 / FAT 表), 数据区一个字节没碰。
+一张数据区写入故障的卡, 这两项都会给出**假阳性**。
+
+⇒ 正确判据: **写入一定量的真实数据 (≥ 数 MB) 并读回比对 md5**。
+```bash
+dd if=/dev/urandom of=/tmp/t bs=1M count=20
+cp /tmp/t /mnt/x/t && sync
+[ "$(md5sum < /tmp/t)" = "$(md5sum < /mnt/x/t)" ] && echo OK
+```
+同类"判据自身失效"的坑见记忆 [[feedback_pair_miss_sentinel_was_broken]]、
+[[feedback_grep_treats_gbk_log_as_binary]]。
+
 ## 附二: 取 rootfs 时踩的坑 (2026-08-26)
 
 🔴 **别走 WiFi 传 rootfs**。板子跟着屏在转, 天线环境本来就差,

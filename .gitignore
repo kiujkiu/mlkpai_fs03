@@ -28,3 +28,5 @@ stream/boot/mk2.bat
 # (制卡必需 —— 见 stream/boot/MAKE_CARD_FROM_BLANK.md, 本地保存在
 #  stream/boot/board_backup/, 校验值记在同目录 MD5SUMS)
 stream/boot/board_backup/rootfs.tar.gz
+# 制卡镜像 (2.6GB/压缩后 576MB), 用 stream/boot/make_card_image.sh 现做
+fs03_card.img*
