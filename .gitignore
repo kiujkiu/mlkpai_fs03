@@ -24,3 +24,7 @@ stream/boot/plbin/*.bit
 stream/boot/__pycache__/
 stream/board/pov_rxd.prev_cpu
 stream/boot/mk2.bat
+# rootfs 镜像 559MB, 超 GitHub 100MB 单文件上限, 不入库
+# (制卡必需 —— 见 stream/boot/MAKE_CARD_FROM_BLANK.md, 本地保存在
+#  stream/boot/board_backup/, 校验值记在同目录 MD5SUMS)
+stream/boot/board_backup/rootfs.tar.gz

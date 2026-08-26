@@ -65,11 +65,14 @@ def handle(conn, args, ref_md5=None):
         magic, comp_len, raw_len, n_slices, flags = HDR.unpack(hdr)
         # 2026-07-31: 帧长不再是常量 (v3.1 偏心屏可能是 180/360/540/720 片),
         # 跟板端 pov_rxd 一样按 n_slices 校验, 不再硬比 FRAME_RAW/N_SLICES。
-        # 2026-08-20 v3.4: **片距也从 flags 推** (protocol.h PVS_STRIDE),
-        # 3-bit 一片 0x9000 ⇒ 片数上限 240 (帧字节上限 8847360 不变)。
+        # 2026-08-20 v3.4: **片距也从 flags 推** (protocol.h PVS_STRIDE)。
+        # 2026-08-26 修: 上限写死过 8847360 (3-bit 只让到 240 片), 而
+        # PVS_FRAME_RAW_MAX 早在 2026-08-24 就抬到 21MB 了 —— 于是任何
+        # >240 片的 3-bit 帧 (双面 142+142=284 就是) 在这里被判 BAD HDR,
+        # 板端反而收得下。改走 pack_obs.FRAME_RAW_MAX = host 侧唯一定义处。
         bpp = 3 if (flags & FLAG_3BIT) else 1
         stride = pack_obs.slice_stride(bpp)
-        if (magic != MAGIC or not (1 <= n_slices <= 8847360 // stride)
+        if (magic != MAGIC or not (1 <= n_slices <= pack_obs.FRAME_RAW_MAX // stride)
                 or raw_len != n_slices * stride):
             print(f'[fake_board] BAD HDR magic={magic!r} raw_len={raw_len} '
                   f'n_slices={n_slices} bpp={bpp}', flush=True)
