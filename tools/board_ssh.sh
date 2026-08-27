@@ -21,7 +21,7 @@ PSCP='/mnt/c/Program Files/PuTTY/pscp.exe'
 #   pov  10.10.20.239  第一台 (ICND2047 双面偏心)
 #   pov2 10.10.21.226  第二台 (2026-08-26 装, ICND2049 单面)
 HOSTKEY_pov='SHA256:u14U8c0RuKnVinQuaGH5ey6OKScaPOlRF3vMNqSnEGI'
-HOSTKEY_pov2='SHA256:5vecxNPqL1xs3uu4sRAHwIk+RxuueCg9CMePo1RNicQ'
+HOSTKEY_pov2='SHA256:RfuPXPxnrnRkhscA6GQsFZBXzNOuUvn8qGvrEIGNPKo'
 case "${BOARD_IP:-}" in
     10.10.21.226) HOSTKEY="${BOARD_HOSTKEY:-$HOSTKEY_pov2}" ;;
     *)            HOSTKEY="${BOARD_HOSTKEY:-$HOSTKEY_pov}"  ;;
