@@ -150,6 +150,21 @@ pw(0x0C, 0xC1000003)                      # auto_en=1 + use_fb: 重新起跑
 # sub01: [7:0]=oe_w1 [15:8]=oe_w2 [16]=bpp_mode [17]=le_plane_mode [18]=half_scan
 pw(0x0C, (1 << 30) | (OE_W1 & 0xFF) | ((OE_W2 & 0xFF) << 8)
          | ((1 if BPP3 else 0) << 16) | ((1 if (BPP3 and HALF) else 0) << 18))
+# 🔴 2026-08-27: 强制用**正确的 bpp3** 重取一次片。
+# 上面 pw(0x10, ...|0x5) 把 pov_en 拉高时 bpp3_r 还是复位值 0 ⇒ 那唯一一次取帧按
+# 1-bit 布局写 fb (slice_off = idx*0x3000, 只写 plane0, 最大 fb 地址 429); 而
+# bpp_mode 到上面这行才变 1, 引擎随后按 3-bit 地址读 0..971 ⇒ 972 个读地址里
+# **542 个(56%)从没被写过 = 恒 0**, 其余 430 个全部错位 ⇒ 屏近乎全黑。
+# 台面上(sensor 模式 + 无电机)slice_idx 定格 ⇒ pov_dual_top.v:387 的
+# 「idx 变了才重取」永远不成立 ⇒ **fb 一辈子只被写这一次, 永不自愈**。
+# 转起来时 pov_rxd/fake-spin 每片都在重取, 这个 bug 被完全掩盖 —— 所以它只在
+# 台面调试时致命, 也正因如此躺了很久没被发现。
+# pov_en 0->1 会把 df_last_slice 复位成 0xFFFF (pov_dual_top.v:417-421), 强制重取。
+# ⚠ [31:16] 必须写 0: 只有非零才会改 n_slices (pov_dual_top.v:335-336)。
+#   pov6_hold.py / pov6_fake.py 写 (360<<16) 就是在这里把 142 砸成 360。
+pw(0x10, 0x4)                             # pov_en=0 (dual_en 保持), 复位 df_last_slice
+_ = int.from_bytes(p[0x24:0x28], 'little')  # 读一次: 强制上一条写完成并拉开时间
+pw(0x10, 0x5)                             # pov_en=1: 用当前 bpp3 重取一次
 print('bpp_mode', 1 if BPP3 else 0, 'oe_w', OE_W0, OE_W1, OE_W2, 'n_slices', N_SLICES)
 print('DISPLAY UP uptime', open('/proc/uptime').read().split()[0])
 PY
@@ -191,7 +206,41 @@ for t in $(seq 1 30); do
 done
 sleep 2; IF2=$(ls /sys/class/net 2>/dev/null | grep '^wl' | head -1); [ -n "$IF2" ] && IF=$IF2
 echo "IF=[$IF]"
-[ -n "$IF" ] || { echo NO_WLAN_STATIC_ONLY; exit 0; }
+# 🔴 2026-08-27: 窗口内没等到网卡时**不再直接放弃**。
+# 实测 mt7921u 有过 **403 秒**才枚举出来的情况 (dmesg: usb 1-1 new high-speed
+# @403.68, 接口 wlx… @406.39), 是上面 30 秒窗口的 9 倍。老代码打完
+# NO_WLAN_STATIC_ONLY 就 exit 0, 之后**再也没有任何东西会把 WiFi 拉起来** ——
+# 哪怕网卡后来出现了并且一直好好待着。板子就此永久失联, 只能插串口救。
+# 这就是记忆里那条「WiFi 会掉且不自愈」的真正机制, 不是射频问题。
+# 改成后台守候: 每 5 秒查一次, 最多 20 分钟, 接口一出现就走同一套配置。
+# ⚠ pov.service 是 Type=oneshot + RemainAfterExit=yes, ExecStart 退出后
+#   cgroup 里的子进程不会被杀 (现役的 wpa_supplicant/dhclient 本来就是这么留下的),
+#   所以这个后台循环能活下来。
+if [ -z "$IF" ]; then
+    echo "NO_WLAN_YET -> 转后台守候 (每 5s 查一次, 最多 20 分钟)"
+    (
+        for t in $(seq 1 240); do
+            IFB=$(ls /sys/class/net 2>/dev/null | grep '^wl' | head -1)
+            if [ -n "$IFB" ]; then
+                sleep 3                       # 让 renamed-from-wlan0 那步落定
+                pkill wpa_supplicant 2>/dev/null; sleep 1
+                wpa_supplicant -B -i "$IFB" -c /etc/wpa_supplicant/wpa.conf
+                for u in $(seq 1 20); do
+                    iw dev "$IFB" link 2>/dev/null | grep -q Connected && break
+                    sleep 1
+                done
+                dhclient "$IFB"
+                echo "LATE_WLAN_UP $IFB (开机后约 $((t*5)) 秒才出现)"
+                ip -br addr show "$IFB"
+                exit 0
+            fi
+            sleep 5
+        done
+        echo "NO_WLAN_AFTER_20MIN"
+    ) &
+    echo BRINGUP_DONE
+    exit 0
+fi
 pkill wpa_supplicant 2>/dev/null; sleep 1
 wpa_supplicant -B -i $IF -c /etc/wpa_supplicant/wpa.conf
 for t in $(seq 1 20); do
