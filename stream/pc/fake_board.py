@@ -7,6 +7,8 @@ fake_board.py — PVS1 协议回环测试服务器 (零硬件测 PC 侧全链路
 校验 raw_len==4,423,680 → sha256 → ACK. 参考帧按连接维护, 连接首帧带
 DELTA 按协议 NAK (无参考帧), 连接保持让发送端降级重发 keyframe.
 可选 --save-png 每帧 unpack slice 0 (pack_obs.unpack_slice) 存 PNG 目验.
+PVS_FLAG_VOXTAB 帧 (验证板 VXT1 体素表, 2026-10-10): 解压后按 vox_table.h 校验,
+--md5 DIR 同样可用 (DIR 里是 frame_*.vxt)。
 可选 --md5 DIR: 与 DIR 内 sorted frame_*.bin 逐帧 md5 比对 (帧号 mod N
 回绕), 校验 delta 重建正确性, 连接结束打 PASS/FAIL 汇总.
 
@@ -27,7 +29,33 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
 sys.path.insert(0, HERE)
 import pack_obs
 from povstream import (MAGIC, HDR, FRAME_RAW, N_SLICES, ACK, NAK,
-                       FLAG_DELTA, FLAG_3BIT, decompress_frame, xor_frames)
+                       FLAG_DELTA, FLAG_3BIT, FLAG_GEOM, FLAG_MSTREAM, decompress_frame,
+                       xor_frames, _decode)
+import pov_profile as pvp
+
+
+def handle_voxtab(conn, comp_len, raw_len, n_slices, flags, n, ref_md5):
+    """PVS_FLAG_VOXTAB 帧 (2026-10-10): 解压 → 按 vox_table.h 校验 VXT1 体。
+    规则同 protocol.h: n_slices 必须 0, 不能与 DELTA/DUAL_FACE/FOLD_A/MSTREAM/3BIT 同置。
+    返回 (ok, raw, info)。"""
+    payload = recv_exact(conn, comp_len)
+    if payload is None:
+        return False, None, 'EOF mid-payload'
+    if n_slices != 0 or flags & (FLAG_DELTA | FLAG_GEOM | FLAG_3BIT | FLAG_MSTREAM):
+        return False, None, f'非法组合 n_slices={n_slices} flags=0x{flags:x}'
+    try:
+        raw = _decode(payload, flags, raw_len)
+        if len(raw) != raw_len:
+            return False, None, f'LEN MISMATCH {len(raw)} != {raw_len}'
+        h, idx, _col = pvp.decode_vxt1(raw)
+    except ValueError as e:
+        return False, None, f'VXT1 坏: {e}'
+    info = (f'VXT1 {h["grid_xz"]}x{h["grid_y"]} n_vox={h["n_vox"]} seq={h["seq"]}'
+            f'{" KEY" if h["flags"] & pvp.VXT_FLAG_KEY else ""}')
+    if ref_md5:
+        ok = hashlib.md5(raw).hexdigest() == ref_md5[n % len(ref_md5)]
+        info += f', md5={"OK" if ok else "MISMATCH!"}'
+    return True, raw, info
 
 
 def recv_exact(conn, n):
@@ -70,6 +98,23 @@ def handle(conn, args, ref_md5=None):
         # PVS_FRAME_RAW_MAX 早在 2026-08-24 就抬到 21MB 了 —— 于是任何
         # >240 片的 3-bit 帧 (双面 142+142=284 就是) 在这里被判 BAD HDR,
         # 板端反而收得下。改走 pack_obs.FRAME_RAW_MAX = host 侧唯一定义处。
+        if magic == MAGIC and flags & pvp.FLAG_VOXTAB:
+            ok, raw, info = handle_voxtab(conn, comp_len, raw_len, n_slices, flags,
+                                          n, ref_md5)
+            print(f'[fake_board] frame {n}: {comp_len}B wire, flags=0x{flags:x} '
+                  f'{raw_len / max(comp_len, 1):.2f}x, {info}', flush=True)
+            if not ok:
+                conn.sendall(bytes([NAK]))
+                return False
+            if ref_md5:
+                good = info.endswith('md5=OK')
+                md5_pass += good
+                md5_fail += not good
+            key_n += 1; key_wire += HDR.size + comp_len
+            conn.sendall(bytes([ACK]))
+            n += 1
+            wire += HDR.size + comp_len
+            continue
         bpp = 3 if (flags & FLAG_3BIT) else 1
         stride = pack_obs.slice_stride(bpp)
         if (magic != MAGIC or not (1 <= n_slices <= pack_obs.FRAME_RAW_MAX // stride)
@@ -152,6 +197,7 @@ def main():
     ref_md5 = None
     if args.md5:
         files = sorted(glob.glob(os.path.join(args.md5, 'frame_*.bin'))
+                       or glob.glob(os.path.join(args.md5, 'frame_*.vxt'))   # VXT1 目录
                        or glob.glob(os.path.join(args.md5, '*.bin')))
         if not files:
             sys.exit(f'--md5: no .bin frames in {args.md5}')

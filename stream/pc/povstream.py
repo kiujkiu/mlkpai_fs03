@@ -26,6 +26,12 @@ numpy 现渲 ~秒级/帧, 正常流程先 render 预渲染到磁盘再 stream:
   python3 povstream.py stream --anim globe --frames 60 --loop   # 现渲直推 (慢)
   python3 povstream.py bench                                    # 压缩测量
 
+验证板 (ICND2260 + DR1M90) 口径 —— 传**体素表**不传切片 (2026-10-10):
+  python3 povstream.py render --profile vb358 --anim rgbhelix --frames 12 --out-dir frames_vb_helix
+  python3 povstream.py stream --dir frames_vb_helix --codec lz4 --host <board>
+  帧 = PVS1 头 (flags=VOXTAB(bit8)|压缩位, n_slices=0) + VXT1 体 (zynq_pov/scatter/vox_table.h);
+  358 片/面垂距/相位是板端切片参数, 只写进 meta.json。不给 --profile = 2047 老路径逐字节不变。
+
 3-bit 色深 (v3.4, 每通道 0..7, 行内 BCM):
   python3 povstream.py render --anim spin --bpp 3 --n-slices 60  # 60 片 = 2.2MB/帧
   python3 povstream.py stream --dir frames_spin --host <board>   # bpp 从 meta.json 读
@@ -80,6 +86,7 @@ TOOLS = os.path.abspath(os.path.join(HERE, '..', '..', 'tools'))
 sys.path.insert(0, TOOLS)
 import pack_obs
 import gen_anime_slices as gas
+import pov_profile as pvp      # 口径 profile + VXT1 体素表 (2026-10-10, 验证板 vb358)
 
 # ---- PVS1 协议常量 (= stream/protocol.h) ----
 MAGIC = b'PVS1'
@@ -1315,7 +1322,43 @@ def gen_packed_frames(args):
 
 # ================= render 子命令 (预渲染到磁盘) =================
 
+def gen_voxtab_frames(args, prof):
+    """动画源 → 逐帧 VXT1 体 (bytes)。与切片路径共用 ANIMS 的体素格, 只是不切片:
+    体素格 (gas 坐标, 160×180×160 float RGB) → RGB565 → pov_slice_v2 网格布局 → VXT1。
+    首帧置 VXT_FLAG_KEY; 之后的帧板端走增量清理 (vox_scatter.c), 板端在 (重)连接
+    后必须 vox_scatter_desync() —— 预渲染帧的 KEY 位是写死在文件里的。"""
+    for i, vox in enumerate(ANIMS[args.anim](args)):
+        t0 = time.time()
+        body = pvp.vxt1_from_gas_float(vox, prof, seq=i, key=(i == 0))
+        n_vox = struct.unpack_from('<I', body, 8)[0]
+        print(f'[voxtab] frame {i}/{args.frames} {n_vox} 体素, VXT1 {len(body)}B '
+              f'({time.time() - t0:.2f}s)', flush=True)
+        yield body
+
+
+def cmd_render_voxtab(args, prof):
+    out_dir = args.out_dir or os.path.join(HERE, f'frames_{prof["name"]}_{args.anim}')
+    os.makedirs(out_dir, exist_ok=True)
+    t0 = time.time()
+    sizes = []
+    for i, body in enumerate(gen_voxtab_frames(args, prof)):
+        with open(os.path.join(out_dir, f'frame_{i:04d}.vxt'), 'wb') as f:
+            f.write(body)
+        sizes.append(len(body))
+    meta = {'anim': args.anim, 'frames': len(sizes), 'transport': 'voxtab',
+            'profile': pvp.meta_dict(prof), 'n_slices': prof['n_slices'],
+            'geom_flags': 0, 'bpp': None, 'vxt_bytes_max': max(sizes, default=0),
+            'generated': time.strftime('%Y-%m-%d %H:%M:%S')}
+    with open(os.path.join(out_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=1)
+    print(f'[render] {len(sizes)} VXT1 frames -> {out_dir} ({time.time() - t0:.1f}s total)',
+          flush=True)
+
+
 def cmd_render(args):
+    prof = getattr(args, 'prof', None)
+    if prof is not None and prof['transport'] == 'voxtab':
+        return cmd_render_voxtab(args, prof)
     out_dir = args.out_dir or os.path.join(HERE, f'frames_{args.anim}')
     os.makedirs(out_dir, exist_ok=True)
     faces, geom_flags = face_plan(args)
@@ -1390,8 +1433,11 @@ class Streamer:
                  link_mbps=DEFAULT_LINK_MBPS, stats_interval=5.0,
                  max_frames=0, on_frame=None, on_status=None, on_stats=None,
                  stop=None, geom_flags=0, lz4_level=DEFAULT_LZ4_LEVEL,
-                 stream_split='face', stream_workers=None):
+                 stream_split='face', stream_workers=None, voxtab=False):
         self.host, self.port = host, port
+        # voxtab=True: 每帧是一个 VXT1 体素表 (PVS_FLAG_VOXTAB), 头里 n_slices=0,
+        # 单流压缩, 不做 DELTA / 拆流 (vox_table.h 规定 VOXTAB|DELTA|DUAL_FACE|FOLD_A 非法)
+        self.voxtab = bool(voxtab)
         self.fps, self.loop = fps, loop
         self.codec, self.zlevel = codec, zlevel
         self.lz4_level = lz4_level
@@ -1449,6 +1495,9 @@ class Streamer:
                 return item.key, item.key_flags, False, None
             return item.delta, item.delta_flags, True, None
         raw = item                       # 现场压缩路径 (bytes)
+        if self.voxtab:
+            payload, cflag = _encode(raw, self.codec, self.zlevel, self.lz4_level)
+            return payload, cflag | pvp.FLAG_VOXTAB, False, None
         split = face_split_bytes(self.geom_flags)   # DUAL_FACE → 两条独立流
         streams = stream_plan(len(raw) // SLICE_STRIDE,
                               self.geom_flags, self.stream_split,
@@ -1472,7 +1521,7 @@ class Streamer:
         # 帧长按 item 实际字节算 (v3.1: 360/540/720 片都可能); n_slices 是
         # 接收方算长度的权威字段, 必须与 raw_len 自洽。
         raw_len = item.raw_len if isinstance(item, FrameEntry) else len(item)
-        n_slices = raw_len // SLICE_STRIDE
+        n_slices = 0 if self.voxtab else raw_len // SLICE_STRIDE   # VOXTAB 帧不含切片
         # ---- 几何变化 ⇒ 强制关键帧 (2026-07-31) ----
         # DELTA = 与上一帧逐字节 XOR。n_slices 或面布局 flags 一变, 参考帧长度/
         # 语义就对不上 (XOR 直接越界), 板端的行为是 NAK + 关连接。协议里
@@ -1786,7 +1835,75 @@ def slots_from_dir(d, cli_ns, geom_flags):
     return ns
 
 
+def voxtab_meta_from_dir(d):
+    """预渲染目录是 VXT1 体素表目录吗? 是 → meta dict, 否 → None。"""
+    try:
+        with open(os.path.join(d, 'meta.json')) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return meta if meta.get('transport') == 'voxtab' else None
+
+
+def cmd_stream_voxtab(args, prof_meta):
+    """推 VXT1 体素表: 每帧 = PVS1 头 (VOXTAB|压缩位, n_slices=0) + 压缩后的 VXT1 体。"""
+    if args.delta:
+        sys.exit('VXT1 体素表不能 --delta (变长体, 逐字节 XOR 无定义; 帧间冗余由板端增量清理吃掉)')
+    print(f'[voxtab] profile {prof_meta.get("name")}: {prof_meta.get("W")}×{prof_meta.get("H")}, '
+          f'{prof_meta.get("n_slices")} 片/圈 (板端切), faces={prof_meta.get("faces")}',
+          flush=True)
+    if args.codec != 'lz4':
+        print(f'[voxtab] ⚠ --codec {args.codec}: 体素表建议 lz4 (分平面布局就是为 lz4 设计的)',
+              flush=True)
+    entries = None
+    if args.dir:
+        files = sorted(glob.glob(os.path.join(args.dir, 'frame_*.vxt')))
+        if not files:
+            sys.exit(f'{args.dir}: 没有 frame_*.vxt')
+        entries = []
+        for p in files:
+            body = open(p, 'rb').read()
+            pvp.decode_vxt1(body)                # 发之前自检一遍格式
+            payload, cflag = _encode(body, args.codec, args.zlevel, args.lz4_level)
+            entries.append(FrameEntry(key=payload, delta=None,
+                                      key_flags=cflag | pvp.FLAG_VOXTAB,
+                                      delta_flags=None, raw_len=len(body)))
+        tot_raw = sum(e.raw_len for e in entries)
+        tot_w = sum(len(e.key) for e in entries)
+        print(f'[voxtab] {len(entries)} 帧预压缩: VXT1 均 {tot_raw / len(entries):,.0f}B → '
+              f'线上均 {tot_w / len(entries):,.0f}B ({tot_raw / max(tot_w, 1):.2f}x, '
+              f'{args.codec})', flush=True)
+
+    def make_iter():
+        if entries is not None:
+            return iter(entries)
+        return gen_voxtab_frames(args, args.prof)
+
+    s = Streamer(args.host, args.port, fps=args.fps, loop=args.loop, window=args.window,
+                 codec=args.codec, zlevel=args.zlevel, lz4_level=args.lz4_level,
+                 reconnect=args.reconnect, link_mbps=args.link_mbps,
+                 max_frames=args.max_frames, geom_flags=0, voxtab=True,
+                 on_status=lambda ev, d: print(f'[net] {ev}: {d}', flush=True))
+    try:
+        s.run(make_iter)
+    except KeyboardInterrupt:
+        print('[net] interrupted', flush=True)
+    except StreamerError as e:
+        print(f'[net] {e}', flush=True)
+        if s.frames == 0:
+            sys.exit(1)
+    dt = s.elapsed()
+    print(f'[stats] {s.frames} VXT1 frames in {dt:.2f}s = {s.frames / dt:.2f} fps | '
+          f'wire {s.wire_mbps():.2f} MB/s | compression {s.ratio():.2f}x', flush=True)
+
+
 def cmd_stream(args):
+    vmeta = voxtab_meta_from_dir(args.dir) if args.dir else None
+    prof = getattr(args, 'prof', None)
+    if vmeta is not None:
+        return cmd_stream_voxtab(args, vmeta['profile'])
+    if args.dir is None and prof is not None and prof['transport'] == 'voxtab':
+        return cmd_stream_voxtab(args, pvp.meta_dict(prof))
     if args.delta and args.codec not in DELTA_CODECS:
         sys.exit(f'--delta 需要 --codec {"/".join(DELTA_CODECS)} '
                  f'(协议 DELTA 与压缩位正交, 但 raw/rle 侧没实现)')
@@ -1896,6 +2013,9 @@ def cmd_bench(args):
 # ================= CLI =================
 
 def add_render_opts(ap):
+    ap.add_argument('--profile', choices=sorted(pvp.PROFILES), default=None,
+                    help='口径 profile (tools/pov_profile.py)。不给 = 2047 老路径, 输出逐字节不变; '
+                         'vb358 = 2260 验证板 160×180/358 片/RGB565, 发 VXT1 体素表 (不发切片)')
     ap.add_argument('--anim', choices=sorted(ANIMS), default='spinpulse')
     ap.add_argument('--frames', type=int, default=36, help='动画帧数 (=循环周期)')
     ap.add_argument('--half-aspect', action='store_true',
@@ -2099,6 +2219,25 @@ def main():
     b.set_defaults(fn=cmd_bench)
 
     args = ap.parse_args()
+
+    # ---- 口径 profile (2026-10-10) ----
+    args.prof = None
+    if getattr(args, 'profile', None):
+        args.prof = pvp.get_profile(args.profile)
+        print(f'[profile] {pvp.describe(args.prof)}', flush=True)
+        if args.prof['transport'] == 'voxtab':
+            bad = [o for o, on in (('--bpp', getattr(args, 'bpp', 1) != 1),
+                                   ('--dual-face', getattr(args, 'dual_face', False)),
+                                   ('--fold-a', getattr(args, 'fold_a', False)),
+                                   ('--half-screen', getattr(args, 'half_screen', False)),
+                                   ('--radial-comp', getattr(args, 'radial_comp', False)))
+                   if on]
+            if bad:
+                sys.exit(f'--profile {args.profile} 传体素表, 切片侧选项 {" ".join(bad)} 无意义 '
+                         f'(面/片数/色深由板端按 profile 切)')
+            if (args.prof['W'], args.prof['H']) != (gas.W, gas.H):
+                sys.exit(f'--profile {args.profile} 要 {args.prof["W"]}×{args.prof["H"]} 体素, '
+                         f'povstream 动画源固定 {gas.W}×{gas.H} (用 zynq_pov/scatter/gen_voxtab.py)')
 
     # 🔴 顺序要紧: 槽数必须在任何渲染/打包之前落到全局 (FRAME_RAW 等按它算)。
     # 🔴 色深要排在槽数前面: 片距变了槽数上限和 FRAME_RAW 都跟着变。

@@ -79,7 +79,7 @@ All integers **little-endian**.
 | 4   | 4    | comp_len   | payload bytes as transmitted                   |
 | 8   | 4    | raw_len    | decompressed size, **must == n_slices * 0x3000** |
 | 12  | 2    | n_slices   | 权威片数, 1..720 (老帧 = 360)                  |
-| 14  | 2    | flags      | bit0 = RLE, bit1 = zlib, bit2 = DELTA, bit3 = DUAL_FACE, bit4 = FOLD_A, bit5 = LZ4, bit6 = MSTREAM, 0 = raw |
+| 14  | 2    | flags      | bit0 = RLE, bit1 = zlib, bit2 = DELTA, bit3 = DUAL_FACE, bit4 = FOLD_A, bit5 = LZ4, bit6 = MSTREAM, bit7 = 3BIT, bit8 = VOXTAB (载荷是 VXT1 体素表, n_slices=0; 见 protocol.h), 0 = raw |
 | 16  | comp_len | payload |                                                |
 
 **DELTA (bit2, PVS1.1)**: payload (after RLE/zlib decode) = `cur XOR prev_raw`,

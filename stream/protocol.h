@@ -319,6 +319,19 @@
                                        * bpp_mode 切到 1 (0x0C subcmd=01 [16]), 收到
                                        * 1-bit 帧切回 0。两种内容可以逐帧交替, 因为
                                        * 空闲动画和上电默认内容都还是 1-bit。 */
+#define PVS_FLAG_VOXTAB    (1u << 8)  /* 2026-10-10 验证板 (ICND2260 + DR1M90):
+                                       * 载荷 (解压后) 是一个 **VXT1 体素表**, 不是切片。
+                                       * 权威格式: zynq_pov/scatter/vox_table.h;
+                                       * 发送端: tools/pov_profile.py + povstream --profile vb358。
+                                       *   hdr.n_slices = 0, hdr.raw_len = VXT1 体长,
+                                       *   压缩位 (LZ4/ZLIB/RLE) 语义不变, 单流。
+                                       *   切片由板端按 profile (358 片 / 面垂距 / mirror /
+                                       *   面B 相位 179) 从体素网格切, 不在线上。
+                                       * 🔴 非法组合 (必须 NAK): VOXTAB 与 DELTA / DUAL_FACE /
+                                       *   FOLD_A / MSTREAM / 3BIT 任一同置 (都是切片流概念)。
+                                       * 🔴 为什么是 bit 8: 08-05 的设计稿写的 bit 7, 但 08-20
+                                       *   3BIT 先占了 bit 7 ⇒ 撞位, 10-10 挪到 bit 8。
+                                       * 老固件不认识本位: 会按 n_slices=0 判坏头 NAK, 不会误显示。 */
 #define PVS_MAX_STREAMS  16           /* 流表条数上限 (表最大 4+16*8 = 132 B) */
 /* flags == 0 -> payload is raw (comp_len == raw_len) */
 
